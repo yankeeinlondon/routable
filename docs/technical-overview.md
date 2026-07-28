@@ -69,9 +69,12 @@ and copy response chunks downstream as they arrive.
 
 Request handling, in order (`proxy/ingress.rs`):
 
-1. **Endpoint allowlist.** Only known model-bearing `POST` endpoints proceed; vLLM
+1. **Endpoint allowlist.** Only known model-bearing `POST` endpoints proceed — the
+   OpenAI-compatible family, Anthropic's `/v1/messages`, and the Cohere/Jina-style
+   score/rerank/classify endpoints (`MODEL_ENDPOINTS` in `proxy/ingress.rs`). vLLM
    admin/dev endpoints and `/pool` are refused on this listener regardless of upstream
-   support.
+   support. Multipart endpoints (audio transcription) are not routable today because
+   model extraction assumes a JSON body.
 2. **Bounded body read.** `Content-Length` is checked first, then the body is read with
    a running cap; overflow drains the connection and returns 413 before any parsing.
 3. **Model routing.** `serde_json` extracts only the `model` field (bytes are never

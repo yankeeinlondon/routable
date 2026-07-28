@@ -1,8 +1,10 @@
 # vLLM Pooling Router
 
-An OpenAI-compatible gateway that lets a small pool of GPUs serve a large catalog of
-models. Clients send ordinary `POST /v1/chat/completions` requests naming any configured
-model; the router forwards to the vLLM server that serves it — and if that model isn't
+A model-routing gateway that lets a small pool of GPUs serve a large catalog of models
+through vLLM's native API surface — OpenAI-compatible chat/completions/embeddings,
+Anthropic's Messages API, and Cohere/Jina-style scoring and rerank. Clients send an
+ordinary request (say `POST /v1/chat/completions` or `POST /v1/messages`) naming any
+configured model; the router forwards to the vLLM server that serves it — and if that model isn't
 running, the router **starts (or wakes) it on demand, holds the request while it loads,
 and answers when it's ready**. Idle models are put to sleep or stopped automatically so
 the GPUs are always available for what's actually being used.
@@ -118,13 +120,22 @@ complete, commented service:
 
 ### Inference (data plane, default `:8000`)
 
-OpenAI-compatible `POST` endpoints, routed by the JSON `model` field (aliases resolve to
-the canonical name): `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`,
-`/v1/responses`, `/v1/messages`, `/v1/score`, `/v1/rerank`, `/v1/classify`,
-`/v1/tokenize`, `/v1/detokenize` (plus legacy `/score`, `/rerank`).
+vLLM exposes several API dialects on one server, and the router forwards the
+model-bearing `POST` endpoints of each, all routed by the JSON `model` field (aliases
+resolve to the canonical name):
+
+| Protocol family | Endpoints |
+|---|---|
+| OpenAI-compatible | `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/responses`, `/v1/tokenize`, `/v1/detokenize` |
+| Anthropic Messages | `/v1/messages` |
+| Cohere/Jina-style pooling | `/v1/score`, `/v1/rerank`, `/v1/classify` (plus legacy `/score`, `/rerank`) |
 
 Everything else — including vLLM's admin endpoints (`/sleep`, `/wake_up`, …) — is
-refused on this listener. Errors come back OpenAI-shaped:
+refused on this listener. Two caveats: multipart endpoints such as audio
+transcription/translation are not currently routed (the router parses JSON bodies for
+the `model` field), and *router-generated* errors use the OpenAI error envelope on every
+endpoint, including `/v1/messages` — errors originating from vLLM itself pass through in
+their native shape. Router errors look like:
 
 ```json
 {"error": {"message": "model `x` is not configured", "type": "invalid_request_error", "code": "model_not_found"}}
