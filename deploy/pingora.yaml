@@ -1,0 +1,12 @@
+---
+version: 1
+threads: 8
+work_stealing: true
+daemon: false
+pid_file: /run/vllm-router.pid
+upgrade_sock: /run/vllm-router-upgrade.sock
+upstream_keepalive_pool_size: 128
+daemon_wait_for_ready: true
+daemon_ready_timeout_seconds: 30
+grace_period_seconds: 10
+graceful_shutdown_timeout_seconds: 900

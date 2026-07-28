@@ -1,0 +1,22 @@
+[Unit]
+Description=vLLM GPU pool router
+After=network-online.target dbus.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/vllm-router -c /etc/vllm-router/pingora.yaml --router-config /etc/vllm-router/router.yaml
+Restart=on-failure
+RestartSec=2
+TimeoutStartSec=30
+TimeoutStopSec=900
+LimitNOFILE=262144
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=read-only
+ProtectSystem=strict
+ReadOnlyPaths=/etc/vllm-router /etc/vllm
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target

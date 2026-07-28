@@ -1,0 +1,25 @@
+[Unit]
+Description=vLLM managed service (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/vllm/%i.env
+Environment=VLLM_SERVER_DEV_MODE=1
+ExecStart=/opt/vllm-venv/bin/vllm serve ${MODEL_PATH} $VLLM_ARGS
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=900
+TimeoutStopSec=120
+KillSignal=SIGTERM
+LimitMEMLOCK=infinity
+LimitNOFILE=65535
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=read-only
+ProtectSystem=strict
+ReadWritePaths=/models
+
+[Install]
+WantedBy=multi-user.target

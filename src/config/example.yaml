@@ -1,0 +1,92 @@
+listeners:
+  data_plane: "0.0.0.0:8000"
+  management: "127.0.0.1:8001"
+  metrics: "127.0.0.1:8002"
+  management_bearer_token_file: /run/secrets/vllm-router-token
+
+inventory:
+  host_ram_capacity_bytes: 200000000000
+  gpus:
+    - uuid: GPU-00000000-0000-0000-0000-000000000001
+      vram_capacity_bytes: 34000000000
+
+policies:
+  maximum_request_body_bytes: 33554432
+  global_parked_request_limit: 1024
+  per_model_parked_request_limit: 128
+  connect_timeout_ms: 5000
+  inter_chunk_timeout_ms: 120000
+  max_awake_owners_per_gpu: 1
+
+services:
+  - name: example-30b
+    enabled: true
+    runner: vllm
+    served_model: example/model-30b
+    aliases: [example-30b]
+    model_path: /srv/models/example-30b
+    tokenizer:
+      path: /srv/models/example-30b
+      mode: auto
+      trust_remote_code: false
+    quantization: modelopt
+    runner_args:
+      enable-prefix-caching: true
+      max-num-seqs: 32
+    placement:
+      gpu_uuids: [GPU-00000000-0000-0000-0000-000000000001]
+      tensor_parallelism: 1
+      pipeline_parallelism: 1
+      data_parallelism: 1
+      vram_reservation_bytes_per_gpu: 30000000000
+    backend:
+      address: 127.0.0.1
+      port: 8100
+    systemd:
+      unit: vllm@example-30b.service
+      environment_file: /etc/vllm/example-30b.env
+    readiness:
+      health_path: /health
+      models_path: /v1/models
+      consecutive_successes: 2
+      consecutive_failures: 3
+      interval_ms: 2000
+      timeout_ms: 1000
+      maximum_probe_age_ms: 10000
+    deadlines:
+      startup_ms: 300000
+      wake_ms: 30000
+      drain_ms: 120000
+      systemd_job_ms: 30000
+    retry:
+      maximum_attempts: 3
+      initial_backoff_ms: 1000
+      maximum_backoff_ms: 30000
+      multiplier: 2.0
+      jitter_fraction: 0.2
+    warmup:
+      path: /v1/completions
+      body:
+        model: example/model-30b
+        prompt: warmup
+        max_tokens: 1
+      after_wake: true
+    sleep:
+      enabled: false
+      hardware_validated: false
+      levels: []
+      residual_vram_bytes_per_gpu: 0
+      l1_host_ram_bytes: 0
+    idle:
+      stop_after_ms: 3600000
+    parking:
+      deadline_ms: 300000
+      queue_limit: 64
+      retry_after_seconds: 30
+    priority: 0
+    evictable: true
+    automatic_start: true
+    compatibility:
+      maximum_model_length: 32768
+      kv_cache_dtype: auto
+      gpu_memory_utilization: 0.9

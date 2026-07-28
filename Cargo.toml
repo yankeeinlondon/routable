@@ -1,0 +1,32 @@
+[package]
+name = "vllm-router"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+
+[dependencies]
+async-trait = "0.1"
+bytes = "1"
+futures-util = "0.3"
+http = "1"
+nvml-wrapper = "0.11"
+pingora = { version = "=0.8.1", features = ["openssl", "proxy", "lb"] }
+prometheus = "=0.13.4"
+rand = "0.9"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+uuid = { version = "1", features = ["serde", "v4"] }
+zbus = { version = "5", features = ["tokio"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
