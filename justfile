@@ -137,7 +137,7 @@ ready: _need-router
 # Authenticated pool status: every service's desired + observed state.
 pool: _need-router
     @curl -sS -H "Authorization: Bearer $(cat {{token_file}})" \
-        {{mgmt}}/pool/v1/services | jq '.services[] | {service, lifecycle, active_requests, parked_requests, last_error}'
+        {{mgmt}}/pool/v1/services | jq -c '.services[] | {name: .desired.name, lifecycle: .observed.lifecycle, active: .observed.active_requests, parked: .observed.parked_requests, error: .observed.last_error}'
 
 # Full pool status, unabridged JSON.
 pool-raw: _need-router
