@@ -319,3 +319,14 @@ failure is fully drained — preserving `failed` there serves nobody); alternati
 `record_failure` re-arms a single keyed backoff task on every failure. Regression
 test: two concurrent failing flights → the service reaches `stopped` automatically
 within backoff-max.
+
+**F9 amendment (2026-07-29, later):** the parser *value* is per-chat-template, not
+merely per-family — Qwen documentation says `hermes`, but these Qwen3.6 checkpoints'
+templates emit the XML function format requiring `qwen3_xml`, and thinking models
+additionally need `--reasoning-parser qwen3` or tool parsing fails silently mid-stream
+(observed live: streams ended at `</think>` with no tool_calls; `<think>` text leaked
+into `content`). The config fix must therefore allowlist **both** `tool-call-parser`
+and `reasoning-parser` with values validated against vLLM's registries (`--help=all`
+enumerates tool parsers; `vllm.reasoning` registry for reasoning parsers), and the
+runbook's Tier-3 smoke needs a tool-call + reasoning-separation assertion, which would
+have caught both the wrong-parser and missing-parser variants.
