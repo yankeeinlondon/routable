@@ -35,6 +35,38 @@ owns only generic resource and lifecycle concepts. v2 delivers the second adapte
   declaration-based accounting; no new scheduling concepts are required for same-host
   mixed runners.
 
+**Complexity register (brainstormed 2026-07-29)** — where a second runner genuinely
+adds complexity, by layer:
+
+- **Capability heterogeneity (scheduler):** llama.cpp has no sleep mode — its idle
+  ladder is `running → stopped` — but mmap'd GGUF weights make warm cold-starts
+  seconds, not minutes. Per-runner validation of idle tiers, and the Dynamic
+  Scheduling cost model becomes runner-aware: eviction/restart cost differs by an
+  order of magnitude between runners and should join priority + LRU in victim
+  selection.
+- **Memory-model divergence (ledger):** vLLM is a pre-allocated pool; llama.cpp is
+  additive (offloaded layers + KV by `--ctx-size`/`--parallel` + buffers) and adds two
+  new placement classes — partial offload (`-ngl`, a degraded-placement dial) and
+  CPU-only services (`gpu_ids: []`), making host RAM a first-class scheduling
+  resource. Host-RAM accounting needs classes: vLLM L1 sleep RAM is *pinned*;
+  mmap'd GGUF is *reclaimable page cache* unless `--mlock` (then pinned).
+  Conversely, `--tensor-split` gives llama.cpp native asymmetric splits — it is the
+  easy runner for US4/US6.
+- **Endpoint capability routing (data plane — the one leak outside the adapter):**
+  the endpoint allowlist must become a per-service capability set intersected at
+  admission. llama.cpp serves the OpenAI core but not Anthropic `/v1/messages` or the
+  Cohere/score/rerank family; a request for an unsupported endpoint must fail with a
+  distinct "endpoint not supported by this model" error *before* any lifecycle action
+  can fire (never cold-start a model the request cannot use).
+- **Operational:** second unit template + arg allowlist + per-runner executable path
+  (supersedes the hardcoded `VLLM_EXECUTABLE`); GGUF-file validation for
+  `model_path`; served-model verification via `--alias`; readiness thresholds tuned
+  to llama.cpp's load profile.
+- **Version churn:** llama.cpp releases near-daily without server-flag stability
+  guarantees; apply the vLLM pin-and-retest discipline strictly.
+- **Optional new policy (default off):** CPU-capable serving could turn some US7
+  refusals into an explicit opt-in "degraded CPU placement" instead of a 503.
+
 ## 2. Dynamic service registration (add-only) — decided 2026-07-29
 
 A later version will support *adding* a new service definition at runtime
