@@ -4,6 +4,12 @@ Ordered tiers, cheapest first; each tier assumes the previous passed. Status col
 records what has already been verified on CT 107 (2026-07-29). The acceptance criteria
 being exercised are `spec.md` §Acceptance criteria; results belong in `acceptance.md`.
 
+Most commands below have `just` shortcuts (see `just --list`): `gpus`, `host-test`,
+`token`, `validate`, `run`, `ready`, `pool`/`pool-raw`, `pool-op <svc> <action>
+['{json}']`, `operation <id>`, `models`, `chat <model>`, `stream <model>`,
+`stampede <model> [n]`, `metrics`, `unit-logs <svc>`. Endpoints/paths override via
+`DATA`/`MGMT`/`METRICS`/`ROUTER_CONFIG`/`PINGORA_CONFIG`/`TOKEN_FILE` env vars.
+
 Environment facts (verified 2026-07-29): both RTX 5090s visible via NVML
 (`GPU-d751861a…`, `GPU-06645389…`); systemd + system D-Bus reachable from the
 container; vLLM at `/root/.venv/bin/vllm` (NOT the example config's `/opt/vllm-venv`);
