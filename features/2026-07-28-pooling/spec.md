@@ -63,8 +63,10 @@ runner (`vllm` today; `llama.cpp` and others later). All managed runners are on 
 host in v1; no distributed scheduling, consensus, or cross-host failure recovery.
 
 Everything beyond that constraint — additional runners, add-only dynamic service
-registration, the web configuration UI, occupancy-aware placement with runner-computed
-splits, and multi-host — is specified in
+registration, the web configuration UI, **Dynamic Scheduling** (the named discipline
+covering occupancy-aware placement, placement profiles, budget-reclamation eviction,
+replica scaling, and GPU power stewardship; v1 ships its reactive core), and
+multi-host — is specified in
 [`features/2026-07-29-v2/spec.md`](../2026-07-29-v2/spec.md) so this document can freeze
 as the v1 acceptance contract.
 
