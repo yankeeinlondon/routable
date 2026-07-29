@@ -217,3 +217,27 @@ bounded exit time, which would have caught this).
 of identical WARN lines per hour for a steady condition. Warn on *transitions*
 (drift appears/changes/clears) and demote the steady-state repeat to debug; the
 drift metric already carries the continuous signal.
+
+## F7 — Generated environment omits required host toolchain variables
+
+**Severity: high on this host (crash-loop for any FlashInfer-JIT model).**
+
+First real cold start (2026-07-29): the mixed NVFP4/BF16 checkpoint hit FlashInfer's
+JIT path, which died with `RuntimeError: Could not find nvcc and default
+cuda_home='/usr/local/cuda' doesn't exist` — the venv's `nvcc` lives at
+`.venv/lib/python3.12/site-packages/nvidia/cu13/bin` and is only reachable via the
+PATH that `/root/serve-vllm.sh` exports; the router-generated environment file sets
+only `CUDA_VISIBLE_DEVICES` (+ args). The unit crash-looped under `Restart=on-failure`
+while the parked request burned its deadline. Also missing: `VLLM_CACHE_ROOT` (so
+cold starts ignore the warm torch.compile caches under `/models/vllm`) and `HF_HOME`.
+MXFP4 models (`openai/gpt-oss-20b`) hit the same path.
+
+**Interim operator fix (deployed):** systemd drop-in
+`/etc/systemd/system/vllm@.service.d/10-toolchain.conf` setting `PATH`, `HF_HOME`,
+`VLLM_CACHE_ROOT` for every `vllm@*` instance; survives unit regeneration.
+
+**Proper fix:** an allowlisted `environment:` map — per service and/or a global
+default block — validated with the existing control-character/newline rules and
+rendered into the generated env file, so host toolchain requirements are declared
+configuration rather than out-of-band drop-ins. Document the drop-in pattern in the
+README as the escape hatch for env the schema doesn't model.
