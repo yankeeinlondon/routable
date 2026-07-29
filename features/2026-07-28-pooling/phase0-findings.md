@@ -53,8 +53,17 @@ router's L1→L2 promotion and three-step L2 wake. The common behavioral failure
 was the required 503 while asleep: vLLM accepted the connection but returned no
 bytes before the 2-second test timeout. The TP=2 NVFP4 launch failed in
 FlashInfer FP4 quantization with `last dim has to be multiple of 16, but got
-2152`. Detailed latency and memory measurements are recorded in the per-model
-documents and `acceptance.md`.
+2152`. The tested service must therefore declare TP=2 in
+`compatibility.unsupported_tensor_parallelism` and run at TP=1; the boot-time
+validator rejects selecting a declared failed degree. Detailed latency and memory
+measurements are recorded in the per-model documents and `acceptance.md`.
+
+The provisional weight-sized L1 declarations were also insufficient. The
+conservative recorded floors are 25,000,000,000 bytes for FP8 (1.25× over the
+20 GB input, covering the 24.53 GB maximum) and 40,000,000,000 bytes for NVFP4
+(1.33× over 30 GB, covering the approximately 39.0 GB maximum). These floors may
+be retained while sleep remains disabled, and config validation rejects any
+future enabled-L1 reservation below them.
 
 ## S3 — systemd D-Bus
 

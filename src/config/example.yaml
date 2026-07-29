@@ -99,3 +99,9 @@ services:
       maximum_model_length: 32768
       kv_cache_dtype: auto
       gpu_memory_utilization: 0.9
+      # Set from a conservative on-host L1 measurement before enabling L1.
+      # This may remain populated while sleep/hardware validation stay false.
+      minimum_l1_host_ram_bytes: 0
+      # Record tensor-parallel degrees that failed this exact checkpoint/runtime
+      # validation (for example, [2] for the documented Qwen NVFP4 profile).
+      unsupported_tensor_parallelism: []

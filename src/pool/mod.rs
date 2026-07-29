@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::runtime::Handle;
 use tokio::sync::{Mutex, watch};
+use tracing::info;
 use uuid::Uuid;
 
 use crate::metrics;
@@ -72,6 +73,7 @@ pub struct ServiceDefinition {
     pub startup_deadline: Duration,
     pub wake_deadline: Duration,
     pub readiness_poll_interval: Duration,
+    pub maximum_probe_age: Duration,
     pub drain_deadline: Duration,
     pub stop_deadline: Duration,
     pub idle: IdlePolicy,
@@ -99,6 +101,7 @@ impl ServiceDefinition {
             startup_deadline: Duration::from_secs(300),
             wake_deadline: Duration::from_secs(60),
             readiness_poll_interval: Duration::from_millis(10),
+            maximum_probe_age: Duration::from_secs(10),
             drain_deadline: Duration::from_secs(30),
             stop_deadline: Duration::from_secs(30),
             idle: IdlePolicy::default(),
@@ -219,11 +222,16 @@ pub struct TransitionHandle {
     service: String,
     result: watch::Receiver<FlightResult>,
     affected_requests: AffectedRequests,
+    joined_existing: bool,
 }
 
 impl TransitionHandle {
     pub fn operation_id(&self) -> Uuid {
         self.operation_id
+    }
+
+    pub fn joined_existing(&self) -> bool {
+        self.joined_existing
     }
 
     /// Wait for the terminal lifecycle result while retaining force-decision metadata,
@@ -431,7 +439,18 @@ enum TransitionKind {
     EnsureReady,
     Drain,
     Sleep(SleepLevel),
-    Stop,
+    Stop(bool),
+}
+
+impl TransitionKind {
+    fn audit_action(self) -> &'static str {
+        match self {
+            Self::EnsureReady => "ensure_ready",
+            Self::Drain => "drain",
+            Self::Sleep(_) => "sleep",
+            Self::Stop(_) => "stop",
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -620,7 +639,7 @@ impl<R: Runner + 'static> Pool<R> {
         let task_options = options;
         self.get_or_spawn_flight(
             service,
-            TransitionKind::Stop,
+            TransitionKind::Stop(task_options.force),
             move |pool, operation_id, affected_requests| async move {
                 pool.do_stop(&service_name, task_options, operation_id, affected_requests)
                     .await
@@ -677,6 +696,15 @@ impl<R: Runner + 'static> Pool<R> {
             );
             return self.current_status(service);
         }
+        // Serialize the publication of Reconciling with active admission. Once this state is
+        // visible, no request can acquire a guard from the observation being replaced; if an
+        // admission already holds the lock, it publishes its exact active count first.
+        let admission = entry.admission.lock().await;
+        let current = self.current_status(service)?;
+        if matches!(current.lifecycle, Lifecycle::Failed | Lifecycle::Backoff) {
+            drop(admission);
+            return Ok(current);
+        }
         let prior_lifecycle = current.lifecycle;
         let preserve_drained = prior_lifecycle == Lifecycle::Drained;
         let operation_id = Uuid::new_v4();
@@ -693,6 +721,7 @@ impl<R: Runner + 'static> Pool<R> {
                 operation_id,
             )
             .expect("registered service missing from state store");
+        drop(admission);
         let observation = match self.inner.runner.observe(&entry.definition).await {
             Ok(observation) => observation,
             Err(error) => {
@@ -843,6 +872,80 @@ impl<R: Runner + 'static> Pool<R> {
             .ok_or_else(|| PoolError::UnknownService(service.to_string()))
     }
 
+    fn require_admissible_status(
+        &self,
+        service: &str,
+        entry: &ServiceEntry,
+    ) -> Result<ObservedState, PoolError> {
+        // The supported lifecycle path publishes Draining under `entry.admission` before
+        // issuing a sleep command, so a sufficiently fresh ready observation is the hot-path
+        // lease. This avoids serializing every inference request on `/is_sleeping`; stale or
+        // internally inconsistent facts fail closed until bounded reconciliation refreshes them.
+        let status = self.current_status(service)?;
+        if status.lifecycle != Lifecycle::Running {
+            if status.lifecycle.is_transitioning() {
+                self.count_admission_rejection(service, "transition_in_progress");
+                return Err(PoolError::TransitionInProgress {
+                    service: service.to_string(),
+                });
+            }
+            self.count_admission_rejection(service, "lifecycle_not_running");
+            return Err(PoolError::PlacementUnavailable {
+                service: service.to_string(),
+                reason: format!("service is {:?}", status.lifecycle),
+            });
+        }
+        // Ordered so the reported reason names the operator's actual problem: a
+        // fleet-wide stale-observation outage must not be reported as "not ready".
+        let probe_is_current = status
+            .probe
+            .age
+            .is_some_and(|age| age <= entry.definition.maximum_probe_age);
+        let rejection = if status.probe.sleeping_level.is_some() {
+            Some((
+                "asleep",
+                "cached runner readiness reports a sleeping backend",
+            ))
+        } else if !probe_is_current {
+            Some((
+                "stale_probe",
+                "cached runner readiness is older than the configured maximum probe age",
+            ))
+        } else if status.systemd.state != SystemdState::Active {
+            Some((
+                "systemd_not_active",
+                "cached systemd state is not active for a running service",
+            ))
+        } else if !status.probe.ready || !status.probe.healthy {
+            Some((
+                "not_ready",
+                "cached runner readiness is incomplete for a running service",
+            ))
+        } else if !status.probe.served_model_matches {
+            Some((
+                "served_model_mismatch",
+                "cached runner readiness reports an unexpected served model",
+            ))
+        } else {
+            None
+        };
+        if let Some((reason_label, reason)) = rejection {
+            self.count_admission_rejection(service, reason_label);
+            return Err(PoolError::PlacementUnavailable {
+                service: service.to_string(),
+                reason: reason.into(),
+            });
+        }
+        Ok(status)
+    }
+
+    fn count_admission_rejection(&self, service: &str, reason: &str) {
+        metrics::global()
+            .admission_rejections
+            .with_label_values(&[service, reason])
+            .inc();
+    }
+
     fn runner_error(&self, service: &str, error: RunnerError) -> PoolError {
         PoolError::Runner {
             service: service.to_string(),
@@ -897,11 +1000,20 @@ impl<R: Runner + 'static> Pool<R> {
         let mut slot = entry.flight.lock().await;
         if let Some(existing) = slot.as_ref() {
             if existing.kind == kind {
+                info!(
+                    audit = true,
+                    operation_id = %existing.operation_id,
+                    service,
+                    action = kind.audit_action(),
+                    joined_existing = true,
+                    "pool lifecycle request joined existing operation"
+                );
                 return Ok(TransitionHandle {
                     operation_id: existing.operation_id,
                     service: service.to_string(),
                     result: existing.result.clone(),
                     affected_requests: existing.affected_requests.clone(),
+                    joined_existing: true,
                 });
             }
             return Err(PoolError::TransitionInProgress {
@@ -950,6 +1062,7 @@ impl<R: Runner + 'static> Pool<R> {
             service: service.to_string(),
             result: receiver,
             affected_requests,
+            joined_existing: false,
         })
     }
 
@@ -1270,7 +1383,7 @@ impl<R: Runner + 'static> Pool<R> {
         let affected_requests = AffectedRequests::default();
         let (_sender, receiver) = watch::channel(FlightResult::Pending);
         *flight_slot = Some(Flight {
-            kind: TransitionKind::Stop,
+            kind: TransitionKind::Stop(false),
             operation_id,
             result: receiver,
             affected_requests: affected_requests.clone(),
@@ -1541,6 +1654,12 @@ impl<R: Runner + 'static> Pool<R> {
             return Ok(previous_status);
         }
         let admission = entry.admission.lock().await;
+        // Capture the exact force-stop blast radius while admission is closed.
+        // Requests may finish during the drain window, but every request present
+        // at this boundary was subjected to the administrative force decision.
+        if options.force {
+            affected_requests.capture(entry.activity.active());
+        }
         let generation = self
             .inner
             .state
@@ -1558,9 +1677,6 @@ impl<R: Runner + 'static> Pool<R> {
                 service: service.to_string(),
                 operation: "drain before stop",
             });
-        }
-        if !drained {
-            affected_requests.capture(entry.activity.active());
         }
         self.inner
             .state
@@ -1581,7 +1697,7 @@ impl<R: Runner + 'static> Pool<R> {
         .await
         .and_then(|result| result.map_err(|error| self.runner_error(service, error)));
         if let Err(error) = result {
-            if previous == Lifecycle::Drained {
+            if options.force || previous == Lifecycle::Drained {
                 self.inner.state.update_if_current(
                     service,
                     generation,
@@ -1599,7 +1715,7 @@ impl<R: Runner + 'static> Pool<R> {
         self.inner
             .state
             .update_if_current(service, generation, Some(operation_id), |status| {
-                status.lifecycle = if previous == Lifecycle::Drained {
+                status.lifecycle = if options.force || previous == Lifecycle::Drained {
                     Lifecycle::Drained
                 } else {
                     Lifecycle::Stopped
@@ -1907,16 +2023,7 @@ impl<R: Runner + 'static> PoolManager for Pool<R> {
     async fn acquire_active(&self, service: String) -> Result<ActiveGuard, PoolError> {
         let entry = self.entry(&service)?;
         let _admission = entry.admission.lock().await;
-        let status = self.current_status(&service)?;
-        if status.lifecycle != Lifecycle::Running {
-            if status.lifecycle.is_transitioning() {
-                return Err(PoolError::TransitionInProgress { service });
-            }
-            return Err(PoolError::PlacementUnavailable {
-                service,
-                reason: format!("service is {:?}", status.lifecycle),
-            });
-        }
+        self.require_admissible_status(&service, &entry)?;
         Ok(entry.activity.acquire_active())
     }
 
@@ -1952,9 +2059,12 @@ fn lifecycle_from_observation(observation: &RunnerObservation) -> Lifecycle {
 }
 
 fn status_owns_awake_placement(status: &ObservedState) -> bool {
-    if status.lifecycle != Lifecycle::Drained {
-        return status.lifecycle.owns_awake_placement();
+    if status.lifecycle.owns_awake_placement() {
+        return true;
     }
+    // Lifecycle publication and runner observations are not one atomic operation. Release
+    // placement only on an authoritative inactive or asleep fact; an inconsistent stopped,
+    // drained, or asleep label with an awake/unknown underlying process must fail closed.
     status.systemd.state != SystemdState::Inactive && status.probe.sleeping_level.is_none()
 }
 
@@ -2010,11 +2120,30 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use std::{
+        io::{self, Write},
+        sync::atomic::{AtomicBool, AtomicUsize},
+    };
 
     use tokio::sync::Notify;
 
     use super::*;
+
+    struct AuditWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl Write for AuditWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .expect("audit capture lock poisoned")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
 
     struct MockService {
         running: AtomicBool,
@@ -2550,13 +2679,37 @@ mod tests {
             PoolManager::begin_lifecycle(&pool, LifecycleRequest::EnsureReady(request.clone()))
                 .await
                 .unwrap();
+        assert!(!first.joined_existing());
         tokio::time::timeout(Duration::from_secs(1), start_started.notified())
             .await
             .expect("the authoritative pool flight should start");
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&captured);
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(move || AuditWriter(Arc::clone(&sink)))
+            .finish();
+        let audit_guard = tracing::subscriber::set_default(subscriber);
         let second = PoolManager::begin_lifecycle(&pool, LifecycleRequest::EnsureReady(request))
             .await
             .unwrap();
+        drop(audit_guard);
         assert_eq!(first.operation_id(), second.operation_id());
+        assert!(second.joined_existing());
+        let audit = String::from_utf8(
+            captured
+                .lock()
+                .expect("audit capture lock poisoned")
+                .clone(),
+        )
+        .unwrap();
+        assert!(audit.contains(r#""audit":true"#), "{audit}");
+        assert!(audit.contains(r#""action":"ensure_ready""#), "{audit}");
+        assert!(audit.contains(r#""joined_existing":true"#), "{audit}");
+        assert!(
+            audit.contains(&format!(r#""operation_id":"{}""#, first.operation_id())),
+            "{audit}"
+        );
 
         let rejected = PoolManager::begin_lifecycle(
             &pool,
@@ -2613,6 +2766,96 @@ mod tests {
         PoolManager::acquire_active(&pool, "a".into())
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn active_admission_rejects_stale_or_sleeping_running_facts() {
+        let runner = MockRunner::new(&["a"], &["a"]);
+        let controls = runner.clone();
+        let mut service = definition("a", "gpu-0");
+        service.maximum_probe_age = Duration::from_millis(20);
+        let pool = reconciled_pool(vec![service], runner).await;
+
+        let current = pool.current_status("a").unwrap();
+        pool.inner.state.update_if_current(
+            "a",
+            current.generation,
+            current.operation_id,
+            |status| status.probe.age = Some(Duration::from_secs(1)),
+        );
+        assert!(matches!(
+            PoolManager::acquire_active(&pool, "a".into()).await,
+            Err(PoolError::PlacementUnavailable { .. })
+        ));
+        assert_eq!(pool.activity("a").unwrap().active(), 0);
+
+        *controls.services["a"].sleeping.lock().await = Some(SleepLevel::L1);
+        let asleep = pool.reconcile("a").await.unwrap();
+        assert_eq!(asleep.lifecycle, Lifecycle::AsleepL1);
+        pool.inner
+            .state
+            .update_if_current("a", asleep.generation, asleep.operation_id, |status| {
+                status.lifecycle = Lifecycle::Running
+            });
+        assert!(matches!(
+            PoolManager::acquire_active(&pool, "a".into()).await,
+            Err(PoolError::PlacementUnavailable { .. })
+        ));
+        assert_eq!(pool.activity("a").unwrap().active(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconciliation_cannot_publish_over_an_admission_critical_section() {
+        let runner = MockRunner::new(&["a"], &["a"]);
+        let controls = runner.clone();
+        let pool = reconciled_pool(vec![definition("a", "gpu-0")], runner).await;
+        let observe_started = Arc::new(Notify::new());
+        let observe_release = Arc::new(Notify::new());
+        controls
+            .observe_started
+            .lock()
+            .await
+            .insert("a".into(), observe_started.clone());
+        controls
+            .observe_release
+            .lock()
+            .await
+            .insert("a".into(), observe_release.clone());
+
+        let entry = pool.entry("a").unwrap();
+        let admission = entry.admission.lock().await;
+        let reconcile_pool = pool.clone();
+        let reconcile = tokio::spawn(async move { reconcile_pool.reconcile("a").await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), observe_started.notified())
+                .await
+                .is_err(),
+            "reconciliation must not replace Running while admission is deciding"
+        );
+        assert_eq!(
+            pool.current_status("a").unwrap().lifecycle,
+            Lifecycle::Running
+        );
+
+        drop(admission);
+        tokio::time::timeout(Duration::from_secs(1), observe_started.notified())
+            .await
+            .expect("reconciliation should proceed once admission releases");
+        assert_eq!(
+            pool.current_status("a").unwrap().lifecycle,
+            Lifecycle::Reconciling
+        );
+        assert!(matches!(
+            PoolManager::acquire_active(&pool, "a".into()).await,
+            Err(PoolError::TransitionInProgress { .. })
+        ));
+        assert_eq!(pool.activity("a").unwrap().active(), 0);
+
+        observe_release.notify_one();
+        assert_eq!(
+            reconcile.await.unwrap().unwrap().lifecycle,
+            Lifecycle::Running
+        );
     }
 
     #[tokio::test]
@@ -2749,8 +2992,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn forced_stop_reports_force_decision_count_after_active_guard_drops() {
+    async fn forced_stop_reports_initial_blast_radius_and_remains_durably_drained() {
         let runner = MockRunner::new(&["a"], &["a"]);
+        let controls = runner.clone();
+        let starts = runner.starts.clone();
         let stop_started = Arc::new(Notify::new());
         let stop_release = Arc::new(Notify::new());
         runner
@@ -2764,12 +3009,14 @@ mod tests {
             .await
             .insert("a".into(), stop_release.clone());
         let pool = reconciled_pool(vec![definition("a", "gpu-0")], runner).await;
-        let active = pool.activity("a").unwrap().acquire_active();
+        let mut active: Vec<_> = (0..8)
+            .map(|_| pool.activity("a").unwrap().acquire_active())
+            .collect();
         let handle = PoolManager::begin_lifecycle(
             &pool,
             LifecycleRequest::Stop(StopRequest {
                 service: "a".into(),
-                deadline: Instant::now() + Duration::from_millis(20),
+                deadline: Instant::now() + Duration::from_millis(40),
                 force: true,
             }),
         )
@@ -2777,6 +3024,10 @@ mod tests {
         .unwrap();
         let operation_id = handle.operation_id();
 
+        wait_for_status(&pool, "a", |status| status.lifecycle == Lifecycle::Draining).await;
+        // Completion during the drain window must not rewrite the exact
+        // admission-boundary count recorded for the force decision.
+        active.drain(..7);
         tokio::time::timeout(Duration::from_secs(1), stop_started.notified())
             .await
             .expect("forced stop should reach the blocked runner");
@@ -2787,17 +3038,49 @@ mod tests {
         let outcome = handle.wait_outcome().await;
         assert_eq!(outcome.operation_id, operation_id);
         assert_eq!(
-            outcome.affected_requests, 1,
-            "terminal metadata must retain the count captured before runner.stop"
+            outcome.affected_requests, 8,
+            "terminal metadata must retain the count captured when admission closed"
         );
-        assert_eq!(outcome.result.unwrap().lifecycle, Lifecycle::Stopped);
+        let stopped = outcome.result.unwrap();
+        assert_eq!(stopped.lifecycle, Lifecycle::Drained);
+        assert_eq!(stopped.systemd.state, SystemdState::Inactive);
+        assert!(!controls.services["a"].running.load(Ordering::Acquire));
+
+        assert_eq!(
+            pool.reconcile("a").await.unwrap().lifecycle,
+            Lifecycle::Drained,
+            "observation must preserve the administrative stop latch"
+        );
+        let automatic_restart = pool
+            .ensure_ready_status(
+                "a",
+                EnsureReadyOptions {
+                    deadline: Instant::now() + Duration::from_secs(1),
+                    evict: true,
+                    reactivate_drained: false,
+                },
+            )
+            .await;
+        assert!(matches!(
+            automatic_restart,
+            Err(PoolError::ServiceDrained(service)) if service == "a"
+        ));
+        assert_eq!(
+            starts.load(Ordering::Acquire),
+            0,
+            "automatic demand must not undo an administrative force-stop"
+        );
     }
 
     #[tokio::test]
-    async fn forced_stop_failure_retains_force_decision_count() {
+    async fn forced_stop_failure_retains_count_and_durable_stop_intent() {
         let runner = MockRunner::new(&["a"], &["a"]);
+        let stops = runner.stops.clone();
         runner.fail_stop.store(true, Ordering::Release);
-        let pool = reconciled_pool(vec![definition("a", "gpu-0")], runner).await;
+        let mut service = definition("a", "gpu-0");
+        service.backoff_initial = Duration::ZERO;
+        service.backoff_max = Duration::ZERO;
+        let pool = reconciled_pool(vec![service], runner).await;
         let active = pool.activity("a").unwrap().acquire_active();
         let handle = PoolManager::begin_lifecycle(
             &pool,
@@ -2814,6 +3097,27 @@ mod tests {
         assert_eq!(outcome.affected_requests, 1);
         assert!(matches!(outcome.result, Err(PoolError::Runner { .. })));
         drop(active);
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let status = pool.current_status("a").unwrap();
+        assert_eq!(status.lifecycle, Lifecycle::Drained);
+        assert_eq!(
+            stops.load(Ordering::Acquire),
+            1,
+            "durable administrative stop failure must not schedule automatic recovery"
+        );
+        assert!(matches!(
+            pool.ensure_ready_status(
+                "a",
+                EnsureReadyOptions {
+                    deadline: Instant::now() + Duration::from_secs(1),
+                    evict: true,
+                    reactivate_drained: false,
+                },
+            )
+            .await,
+            Err(PoolError::ServiceDrained(service)) if service == "a"
+        ));
     }
 
     #[tokio::test]
@@ -3056,6 +3360,84 @@ mod tests {
         );
         drop(active);
         drop(parked);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn busy_owner_keeps_placement_while_reconciliation_is_in_flight() {
+        let runner = MockRunner::new(&["owner", "new"], &["owner"]);
+        let controls = runner.clone();
+        let starts = runner.starts.clone();
+        let stops = runner.stops.clone();
+        let pool = reconciled_pool(
+            vec![definition("owner", "gpu-0"), definition("new", "gpu-0")],
+            runner,
+        )
+        .await;
+        let observe_started = Arc::new(Notify::new());
+        let observe_release = Arc::new(Notify::new());
+        controls
+            .observe_started
+            .lock()
+            .await
+            .insert("owner".into(), observe_started.clone());
+        controls
+            .observe_release
+            .lock()
+            .await
+            .insert("owner".into(), observe_release.clone());
+        let mut active = Vec::new();
+        for _ in 0..8 {
+            active.push(
+                PoolManager::acquire_active(&pool, "owner".into())
+                    .await
+                    .unwrap(),
+            );
+        }
+        assert_eq!(pool.activity("owner").unwrap().active(), 8);
+
+        let reconcile_pool = pool.clone();
+        let reconcile =
+            tokio::spawn(async move { reconcile_pool.reconcile("owner").await.unwrap() });
+        tokio::time::timeout(Duration::from_secs(1), observe_started.notified())
+            .await
+            .expect("owner reconciliation should enter its observation window");
+        assert_eq!(
+            pool.current_status("owner").unwrap().lifecycle,
+            Lifecycle::Reconciling
+        );
+
+        let result = pool
+            .ensure_ready_status(
+                "new",
+                EnsureReadyOptions {
+                    deadline: Instant::now() + Duration::from_millis(40),
+                    evict: true,
+                    reactivate_drained: false,
+                },
+            )
+            .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(PoolError::PlacementUnavailable { .. } | PoolError::Deadline { .. })
+            ),
+            "concurrent reconciliation must not hide an awake busy owner: {result:?}"
+        );
+        assert_eq!(starts.load(Ordering::Acquire), 0);
+        assert_eq!(stops.load(Ordering::Acquire), 0);
+        assert!(
+            controls.services["owner"].running.load(Ordering::Acquire),
+            "the busy owner must remain awake"
+        );
+        assert!(
+            !controls.services["new"].running.load(Ordering::Acquire),
+            "the contender must never be double-placed"
+        );
+
+        observe_release.notify_one();
+        assert_eq!(reconcile.await.unwrap().lifecycle, Lifecycle::Running);
+        drop(active);
     }
 
     #[tokio::test]

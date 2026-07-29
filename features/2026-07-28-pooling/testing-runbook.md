@@ -94,20 +94,32 @@ Run the router in the foreground first (`RUST_LOG=info`), systemd unit later.
   continues, other waiters unaffected.
 - **Streaming timeouts:** a long active stream survives past `inter_chunk_timeout_ms`
   total duration; a stall (SIGSTOP the vLLM process mid-stream) kills the stream with
-  a clear error and releases counters.
+  a clear `upstream response idle timeout` error and releases counters.
 - **Crash:** `kill -9` the vLLM main PID mid-stream → clean downstream error, service
   observed failed/inactive, next request re-parks and restarts it.
-- **Router restart under traffic:** `kill` the router during an active stream + idle
-  model running → model units untouched; restarted router reconciles to correct
-  state; stream (necessarily) broken — no admission to unready backends afterward.
+- **Router restart under traffic:** `systemctl restart` (which sends the unit's
+  `KillSignal=SIGINT` fast shutdown) during an active stream + idle model running →
+  the router exits promptly rather than waiting out the grace window; model units
+  untouched; restarted router reconciles to correct state; stream (necessarily)
+  broken — no admission to unready backends afterward. Time the stop: a restart that
+  takes the full `grace_period_seconds` means the unit is delivering SIGTERM, which is
+  the graceful path and always sleeps the whole window even with no traffic.
 - **Graceful upgrade:** new binary `-t`, then `-u`, SIGQUIT old — active SSE stream
-  survives the handoff; models untouched.
+  survives the handoff; models untouched. The old process only exits after the full
+  `grace_period_seconds`, so expect an 11-minute lingering process, and drive this by
+  hand rather than through `systemctl restart`.
 - **Eviction:** two services pinned to the same GPU; request model B while A idles →
   A drains and stops, B starts, B's request parks throughout. Verify a busy A is
   never chosen (fire requests at A continuously and request B → B gets
   placement-unavailable/503 at deadline).
-- **Force-stop:** `stop` with `{"force": true}` against in-flight requests → drain
-  deadline passes, unit stops, audit line carries `affected_requests > 0`.
+- **Force-stop:** `stop` with `{"force": true}` against a known number of in-flight
+  requests → drain deadline passes, the unit remains inactive despite retry traffic,
+  and the terminal audit line carries that exact `affected_requests` count. Within the
+  running router only an explicit start/wake clears the drained stop latch; lifecycle
+  state is not persisted, so also confirm the documented boundary — restart the router
+  and verify the force-stopped service reconciles to `stopped` and that demand traffic
+  restarts it again. Keeping a model down across a router restart is a configuration
+  change (`enabled: false` or `automatic_start: false`), not a runtime latch.
 - **Negative:** oversized body (413), malformed JSON (400), `/sleep` on the data
   plane (404) — confirm none of them triggered any lifecycle action
   (`vllm_router_transitions_total` unchanged).
@@ -116,10 +128,24 @@ Run the router in the foreground first (`RUST_LOG=info`), systemd unit later.
 
 Per `phase0-findings.md`: for each {TP=1, TP=2} × {FP8, NVFP4} × {L1, L2} cell — five
 sleep/wake cycles with fixed-prompt output sanity, wake latency, residual VRAM
-(nvidia-smi), pinned host RAM, 503-while-asleep, drain-then-sleep, sleep-mid-request
-refusal, L2 three-step wake, **and the L1→L2 tier promotion**. Only passing cells get
-`sleep: {enabled: true, hardware_validated: true}`. Record per-model results in
-`docs/{model-id}.md` per convention — these measurements are also v2 planner inputs.
+(nvidia-smi), pinned host RAM, direct-asleep behavior characterization, drain-then-sleep,
+sleep-mid-request refusal, L2 three-step wake, **and the L1→L2 tier promotion**. The
+router-level drill must prove that fresh fail-closed admission rejects stale or asleep
+facts, wakes and reprobes before forwarding, and bounds any post-admission stall with
+the inter-chunk idle timeout; do not expect or depend on a backend 503. Read the
+refusals off `vllm_router_admission_rejections_total{reason=…}` rather than inferring
+them from 503 bodies, and check `reason="stale_probe"` stays at zero during ordinary
+traffic — a nonzero count there means observation is falling behind
+`readiness.maximum_probe_age_ms` and would 503 every service, not just the asleep one. Only passing
+cells get `sleep: {enabled: true, hardware_validated: true}`. Record per-model results
+in `docs/{model-id}.md` per convention — these measurements are also v2 planner inputs.
+Any topology that fails before the matrix must also be recorded in the service's
+`compatibility.unsupported_tensor_parallelism`; configuration validation must reject
+that degree until the exact checkpoint/runtime/host cell is revalidated successfully.
+Round the maximum measured L1 `MemoryCurrent` ratio up with margin and store the
+resulting byte floor in `compatibility.minimum_l1_host_ram_bytes` even if sleep remains
+disabled. A future L1 declaration must meet that floor before the aggregate host-RAM
+budget can validate.
 
 ## Tier 6 — load & soak
 

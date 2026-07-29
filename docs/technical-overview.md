@@ -87,8 +87,10 @@ Request handling, in order (`proxy/ingress.rs`):
    modified); aliases resolve to a canonical served-model name; unknown → OpenAI-shaped
    404. Invalid requests fail here — before any lifecycle machinery can be triggered.
 4. **Admission.** Fast path: among `Running` replicas of the model, pick least-inflight
-   and atomically acquire an exact active-request guard (a drain racing this loses —
-   admission is serialized against lifecycle transitions per service).
+   and atomically acquire an exact active-request guard. Under the same per-service
+   admission lock, require a fresh cached observation showing systemd active, healthy
+   and ready with the expected served model, and no sleep level. Stale, incomplete,
+   or sleeping observations fail closed; a drain or reconcile racing admission wins.
 5. **Parking (cold path).** If nothing is running: acquire global and per-model parking
    permits (semaphores — exhaustion returns 503 + `Retry-After`), then a parked-slot
    guard, then call `ensure_ready` with the service's parking deadline. The deadline is
@@ -104,7 +106,9 @@ Request handling, in order (`proxy/ingress.rs`):
    Response chunks stream through one at a time; nothing aggregates SSE, and
    compression is never enabled. The reqwest client's read timeout is the **inter-chunk**
    idle deadline (reqwest resets it on every received byte), so long active generations
-   survive while a stalled stream fails.
+   survive while a stalled stream fails. Reqwest timeout sources are classified before
+   logging, producing a bounded `upstream response idle timeout` diagnostic instead of
+   its generic response-body decode wrapper.
 7. **Failover.** Only a *connect* failure (no bytes sent) may retry on a different
    replica, once. After the request may have reached an upstream — and certainly after
    response headers or SSE data reach the client — no retry occurs.
@@ -171,11 +175,16 @@ because sm_120/Blackwell has open upstream bugs (see the Phase-0 matrix). The ru
 speaks vLLM 0.26's dev-mode surface: `POST /sleep?level=N`, `GET /is_sleeping`, and for
 L2 wake the required three-step sequence — `wake_up?tags=weights` →
 `collective_rpc {"method":"reload_weights"}` → `wake_up?tags=kv_cache` — asserted by a
-sequence test. A sleeping vLLM answers inference with 503 and queues nothing, which is
-why the router's parking + wake-then-forward design exists. Budget validation accounts
-for sleep: L1 pins roughly weight-size host RAM, and slept services retain residual
-VRAM, both declared per service and checked across every allowed awake/asleep
-combination at config load.
+sequence test. On the tested vLLM 0.26/sm_120 combinations, direct inference against a
+sleeping backend was accepted but produced no bytes before the client timed out; it did
+not return 503. The router therefore never treats a backend response as the sleep
+safety barrier: fresh fail-closed admission parks an asleep model, wakes and reprobes
+it before forwarding, and the inter-chunk idle timeout bounds a backend that stalls
+after admission. Budget validation accounts for sleep: an L1 reservation must meet the
+service's checkpoint/runtime-specific measured pinned-RAM floor, because the on-host
+FP8 and NVFP4 measurements exceeded weight size. Slept services also retain residual
+VRAM; both reservations are checked across every allowed awake/asleep combination at
+config load.
 
 ## Observation and reconciliation
 
@@ -192,7 +201,17 @@ readiness, so a single blip neither admits nor evicts traffic. A periodic backgr
 service reconciles all services and runs the idle reaper; router startup begins in
 `Reconciling` and reconstructs the entire pool picture from these observations — the
 router trusts what it sees, not what it last did, so out-of-band `systemctl` actions
-converge instead of desynchronizing.
+converge instead of desynchronizing. That also bounds what a runtime latch can promise:
+`drained` is held in memory and survives reconciliation, but not a router restart.
+
+One loop reconciles every service, so the *shortest* configured
+`readiness.interval_ms` is the observation cadence for all of them
+(`RouterConfig::observation_interval_ms`). Because admission rejects probe facts older
+than `readiness.maximum_probe_age_ms`, that budget is load-bearing rather than
+advisory: config validation requires it to cover two observation periods plus one probe
+timeout, so a single missed or slow pass degrades latency instead of 503-ing the fleet.
+`vllm_router_admission_rejections_total{reason="stale_probe"}` is the signal that the
+margin is being consumed.
 
 ## Exact accounting
 

@@ -52,11 +52,15 @@ impl Lifecycle {
         self == Self::Running
     }
 
-    /// States that reserve an awake placement while a service is converging.
+    /// States that conservatively reserve an awake placement.
+    ///
+    /// Reconciliation and unknown observations must fail closed: either can describe an
+    /// already-running process whose last authoritative observation is temporarily hidden.
     pub fn owns_awake_placement(self) -> bool {
         matches!(
             self,
-            Self::Starting
+            Self::Reconciling
+                | Self::Starting
                 | Self::Running
                 | Self::Draining
                 | Self::Waking
@@ -64,6 +68,7 @@ impl Lifecycle {
                 | Self::Failed
                 | Self::Backoff
                 | Self::Stale
+                | Self::Unknown
         )
     }
 }
@@ -487,6 +492,12 @@ mod tests {
         assert!(!Lifecycle::Drained.is_ready());
         assert!(!Lifecycle::Drained.is_transitioning());
         assert!(!Lifecycle::Drained.owns_awake_placement());
+    }
+
+    #[test]
+    fn uncertain_lifecycle_states_reserve_placement() {
+        assert!(Lifecycle::Reconciling.owns_awake_placement());
+        assert!(Lifecycle::Unknown.owns_awake_placement());
     }
 
     #[test]

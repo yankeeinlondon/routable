@@ -117,6 +117,7 @@ pub struct DataPlane {
     config: Arc<ConfigStore>,
     pool: Arc<dyn PoolManager>,
     client: reqwest::Client,
+    inter_chunk_timeout: Duration,
     global_parked: Arc<Semaphore>,
     model_parked: RwLock<HashMap<String, Arc<Semaphore>>>,
 }
@@ -138,10 +139,12 @@ impl DataPlane {
                     ))
                 });
         }
+        let inter_chunk_timeout = Duration::from_millis(snapshot.policies.inter_chunk_timeout_ms);
         Ok(Self {
             config,
             pool,
             client,
+            inter_chunk_timeout,
             global_parked: Arc::new(Semaphore::new(
                 snapshot.policies.global_parked_request_limit,
             )),
@@ -524,7 +527,11 @@ impl DataPlane {
             if error.is_connect() {
                 IngressError::ConnectFailure(error)
             } else {
-                IngressError::Upstream(error)
+                classify_upstream_error(
+                    error,
+                    self.inter_chunk_timeout,
+                    "waiting for response headers",
+                )
             }
         })?;
         let status = response.status().as_u16();
@@ -556,7 +563,9 @@ impl DataPlane {
         http.write_response_header(Box::new(downstream))
             .await
             .map_err(IngressError::Pingora)?;
-        while let Some(chunk) = response.chunk().await.map_err(IngressError::Upstream)? {
+        while let Some(chunk) = response.chunk().await.map_err(|error| {
+            classify_upstream_error(error, self.inter_chunk_timeout, "reading the response body")
+        })? {
             http.write_response_body(chunk, false)
                 .await
                 .map_err(IngressError::Pingora)?;
@@ -699,6 +708,22 @@ fn build_upstream_client(config: &RouterConfig) -> Result<reqwest::Client, reqwe
         .build()
 }
 
+fn classify_upstream_error(
+    error: reqwest::Error,
+    idle_timeout: Duration,
+    phase: &'static str,
+) -> IngressError {
+    if error.is_timeout() {
+        IngressError::UpstreamTimeout {
+            idle_timeout,
+            phase,
+            source: error,
+        }
+    } else {
+        IngressError::Upstream(error)
+    }
+}
+
 async fn acquire_first_running<F, Fut>(
     candidates: Vec<ServiceDefinition>,
     mut acquire: F,
@@ -785,6 +810,13 @@ enum IngressError {
     Pool(#[from] PoolError),
     #[error("upstream HTTP error: {0}")]
     Upstream(#[source] reqwest::Error),
+    #[error("upstream response idle timeout after {idle_timeout:?} while {phase}")]
+    UpstreamTimeout {
+        idle_timeout: Duration,
+        phase: &'static str,
+        #[source]
+        source: reqwest::Error,
+    },
     #[error("upstream connection failed before request transmission: {0}")]
     ConnectFailure(#[source] reqwest::Error),
     #[error("JSON serialization error: {0}")]
@@ -993,6 +1025,7 @@ mod tests {
         ensure_started: Notify,
         ensure_cancelled: Arc<AtomicBool>,
         active_attempts: Mutex<Vec<String>>,
+        sleep_on_next_acquire: AtomicBool,
     }
 
     struct CancellationFlag(Arc<AtomicBool>);
@@ -1029,6 +1062,7 @@ mod tests {
                 ensure_started: Notify::new(),
                 ensure_cancelled: Arc::new(AtomicBool::new(false)),
                 active_attempts: Mutex::new(Vec::new()),
+                sleep_on_next_acquire: AtomicBool::new(false),
             }
         }
 
@@ -1183,6 +1217,19 @@ mod tests {
 
         async fn acquire_active(&self, service: String) -> Result<ActiveGuard, PoolError> {
             self.active_attempts.lock().unwrap().push(service.clone());
+            if self.sleep_on_next_acquire.swap(false, Ordering::AcqRel) {
+                *self
+                    .lifecycles
+                    .lock()
+                    .unwrap()
+                    .get_mut(&service)
+                    .ok_or_else(|| PoolError::UnknownService(service.clone()))? =
+                    Lifecycle::AsleepL1;
+                return Err(PoolError::PlacementUnavailable {
+                    service,
+                    reason: "sleep was observed during active admission".into(),
+                });
+            }
             if self.status_for(&service)?.lifecycle != Lifecycle::Running {
                 return Err(PoolError::PlacementUnavailable {
                     service,
@@ -1375,6 +1422,68 @@ mod tests {
             http::HeaderValue::from_static("application/json"),
         );
         assert!(!is_event_stream(&headers));
+    }
+
+    #[tokio::test]
+    async fn stalled_response_body_is_classified_as_bounded_inter_chunk_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend = listener.local_addr().unwrap();
+        let upstream = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _ = read_upstream_request(&mut stream).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\n\
+                      Content-Type: text/event-stream\r\n\
+                      Transfer-Encoding: chunked\r\n\
+                      Connection: close\r\n\r\n\
+                      D\r\n\
+                      data: first\n\n\r\n",
+                )
+                .await
+                .unwrap();
+            stream.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+
+        let idle_timeout = Duration::from_millis(30);
+        let client = reqwest::Client::builder()
+            .read_timeout(idle_timeout)
+            .build()
+            .unwrap();
+        let mut response = client
+            .post(format!("http://{backend}/v1/chat/completions"))
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.chunk().await.unwrap().unwrap(),
+            Bytes::from_static(b"data: first\n\n")
+        );
+
+        let error = response.chunk().await.unwrap_err();
+        assert!(error.is_timeout());
+        let classified = classify_upstream_error(error, idle_timeout, "reading the response body");
+        match &classified {
+            IngressError::UpstreamTimeout {
+                idle_timeout,
+                phase,
+                ..
+            } => {
+                assert_eq!(*idle_timeout, Duration::from_millis(30));
+                assert_eq!(*phase, "reading the response body");
+            }
+            other => panic!("expected timeout classification, got {other}"),
+        }
+        let message = classified.to_string();
+        assert_eq!(
+            message,
+            "upstream response idle timeout after 30ms while reading the response body"
+        );
+        assert!(!message.contains("decoding response body"));
+        assert!(message.len() < 128);
+        upstream.await.unwrap();
     }
 
     #[test]
@@ -1624,6 +1733,85 @@ mod tests {
         assert_eq!(
             *attempts.lock().unwrap(),
             vec!["example-30b", "second-replica"]
+        );
+    }
+
+    #[tokio::test]
+    async fn sleep_probe_failure_falls_back_to_the_next_ready_replica() {
+        let config: RouterConfig = serde_yaml::from_str(include_str!("../config/example.yaml"))
+            .expect("example config should parse");
+        let first = config.services[0].clone();
+        let mut second = first.clone();
+        second.name = "second-replica".into();
+        let activity = Activity::new();
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+
+        let selected = acquire_first_running(vec![first, second], {
+            let attempts = Arc::clone(&attempts);
+            move |service| {
+                let activity = activity.clone();
+                let attempts = Arc::clone(&attempts);
+                async move {
+                    attempts.lock().unwrap().push(service.clone());
+                    if service == "example-30b" {
+                        Err(PoolError::Runner {
+                            service,
+                            message: "sleep observation timed out".into(),
+                        })
+                    } else {
+                        Ok(activity.acquire_active())
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap()
+        .expect("bounded sleep-probe failure should fail over");
+
+        assert_eq!(selected.0.name, "second-replica");
+        assert_eq!(
+            *attempts.lock().unwrap(),
+            vec!["example-30b", "second-replica"]
+        );
+    }
+
+    #[tokio::test]
+    async fn sleep_racing_active_admission_never_reaches_the_backend() {
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend = upstream.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_millis(250), upstream.accept()).await
+        });
+        let config = test_config(&[backend]);
+        let pool = Arc::new(FakePool::new(
+            config.snapshot().as_ref(),
+            Lifecycle::Running,
+            EnsureBehavior::Error(PoolError::Deadline {
+                service: "replica-0".into(),
+                operation: "wake",
+            }),
+        ));
+        pool.sleep_on_next_acquire.store(true, Ordering::Release);
+        let plane = Arc::new(DataPlane::new(config, pool.clone()).unwrap());
+        let (mut client, ingress_task) = ingress_connection(plane).await;
+        write_inference_request(
+            &mut client,
+            br#"{"model":"example/model-30b","messages":[]}"#,
+        )
+        .await;
+
+        let response = read_response(client).await;
+        ingress_task.await.unwrap();
+        assert!(
+            response.starts_with(b"HTTP/1.1 503"),
+            "sleep race must fail before forwarding: {}",
+            String::from_utf8_lossy(&response)
+        );
+        assert_eq!(pool.activity("replica-0").active(), 0);
+        assert_eq!(pool.ensure_calls.load(Ordering::Acquire), 1);
+        assert!(
+            upstream_task.await.unwrap().is_err(),
+            "a sleeping backend must not receive inference bytes"
         );
     }
 

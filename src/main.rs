@@ -180,13 +180,10 @@ fn publish_state_metrics(services: &[vllm_router::state::ServiceStatus]) {
     }
 }
 
+/// The loop period must stay the value `validate_probe_freshness` budgeted against, so
+/// it is derived from the configuration rather than recomputed here.
 fn observation_interval(config: &RouterConfig) -> Duration {
-    config
-        .services
-        .iter()
-        .map(|service| Duration::from_millis(service.readiness.interval_ms))
-        .min()
-        .unwrap_or(Duration::from_secs(2))
+    Duration::from_millis(config.observation_interval_ms())
 }
 
 fn parse_arguments() -> Result<Arguments, String> {
@@ -289,6 +286,54 @@ mod tests {
     #[test]
     fn accepts_foreground_mode() {
         ensure_foreground_mode(false).expect("foreground mode must remain supported");
+    }
+
+    #[test]
+    fn deployment_shutdown_window_covers_long_stream_target() {
+        const LONG_STREAM_TARGET_SECONDS: u64 = 10 * 60;
+
+        let configuration = ServerConf::from_yaml(include_str!("../deploy/pingora.yaml"))
+            .expect("deployment Pingora configuration should parse");
+        let grace = configuration
+            .grace_period_seconds
+            .expect("deployment must configure an explicit request-drain grace");
+        let runtime_shutdown = configuration
+            .graceful_shutdown_timeout_seconds
+            .expect("deployment must configure an explicit runtime shutdown timeout");
+
+        assert!(
+            grace > LONG_STREAM_TARGET_SECONDS,
+            "deployment grace must cover the ten-minute stream target with handoff margin"
+        );
+        assert_eq!(
+            runtime_shutdown, 0,
+            "Pingora 0.8 waits the full runtime shutdown timeout after request drain"
+        );
+
+        let unit = include_str!("../deploy/vllm-router.service");
+        let supervisor_timeout = unit
+            .lines()
+            .find_map(|line| line.strip_prefix("TimeoutStopSec="))
+            .expect("deployment unit must configure TimeoutStopSec")
+            .parse::<u64>()
+            .expect("deployment TimeoutStopSec must be an integer number of seconds");
+        assert!(
+            supervisor_timeout > grace + runtime_shutdown,
+            "systemd TimeoutStopSec must exceed Pingora's complete shutdown window"
+        );
+
+        // Pingora's graceful path sleeps for the entire grace period whether or not
+        // anything is still in flight, so a grace window sized for long streams must not
+        // also be the cost of `systemctl stop`. SIGINT selects fast shutdown; SIGQUIT and
+        // the -u handoff remain the stream-preserving path.
+        let kill_signal = unit
+            .lines()
+            .find_map(|line| line.strip_prefix("KillSignal="))
+            .expect("deployment unit must pin an explicit administrative stop signal");
+        assert_eq!(
+            kill_signal, "SIGINT",
+            "a long stream grace window must not become the cost of every administrative stop"
+        );
     }
 
     #[test]

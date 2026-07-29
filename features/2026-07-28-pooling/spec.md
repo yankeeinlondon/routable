@@ -179,19 +179,30 @@ Sleep-mode facts that shape the design (verified against vLLM 0.26 docs/repo, 20
 - Wake latency: L1 sub-second, L2 a few seconds. Cold start on a 5090 is tens of seconds to
   **minutes** in bad cases (documented ~277 s for a 30B NVFP4 model on sm_120; ~210 s of that
   is uncached warmup). This is the core argument for sleep.
-- Costs: L1 pins ~weight-size CPU RAM (page-locked, unswappable — budget against 187 GB);
-  ~1–3 GB residual VRAM per slept server (CUDA context/graphs — measure with nvidia-smi,
-  torch counters lie); KV/prefix cache is discarded at both levels.
-- Behavior: a slept server returns **503** to inference requests (they are not queued) — the
-  router must wake-then-forward, which matches the parked-request design. Drain in-flight
-  requests before sleeping (sleeping mid-request → CUDA crash). Do one warmup request after
-  first start; validate whether each model/quantization also requires warmup after wake.
+- Costs: L1 pins more than weight-size CPU RAM on the validated host (page-locked,
+  unswappable — budget against 187 GB). Record a conservative measured floor per exact
+  checkpoint/runtime/topology and reject a smaller L1 declaration; ~1–3 GB residual
+  VRAM remains per slept server (CUDA context/graphs — measure with nvidia-smi, torch
+  counters lie). KV/prefix cache is discarded at both levels.
+- Behavior: on the tested vLLM 0.26/sm_120 combinations, a slept server accepted an
+  inference request but returned no bytes before the client timed out; it did **not**
+  return 503. Backend refusal is therefore not a safety mechanism. Active admission
+  requires a fresh cached observation proving the service is running, systemd-active,
+  ready and healthy with the expected served model, and not asleep; stale, incomplete,
+  or sleeping observations fail closed. An asleep request must park, wake, and reprobe
+  before forwarding, while the inter-chunk idle timeout bounds a backend that stalls
+  after admission. Drain in-flight requests before sleeping (sleeping mid-request →
+  CUDA crash). Do one warmup request after first start; validate whether each
+  model/quantization also requires warmup after wake.
 - **Validation spike required before relying on it:** known open Blackwell issues — TP=2
   init crash with `--enable-sleep-mode` (#21336) and FP8-KV wake crash (#39078). Test on this
   box with our exact vLLM version, model, quantization, TP mode, KV-cache dtype, and sleep
   level. The test must include generation correctness before and after repeated sleep/wake
   cycles, draining an active stream, residual VRAM/host RAM measurement, and failure
-  recovery. Keep stop/start as the fallback path.
+  recovery. Keep stop/start as the fallback path. A tensor-parallel degree that fails
+  this validation is persisted in
+  `compatibility.unsupported_tensor_parallelism` and rejected at configuration load
+  until that exact checkpoint/runtime/host cell is revalidated.
 
 ## Request routing and proxy behavior
 
@@ -307,6 +318,8 @@ only to loopback, and the router is the sole supported client-facing entry point
 - Public clients cannot reach `/pool` mutations or vLLM development endpoints.
 - Sleep support remains disabled for a service until the hardware-specific validation matrix
   passes, and a failed wake falls back according to the configured stop/start policy.
+- No inference request reaches a backend observed asleep, stale, or inconsistently ready;
+  admission fails closed and wake readiness is reprobed before forwarding.
 - Metrics and status distinguish stopped, starting, running, draining, asleep, waking,
   stopping, failed/backoff, and stale/unknown observed state.
 

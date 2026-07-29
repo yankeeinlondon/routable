@@ -9,6 +9,17 @@ ExecStart=/usr/local/bin/vllm-router -c /etc/vllm-router/pingora.yaml --router-c
 Restart=on-failure
 RestartSec=2
 TimeoutStartSec=30
+# Pingora 0.8 maps SIGINT to fast shutdown, SIGTERM to graceful shutdown, and
+# SIGQUIT to the graceful upgrade handoff. Its graceful path is an unconditional
+# sleep for the whole of pingora.yaml's grace_period_seconds — it does not exit
+# early once requests drain — so leaving the default SIGTERM here would make every
+# administrative stop and every restart-to-apply-config take that full window even
+# with zero requests in flight. Administrative stops therefore use fast shutdown;
+# streams that must survive a handoff use the zero-downtime upgrade path instead
+# (start the new binary with -u, then SIGQUIT the old one).
+KillSignal=SIGINT
+# Only reached if the process wedges, or if SIGTERM is delivered by hand: it must
+# still exceed pingora's complete graceful window rather than SIGKILL mid-drain.
 TimeoutStopSec=900
 LimitNOFILE=262144
 ConfigurationDirectory=vllm

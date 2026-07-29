@@ -14,6 +14,9 @@ use std::sync::{Arc, RwLock};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+/// Observation period used when no service is configured at all.
+const DEFAULT_OBSERVATION_INTERVAL_MS: u64 = 2_000;
+
 /// A fully parsed and validated router configuration.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -52,6 +55,7 @@ impl RouterConfig {
         validate_inventory(&self.inventory, &mut errors);
         validate_policies(&self.policies, &mut errors);
         validate_services(self, &mut errors);
+        validate_probe_freshness(self, &mut errors);
         validate_resource_budgets(self, &mut errors);
 
         if errors.is_empty() {
@@ -59,6 +63,21 @@ impl RouterConfig {
         } else {
             Err(ValidationErrors(errors))
         }
+    }
+
+    /// Period of the single background observation loop.
+    ///
+    /// Every tick reconciles every service, so the shortest configured readiness
+    /// interval sets the refresh cadence for all of them. Admission rejects probe
+    /// facts older than `readiness.maximum_probe_age_ms`, which makes this the
+    /// authoritative input to that budget — the runtime loop and the configuration
+    /// validator must therefore derive it from this one function.
+    pub fn observation_interval_ms(&self) -> u64 {
+        self.services
+            .iter()
+            .map(|service| service.readiness.interval_ms)
+            .min()
+            .unwrap_or(DEFAULT_OBSERVATION_INTERVAL_MS)
     }
 
     /// Resolve a canonical model name or alias to its canonical name.
@@ -435,6 +454,14 @@ pub struct VllmCompatibility {
     pub maximum_model_length: Option<u64>,
     pub kv_cache_dtype: Option<String>,
     pub gpu_memory_utilization: f64,
+    /// Conservative measured floor for L1's pinned host memory for this exact
+    /// checkpoint/runtime/topology. It may be recorded while sleep remains
+    /// disabled; enabling L1 must reserve at least this many bytes.
+    pub minimum_l1_host_ram_bytes: u64,
+    /// Tensor-parallel degrees known to fail for this exact checkpoint/runtime
+    /// combination. This keeps a failed hardware-validation cell from being
+    /// selected accidentally while leaving other checkpoints unaffected.
+    pub unsupported_tensor_parallelism: Vec<usize>,
 }
 
 impl Default for VllmCompatibility {
@@ -443,6 +470,8 @@ impl Default for VllmCompatibility {
             maximum_model_length: None,
             kv_cache_dtype: None,
             gpu_memory_utilization: 0.9,
+            minimum_l1_host_ram_bytes: 0,
+            unsupported_tensor_parallelism: Vec::new(),
         }
     }
 }
@@ -1129,6 +1158,35 @@ fn validate_readiness(service: &ServiceDefinition, location: &str, errors: &mut 
     }
 }
 
+/// Require a probe-freshness budget that survives one missed observation tick.
+///
+/// `maximum_probe_age_ms` is not advisory: admission rejects any service whose cached
+/// readiness is older than it, so a budget that merely equals the observation cadence
+/// turns ordinary observation jitter into fleet-wide 503s. The background loop reconciles
+/// every service on one shared period and skips missed ticks, and a probe is only stamped
+/// once it resolves, so the budget must cover two periods plus one probe timeout.
+fn validate_probe_freshness(config: &RouterConfig, errors: &mut Vec<String>) {
+    let observation_interval_ms = config.observation_interval_ms();
+    for (index, service) in config.services.iter().enumerate() {
+        let readiness = &service.readiness;
+        // Zero-valued inputs are already reported by `validate_readiness`; deriving a
+        // floor from them here would only add noise to the same root cause.
+        if observation_interval_ms == 0 || readiness.timeout_ms == 0 {
+            continue;
+        }
+        let required = observation_interval_ms
+            .saturating_mul(2)
+            .saturating_add(readiness.timeout_ms);
+        if readiness.maximum_probe_age_ms < required {
+            let location = format!("services[{index}] ({:?})", service.name);
+            errors.push(format!(
+                "{location}.readiness.maximum_probe_age_ms {} is below the {required} ms admission-freshness floor (two {observation_interval_ms} ms observation periods plus a {} ms probe timeout); the shortest configured readiness.interval_ms sets the cadence for every service",
+                readiness.maximum_probe_age_ms, readiness.timeout_ms
+            ));
+        }
+    }
+}
+
 fn validate_timing(
     service: &ServiceDefinition,
     location: &str,
@@ -1229,6 +1287,17 @@ fn validate_sleep(service: &ServiceDefinition, location: &str, errors: &mut Vec<
                     "{location}.sleep.l1_host_ram_bytes must be greater than zero for L1"
                 ));
             }
+            let measured_minimum = service.compatibility.minimum_l1_host_ram_bytes;
+            if measured_minimum == 0 {
+                errors.push(format!(
+                    "{location}.compatibility.minimum_l1_host_ram_bytes must record a measured conservative floor before L1 is enabled"
+                ));
+            } else if sleep.l1_host_ram_bytes < measured_minimum {
+                errors.push(format!(
+                    "{location}.sleep.l1_host_ram_bytes {} is below compatibility.minimum_l1_host_ram_bytes {measured_minimum}",
+                    sleep.l1_host_ram_bytes
+                ));
+            }
             if idle.sleep_l1_after_ms.is_none() {
                 errors.push(format!(
                     "{location}.idle.sleep_l1_after_ms is required when L1 is enabled"
@@ -1298,6 +1367,24 @@ fn validate_compatibility(service: &ServiceDefinition, location: &str, errors: &
     if compatibility.maximum_model_length == Some(0) {
         errors.push(format!(
             "{location}.compatibility.maximum_model_length must be greater than zero"
+        ));
+    }
+    let mut unsupported_tensor_parallelism = HashSet::new();
+    for degree in &compatibility.unsupported_tensor_parallelism {
+        if *degree == 0 {
+            errors.push(format!(
+                "{location}.compatibility.unsupported_tensor_parallelism values must be greater than zero"
+            ));
+        } else if !unsupported_tensor_parallelism.insert(*degree) {
+            errors.push(format!(
+                "{location}.compatibility.unsupported_tensor_parallelism contains duplicate degree {degree}"
+            ));
+        }
+    }
+    if unsupported_tensor_parallelism.contains(&service.placement.tensor_parallelism) {
+        errors.push(format!(
+            "{location}.placement.tensor_parallelism {} is explicitly unsupported by this service's hardware compatibility declaration",
+            service.placement.tensor_parallelism
         ));
     }
 }

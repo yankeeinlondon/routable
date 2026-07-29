@@ -242,19 +242,24 @@ impl ControlPlane {
             Err(error) => return mutation_start_error(error),
         };
         let id = handle.operation_id();
+        let joined_existing = handle.joined_existing();
         let (operation, inserted) = self
             .operations
             .register_running(id, kind, service.to_owned());
-        info!(
-            audit = true,
-            operation_id = %id,
-            service,
-            action,
-            joined_existing = !inserted,
-            force,
-            evict = options.evict.unwrap_or(false),
-            "pool mutation accepted"
-        );
+        // Joined flights are audited at the pool boundary so data-plane
+        // stampedes and management requests share one authoritative record.
+        if !joined_existing {
+            info!(
+                audit = true,
+                operation_id = %id,
+                service,
+                action,
+                joined_existing = false,
+                force,
+                evict = options.evict.unwrap_or(false),
+                "pool mutation accepted"
+            );
+        }
         if inserted {
             let store = self.operations.clone();
             let action = action.to_owned();
@@ -696,8 +701,8 @@ mod tests {
             true,
             TransitionOutcome {
                 operation_id,
-                affected_requests: 3,
-                result: Ok(observed("model-a", Lifecycle::Stopped)),
+                affected_requests: 8,
+                result: Ok(observed("model-a", Lifecycle::Drained)),
             },
         );
         assert_eq!(state, OperationState::Succeeded);
@@ -709,7 +714,7 @@ mod tests {
                 service: "model-a".into(),
                 force: true,
                 result: "succeeded",
-                affected_requests: 3,
+                affected_requests: 8,
             }
         );
 
@@ -719,7 +724,7 @@ mod tests {
             true,
             TransitionOutcome {
                 operation_id,
-                affected_requests: 3,
+                affected_requests: 8,
                 result: Err(PoolError::Runner {
                     service: "model-a".into(),
                     message: "unbounded runner diagnostic stays out of the audit payload".into(),
@@ -731,7 +736,7 @@ mod tests {
             OperationState::Failed { ref code, .. } if code == "runner_failure"
         ));
         assert_eq!(audit.result, "failed");
-        assert_eq!(audit.affected_requests, 3);
+        assert_eq!(audit.affected_requests, 8);
         assert_eq!(audit.operation_id, operation_id);
     }
 

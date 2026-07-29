@@ -8,7 +8,11 @@ upgrade_sock: /run/vllm-router-upgrade.sock
 upstream_keepalive_pool_size: 128
 daemon_wait_for_ready: true
 daemon_ready_timeout_seconds: 30
-grace_period_seconds: 10
+# Pingora 0.8 keeps in-flight requests alive only for this fixed grace window
+# after a graceful shutdown/upgrade begins. Eleven minutes covers the project's
+# ten-minute active-stream acceptance target with one minute of handoff margin.
+# Keep the supervisor's TimeoutStopSec greater than this value.
+grace_period_seconds: 660
 # Pingora 0.8 waits this entire duration after the grace period, even when all
 # service tasks have exited. Active requests already receive the grace period.
 graceful_shutdown_timeout_seconds: 0

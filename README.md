@@ -147,7 +147,12 @@ complete, commented service:
   `sleep_l2_after_ms` → `stop_after_ms`), short-parking policy,
   priority/evictability, and
   sleep settings. Sleep stays off unless the service is explicitly marked
-  `hardware_validated: true`. If omitted, `runner_executable` defaults to
+  `hardware_validated: true`. Known-bad checkpoint/runtime topologies belong in
+  `compatibility.unsupported_tensor_parallelism`; config validation then prevents
+  that tensor-parallel degree from being selected. A conservative measured L1
+  pinned-RAM floor belongs in `compatibility.minimum_l1_host_ram_bytes`; enabling L1
+  requires `sleep.l1_host_ram_bytes` to meet that floor before the aggregate host
+  budget is checked. If omitted, `runner_executable` defaults to
   `/opt/vllm-venv/bin/vllm` for compatibility with existing deployments.
 
 ## API surface
@@ -207,10 +212,17 @@ audit-logged and returns `202` with an `operation_id`.
 | `POST /pool/v1/services/{name}/wake` | same as start, for a sleeping service |
 | `POST /pool/v1/services/{name}/drain` | remove from selection and wait for in-flight work to finish |
 | `POST /pool/v1/services/{name}/sleep` | drain then sleep; body: `{"level": "l1"\|"l2"}` |
-| `POST /pool/v1/services/{name}/stop` | drain then stop the unit; `{"force": true}` stops after the drain deadline even with work in flight |
+| `POST /pool/v1/services/{name}/stop` | drain then stop the unit; `{"force": true}` stops after the drain deadline even with work in flight and holds the service drained until an explicit start/wake |
 | `GET /pool/v1/operations/{id}` | progress / terminal result of an accepted mutation |
 | `POST /pool/v1/reconcile` | re-observe systemd + probes + NVML and converge state |
 | `GET /livez`, `GET /readyz` | router process liveness / routing readiness (no auth) |
+
+`drained` is a runtime latch held by the running router, not persisted state. It
+survives reconciliation — an observation never converts it back to `running` or
+`stopped` — but a router restart rebuilds observed state from scratch, so a drained or
+force-stopped service reconciles to whatever systemd reports and demand traffic may
+start it again. To keep a model down across a router restart, set `enabled: false` or
+`automatic_start: false` and restart to apply.
 
 ```console
 curl -s -H "Authorization: Bearer $(cat /run/secrets/vllm-router-token)" \
@@ -232,6 +244,7 @@ Prometheus text format:
 | `vllm_router_parking_duration_seconds{model}` | how long parked requests waited |
 | `vllm_router_transitions_total{service,transition,result}` | lifecycle transition attempts |
 | `vllm_router_probe_failures_total{service,probe}` | failed systemd/HTTP/NVML observations |
+| `vllm_router_admission_rejections_total{service,reason}` | fail-closed admission refusals; `reason` is one of `transition_in_progress`, `lifecycle_not_running`, `asleep`, `stale_probe`, `systemd_not_active`, `not_ready`, `served_model_mismatch`. A rising `stale_probe` across every service means observation is not keeping up with `readiness.maximum_probe_age_ms`, not that the backends are unhealthy |
 | `vllm_router_active_requests{service}` | exact in-flight requests per service |
 | `vllm_router_service_state{service,state}` | one-hot lifecycle state per service |
 | `vllm_router_start_phase_duration_seconds{service,phase,result}` | cold-start duration for systemd activation, readiness, and HTTP warmup phases |
@@ -269,7 +282,25 @@ vllm-router -c <pingora.yaml> [--router-config <router.yaml>] [-t] [-u]
 - **Router restart/upgrade never stops healthy models.** For zero-downtime binary
   upgrades, start the new binary with `-u` (after it passes `-t`) and send `SIGQUIT` to
   the old one; listeners hand over via the upgrade socket and in-flight streams drain
-  within the configured grace period.
+  within the configured grace period. Pingora 0.8 uses a fixed grace window and then
+  terminates any request still running; the supplied `deploy/pingora.yaml` therefore
+  allows 11 minutes for the project's 10-minute active-stream target. Increase it if
+  production generations can run longer, and keep systemd's `TimeoutStopSec` greater
+  than the Pingora grace window.
+- **The stop signal decides which of those two costs you pay.** Pingora's graceful path
+  sleeps for the *entire* grace window whether or not anything is in flight — it does
+  not exit early once requests drain. So the signal, not the traffic, sets the shutdown
+  time:
+
+  | Signal | Pingora behavior | Use for |
+  |---|---|---|
+  | `SIGINT` | fast shutdown, exits immediately, in-flight requests die | `systemctl stop`/`restart`, including restart-to-apply-config |
+  | `SIGTERM` | graceful: always waits the full grace window (11 min here) | nothing routine — it costs the whole window even when idle |
+  | `SIGQUIT` | graceful upgrade: hands listeners over, then drains within the window | the `-u` zero-downtime upgrade above |
+
+  `deploy/vllm-router.service` therefore pins `KillSignal=SIGINT` so administrative
+  stops stay fast. If you need a config change to preserve active streams, use the `-u`
+  + `SIGQUIT` upgrade path rather than a supervised restart.
 - **Manual changes reconcile.** If you `systemctl stop` a model behind the router's back,
   the periodic reconciler observes and converges; `POST /pool/v1/reconcile` forces it.
 - **Configuration changes are restart-to-apply.** The router uses one immutable snapshot

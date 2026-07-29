@@ -21,6 +21,9 @@ pub struct RouterMetrics {
     pub parking_seconds: HistogramVec,
     pub transitions: IntCounterVec,
     pub probe_failures: IntCounterVec,
+    /// Fail-closed active-admission rejections. `reason` is a fixed vocabulary so a
+    /// stale-observation outage is distinguishable from an ordinary lifecycle refusal.
+    pub admission_rejections: IntCounterVec,
     pub active: IntGaugeVec,
     pub active_streams: IntGaugeVec,
     pub service_state: IntGaugeVec,
@@ -83,6 +86,14 @@ impl RouterMetrics {
                 &["service", "probe"]
             )
             .expect("probe metric registration"),
+            admission_rejections: register_int_counter_vec!(
+                Opts::new(
+                    "vllm_router_admission_rejections_total",
+                    "Active-admission attempts refused by fail-closed readiness checks"
+                ),
+                &["service", "reason"]
+            )
+            .expect("admission rejection metric registration"),
             active: register_int_gauge_vec!(
                 Opts::new(
                     "vllm_router_active_requests",

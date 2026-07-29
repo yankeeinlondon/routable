@@ -62,18 +62,26 @@ Tier 5 is also **failed** overall; no tested service is eligible for
 
 | TP | quantization | L1 (5 cycles) | L2 (5 cycles) | promotion | gating result |
 |---:|---|---|---|---|---|
-| 1 | NVFP4 | stable output; sleep ~1.02 s, wake ~3.03 s; 1,414 MiB residual | stable output; sleep ~1.02 s, wake ~5.05 s; 1,414 MiB residual | pass | fail: asleep inference hung; ~38.8–39.0 GB pinned host RAM exceeded the 30 GB declaration |
+| 1 | NVFP4 | stable output; sleep ~1.02 s, wake ~3.03 s; 1,414 MiB residual | stable output; sleep ~1.02 s, wake ~5.05 s; 1,414 MiB residual | pass | fail: ~38.8–39.0 GB pinned host RAM exceeded the 30 GB declaration; asleep hang characterized |
 | 2 | NVFP4 | not reached | not reached | not reached | fail at initialization: `last dim has to be multiple of 16, but got 2152` |
-| 1 | FP8 | stable output; sleep/wake ~0.27 s; 944 MiB residual | stable output; sleep ~0.27 s, wake ~3.10 s; 944 MiB residual | pass | fail: asleep inference hung; ~24.53 GB pinned host RAM exceeded the 20 GB declaration |
-| 2 | FP8 | stable output; sleep 0.27–1.04 s, wake 2.32–2.33 s; 1,098 MiB/GPU residual | stable output; sleep ~0.27 s, wake 2.84–3.10 s; 1,098 MiB/GPU residual | pass | fail: asleep inference hung; ~20.22 GB pinned host RAM exceeded the 20 GB declaration |
+| 1 | FP8 | stable output; sleep/wake ~0.27 s; 944 MiB residual | stable output; sleep ~0.27 s, wake ~3.10 s; 944 MiB residual | pass | fail: ~24.53 GB pinned host RAM exceeded the 20 GB declaration; asleep hang characterized |
+| 2 | FP8 | stable output; sleep 0.27–1.04 s, wake 2.32–2.33 s; 1,098 MiB/GPU residual | stable output; sleep ~0.27 s, wake 2.84–3.10 s; 1,098 MiB/GPU residual | pass | fail: ~20.22 GB pinned host RAM exceeded the 20 GB declaration; asleep hang characterized |
 
 All initialized cells used the required L2 three-step sequence
 (`wake_up?tags=weights`, `collective_rpc`, `wake_up?tags=kv_cache`). L1→L2
 promotion first woke the L1 sleeper and then slept at L2. A 7,000-token active
 request caused sleep to fail safely after the 10-second drain deadline on both
-FP8 topologies. However, direct inference against every sleeping backend timed
-out after 2 seconds with no bytes instead of returning the required 503.
+FP8 topologies. Direct inference against every sleeping backend was accepted
+but timed out after 2 seconds with no bytes. This measured vLLM 0.26 behavior
+means router safety cannot depend on a backend 503: admission must fail closed
+on fresh sleep/readiness facts, wake and reprobe before forwarding, and bound a
+post-admission stall with the inter-chunk idle timeout.
 
 Per-model measurements are in `docs/qwen3.6-27b-nvfp4.md` and
 `docs/meta-llama-3.1-8b-instruct-fp8.md`. Stop/start therefore remains the
-production fallback.
+production fallback. The failed Qwen NVFP4 TP=2 cell must also be recorded in
+its service compatibility declaration; configuration validation then rejects
+that topology instead of allowing another doomed cold start. Conservative L1
+floors are 25,000,000,000 bytes for the measured FP8 topologies (1.25× the
+provisional declaration) and 40,000,000,000 bytes for NVFP4 TP=1 (1.33×);
+smaller future L1 declarations are rejected.

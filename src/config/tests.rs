@@ -621,6 +621,14 @@ fn rejects_threshold_deadline_and_policy_errors_table() {
             "maximum_probe_age_ms must be at least interval_ms",
         ),
         (
+            "probe maximum age with no jitter margin",
+            |config| {
+                config.services[0].readiness.maximum_probe_age_ms =
+                    config.services[0].readiness.interval_ms;
+            },
+            "is below the 5000 ms admission-freshness floor",
+        ),
+        (
             "deadline",
             |config| config.services[0].deadlines.wake_ms = 0,
             "deadlines must all",
@@ -689,12 +697,142 @@ fn rejects_threshold_deadline_and_policy_errors_table() {
             |config| config.services[0].compatibility.gpu_memory_utilization = f64::NAN,
             "gpu_memory_utilization must be finite and in (0, 1]",
         ),
+        (
+            "zero unsupported tensor parallelism",
+            |config| {
+                config.services[0]
+                    .compatibility
+                    .unsupported_tensor_parallelism = vec![0];
+            },
+            "unsupported_tensor_parallelism values must be greater than zero",
+        ),
+        (
+            "duplicate unsupported tensor parallelism",
+            |config| {
+                config.services[0]
+                    .compatibility
+                    .unsupported_tensor_parallelism = vec![2, 2];
+            },
+            "unsupported_tensor_parallelism contains duplicate degree 2",
+        ),
     ];
 
     assert_rejections(cases);
 }
 
+#[test]
+fn admission_freshness_floor_follows_the_shared_observation_cadence() {
+    let mut config = valid_config();
+    let mut second = valid_service("beta", "model-b", 8101, "GPU-b");
+    // A longer per-service interval does not slow this service's refresh: one loop
+    // reconciles everything at `alpha`'s 2 s cadence, so `beta`'s budget is measured
+    // against that shared period rather than its own 4 s interval. Its own
+    // `maximum_probe_age_ms >= interval_ms` check passes, which is exactly the
+    // knife-edge the floor exists to catch.
+    second.readiness.interval_ms = 4_000;
+    second.readiness.timeout_ms = 1_500;
+    second.readiness.maximum_probe_age_ms = 4_000;
+    config.services.push(second);
+
+    assert_eq!(
+        config.observation_interval_ms(),
+        2_000,
+        "the shortest configured readiness interval is the observation cadence"
+    );
+    let errors = messages(&config);
+    assert!(
+        errors.contains(
+            "services[1] (\"beta\").readiness.maximum_probe_age_ms 4000 is below the 5500 ms admission-freshness floor"
+        ),
+        "{errors}"
+    );
+    assert!(
+        !errors.contains("services[0] (\"alpha\").readiness.maximum_probe_age_ms"),
+        "a service that already clears the floor must not be reported: {errors}"
+    );
+
+    config.services[1].readiness.maximum_probe_age_ms = 5_500;
+    config
+        .validate()
+        .expect("a budgeted freshness window validates");
+}
+
+#[test]
+fn rejects_a_hardware_incompatible_tensor_parallel_topology() {
+    let mut config = valid_config();
+    // The tested NVFP4 checkpoint reports `compressed-tensors` rather than a
+    // stable NVFP4 CLI label, so the safety decision comes from the explicit
+    // service compatibility declaration.
+    config.services[0].quantization = Some("compressed-tensors".into());
+    config.services[0].placement.gpu_uuids = vec!["GPU-a".into(), "GPU-b".into()];
+    config.services[0].placement.tensor_parallelism = 2;
+    config.services[0]
+        .compatibility
+        .unsupported_tensor_parallelism = vec![2];
+
+    let errors = messages(&config);
+    assert!(
+        errors.contains("placement.tensor_parallelism 2 is explicitly unsupported"),
+        "{errors}"
+    );
+}
+
+#[test]
+fn omitted_unsupported_tensor_parallelism_remains_backward_compatible() {
+    let yaml =
+        include_str!("example.yaml").replace("      unsupported_tensor_parallelism: []\n", "");
+    let config: RouterConfig = serde_yaml::from_str(&yaml).unwrap();
+
+    assert!(
+        config.services[0]
+            .compatibility
+            .unsupported_tensor_parallelism
+            .is_empty()
+    );
+    config.validate().unwrap();
+}
+
+#[test]
+fn omitted_l1_host_ram_floor_remains_backward_compatible_while_sleep_is_disabled() {
+    let yaml = include_str!("example.yaml").replace("      minimum_l1_host_ram_bytes: 0\n", "");
+    let config: RouterConfig = serde_yaml::from_str(&yaml).unwrap();
+
+    assert_eq!(
+        config.services[0].compatibility.minimum_l1_host_ram_bytes,
+        0
+    );
+    config.validate().unwrap();
+}
+
+#[test]
+fn measured_l1_host_ram_floors_reject_underdeclarations_and_accept_budgets() {
+    const GB: u64 = 1_000_000_000;
+    let cases = [("FP8", 20 * GB, 25 * GB), ("NVFP4", 30 * GB, 40 * GB)];
+
+    for (name, provisional, measured_budget) in cases {
+        let mut underdeclared = valid_config();
+        enable_l1(&mut underdeclared.services[0], GIB, provisional);
+        underdeclared.services[0]
+            .compatibility
+            .minimum_l1_host_ram_bytes = measured_budget;
+        let errors = messages(&underdeclared);
+        assert!(
+            errors.contains(&format!(
+                "l1_host_ram_bytes {provisional} is below compatibility.minimum_l1_host_ram_bytes {measured_budget}"
+            )),
+            "{name}: {errors}"
+        );
+
+        let mut measured = valid_config();
+        enable_l1(&mut measured.services[0], GIB, measured_budget);
+        measured
+            .validate()
+            .unwrap_or_else(|error| panic!("{name} measured budget should validate: {error}"));
+    }
+}
+
 fn enable_l1(service: &mut ServiceDefinition, residual: u64, host: u64) {
+    service.compatibility.minimum_l1_host_ram_bytes = host;
     service.sleep = SleepConfig {
         enabled: true,
         hardware_validated: true,
@@ -787,6 +925,14 @@ fn rejects_sleep_and_resource_budget_errors_table() {
             "zero L1 host memory",
             |config| enable_l1(&mut config.services[0], GIB, 0),
             "l1_host_ram_bytes must be greater than zero for L1",
+        ),
+        (
+            "missing measured L1 host memory floor",
+            |config| {
+                enable_l1(&mut config.services[0], GIB, 8 * GIB);
+                config.services[0].compatibility.minimum_l1_host_ram_bytes = 0;
+            },
+            "minimum_l1_host_ram_bytes must record a measured conservative floor",
         ),
         (
             "missing L1 idle threshold",

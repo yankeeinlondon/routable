@@ -410,6 +410,7 @@ pub fn pool_definition(service: &config::ServiceDefinition) -> ServiceDefinition
     definition.startup_deadline = Duration::from_millis(service.deadlines.startup_ms);
     definition.wake_deadline = Duration::from_millis(service.deadlines.wake_ms);
     definition.readiness_poll_interval = Duration::from_millis(service.readiness.interval_ms);
+    definition.maximum_probe_age = Duration::from_millis(service.readiness.maximum_probe_age_ms);
     definition.drain_deadline = Duration::from_millis(service.deadlines.drain_ms);
     definition.stop_deadline = Duration::from_millis(service.deadlines.systemd_job_ms);
     definition.backoff_initial = Duration::from_millis(service.retry.initial_backoff_ms);
@@ -628,6 +629,10 @@ impl Runner for ManagedVllmRunner {
 
     async fn stop(&self, definition: &ServiceDefinition, _force: bool) -> Result<(), RunnerError> {
         let service = self.service(&definition.name)?;
+        // StopUnit is intentional systemd lifecycle control: it suppresses the
+        // generated unit's Restart=on-failure policy for this stop transaction.
+        // `force` governs the pool's drain decision; using KillUnit here would
+        // instead look like a crash and invite the configured restart policy.
         self.systemd
             .stop_unit(&service.config.systemd.unit)
             .await
@@ -834,6 +839,10 @@ mod tests {
         assert_eq!(
             converted.parking_limit,
             u64::try_from(source.parking.queue_limit).unwrap()
+        );
+        assert_eq!(
+            converted.maximum_probe_age,
+            Duration::from_millis(source.readiness.maximum_probe_age_ms)
         );
         assert_eq!(
             vllm_timeouts(source),

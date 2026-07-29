@@ -603,6 +603,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sleep_observation_still_times_out_promptly() {
+        let sleeping = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 20\r\nConnection: close\r\n\r\n{\"is_sleeping\":true}";
+        let (base_url, server) =
+            delayed_mock_server(vec![Duration::from_millis(250)], sleeping).await;
+        let runner = VllmRunner::new(VllmRunnerConfig {
+            base_url,
+            timeouts: VllmTimeouts {
+                probe: Duration::from_millis(30),
+                sleep: Duration::from_millis(300),
+                wake: Duration::from_millis(300),
+                warmup: Duration::from_millis(300),
+            },
+            api_key: None,
+        })
+        .unwrap();
+        let started = tokio::time::Instant::now();
+
+        let error = runner.is_sleeping().await.unwrap_err();
+        match error {
+            RunnerError::Timeout { operation, .. } | RunnerError::Transport { operation, .. } => {
+                assert_eq!(operation, "sleep observation")
+            }
+            error => panic!("unexpected bounded sleep-observation error: {error}"),
+        }
+        assert!(started.elapsed() < Duration::from_millis(150));
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn non_success_response_body_is_capped_and_marked() {
         let diagnostic = format!("vLLM failure: {}", "x".repeat(ERROR_BODY_LIMIT_BYTES));
         let response = format!(
