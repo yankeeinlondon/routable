@@ -186,3 +186,34 @@ unmanaged occupant, since v1 placement is declaration-based and does not treat
 unmanaged processes as placement blockers (a deliberate v1 scope line worth a
 runbook/README caveat: the router assumes it is the only GPU tenant besides declared
 services).
+
+## F5 — Graceful shutdown hangs: background service runtime never exits
+
+**Severity: high (operational; SIGTERM/systemd restart takes the full 900 s timeout).**
+
+Observed live (2026-07-29): after SIGTERM, and again after SIGINT, the router logged
+`"waiting for service runtime BG pool observation and idle policy to exit"`
+indefinitely and required SIGKILL. The `PoolBackground` loop itself breaks on the
+shutdown watch, but the *runtime* hosting it does not exit — most likely lingering
+detached tasks spawned onto it (reaper-fired lifecycle flights via
+`get_or_spawn_flight`'s `tokio::spawn`, `schedule_backoff` sleeps of up to 60 s, or a
+cross-runtime await parked on the pool runtime). With `graceful_shutdown_timeout` and
+the unit's `TimeoutStopSec` both at 900 s, every restart/stop of an otherwise-idle
+router stalls for 15 minutes then gets killed.
+
+**Fix requirement:** the background service's runtime must quiesce promptly on
+shutdown — spawn detached lifecycle tasks on the process-lifetime pool runtime (not
+the pingora service runtime), or track and abort them on shutdown signal.
+**Acceptance:** SIGTERM against an idle router exits within the grace period; add
+this to the `binary_serves` regression (it currently SIGTERMs — extend it to assert
+bounded exit time, which would have caught this).
+
+## F6 — Drift warnings repeat every observation tick (log spam)
+
+**Severity: low (operational noise).**
+
+`NVML drift detected` and `GPU observation degraded` re-log identical facts every
+~2 s (the observation interval) while an unmanaged process occupies a GPU — hundreds
+of identical WARN lines per hour for a steady condition. Warn on *transitions*
+(drift appears/changes/clears) and demote the steady-state repeat to debug; the
+drift metric already carries the continuous signal.
