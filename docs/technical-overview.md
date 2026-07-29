@@ -213,6 +213,13 @@ timeout, so a single missed or slow pass degrades latency instead of 503-ing the
 `vllm_router_admission_rejections_total{reason="stale_probe"}` is the signal that the
 margin is being consumed.
 
+Only a *proven* observation refreshes that timestamp. `sleeping_level: None` can mean
+sleep is disabled, the backend answered "awake", or `/is_sleeping` could not be reached;
+the third case retains the last authoritative level but deliberately leaves the
+timestamp alone. A single failed sleep probe is therefore absorbed, while sustained
+failure ages the fact out and closes admission — rather than presenting an unproven
+"awake" to the one check standing between a sleeping backend and a hung request.
+
 ## Exact accounting
 
 Lifecycle safety decisions (drain complete? safe to sleep? eviction victim idle?) use

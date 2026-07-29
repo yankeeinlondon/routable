@@ -1,11 +1,16 @@
 # Acceptance status
 
-Automated verification recorded 2026-07-28:
+Automated verification recorded 2026-07-29 (re-measured after the review-4 fix
+batch; the previous 2026-07-28 record predates it):
 
 - `cargo fmt --all -- --check`: pass
 - `cargo clippy --all-targets --all-features -- -D warnings`: pass
-- `cargo test --all-targets --all-features`: 36 pass, 1 ignored, 0 fail
-- two-file `-t` configuration check: pass
+- `cargo test --all-targets --all-features`: 168 pass, 3 ignored, 0 fail
+- two-file `-t` configuration check: pass, against the live
+  `/etc/vllm-router/router.yaml` as well as the in-repo example
+
+The three ignored tests each require host resources a CI-style run does not
+have: a live system bus and systemd, and the generated units on `/run`.
 
 The fast suite covers strict startup configuration, model aliases and invalid
 request rejection, generation-safe observed state, exact active/parked guards,
@@ -13,6 +18,13 @@ request rejection, generation-safe observed state, exact active/parked guards,
 priority/LRU eviction, drain deadlines, idle sleep tiers, least-inflight
 admission, probe threshold/age behavior, vLLM readiness/model verification,
 bounded HTTP calls, OpenAI warmup, and the vLLM 0.26 three-step L2 wake.
+
+The review-4 batch added coverage for the one-awake-owner invariant under
+concurrent reconciliation, force-stop blast-radius capture and its drained
+latch, fail-closed admission against stale/asleep/incomplete facts, the
+sleep-fact provenance that keeps an unproven `/is_sleeping` from aging as
+fresh, joined-flight audit records, the deployment shutdown-signal contract,
+and the probe-freshness configuration floor.
 
 The custom Pingora ingress additionally enforces bounded body reads before
 lifecycle admission, a public endpoint allowlist, hop-by-hop stripping,

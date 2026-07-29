@@ -443,12 +443,32 @@ enum TransitionKind {
 }
 
 impl TransitionKind {
+    /// The pool cannot distinguish a `start` from a `wake` — both are one `EnsureReady`
+    /// flight — so joined records correlate to the accepted record by `operation_id`
+    /// rather than by matching the control plane's action vocabulary.
     fn audit_action(self) -> &'static str {
         match self {
             Self::EnsureReady => "ensure_ready",
             Self::Drain => "drain",
             Self::Sleep(_) => "sleep",
             Self::Stop(_) => "stop",
+        }
+    }
+
+    /// Discriminating detail the joined record would otherwise drop. `None` omits the
+    /// field entirely, so each record carries only what applies to its transition.
+    fn audit_sleep_level(self) -> Option<&'static str> {
+        match self {
+            Self::Sleep(SleepLevel::L1) => Some("l1"),
+            Self::Sleep(SleepLevel::L2) => Some("l2"),
+            _ => None,
+        }
+    }
+
+    fn audit_force(self) -> Option<bool> {
+        match self {
+            Self::Stop(force) => Some(force),
+            _ => None,
         }
     }
 }
@@ -1005,6 +1025,8 @@ impl<R: Runner + 'static> Pool<R> {
                     operation_id = %existing.operation_id,
                     service,
                     action = kind.audit_action(),
+                    sleep_level = kind.audit_sleep_level(),
+                    force = kind.audit_force(),
                     joined_existing = true,
                     "pool lifecycle request joined existing operation"
                 );
@@ -2145,6 +2167,27 @@ mod tests {
         }
     }
 
+    /// Run `future` with a JSON audit subscriber installed and return what it emitted.
+    ///
+    /// `set_default` is thread-local, so callers must use a current-thread runtime; a
+    /// work-stealing runtime could resume the awaited work on a thread without it.
+    async fn capture_audit<F: Future>(future: F) -> String {
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&captured);
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(move || AuditWriter(Arc::clone(&sink)))
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        future.await;
+        drop(guard);
+        let bytes = captured
+            .lock()
+            .expect("audit capture lock poisoned")
+            .clone();
+        String::from_utf8(bytes).expect("audit output should be UTF-8")
+    }
+
     struct MockService {
         running: AtomicBool,
         sleeping: Mutex<Option<SleepLevel>>,
@@ -2683,26 +2726,18 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), start_started.notified())
             .await
             .expect("the authoritative pool flight should start");
-        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let sink = Arc::clone(&captured);
-        let subscriber = tracing_subscriber::fmt()
-            .json()
-            .with_writer(move || AuditWriter(Arc::clone(&sink)))
-            .finish();
-        let audit_guard = tracing::subscriber::set_default(subscriber);
-        let second = PoolManager::begin_lifecycle(&pool, LifecycleRequest::EnsureReady(request))
-            .await
-            .unwrap();
-        drop(audit_guard);
+        let mut second = None;
+        let audit = capture_audit(async {
+            second = Some(
+                PoolManager::begin_lifecycle(&pool, LifecycleRequest::EnsureReady(request))
+                    .await
+                    .unwrap(),
+            );
+        })
+        .await;
+        let second = second.expect("the joining request should have completed");
         assert_eq!(first.operation_id(), second.operation_id());
         assert!(second.joined_existing());
-        let audit = String::from_utf8(
-            captured
-                .lock()
-                .expect("audit capture lock poisoned")
-                .clone(),
-        )
-        .unwrap();
         assert!(audit.contains(r#""audit":true"#), "{audit}");
         assert!(audit.contains(r#""action":"ensure_ready""#), "{audit}");
         assert!(audit.contains(r#""joined_existing":true"#), "{audit}");
@@ -2710,6 +2745,10 @@ mod tests {
             audit.contains(&format!(r#""operation_id":"{}""#, first.operation_id())),
             "{audit}"
         );
+        // Discriminating fields are emitted only where they apply, so an ensure-ready
+        // record carries neither a sleep level nor a force decision.
+        assert!(!audit.contains(r#""sleep_level""#), "{audit}");
+        assert!(!audit.contains(r#""force""#), "{audit}");
 
         let rejected = PoolManager::begin_lifecycle(
             &pool,
@@ -2736,6 +2775,103 @@ mod tests {
         assert_eq!(second_terminal.operation_id, Some(operation_id));
         assert_eq!(first_terminal.status.lifecycle, Lifecycle::Running);
         assert_eq!(second_terminal.status.operation_id, Some(operation_id));
+    }
+
+    // Single-threaded on purpose: `set_default` installs a thread-local subscriber, so a
+    // work-stealing runtime could resume the audited await on a thread that cannot see it.
+    #[tokio::test]
+    async fn joined_audit_records_carry_their_discriminating_decision() {
+        let runner = MockRunner::new(&["a"], &["a"]);
+        let controls = runner.clone();
+        let stop_started = Arc::new(Notify::new());
+        let stop_release = Arc::new(Notify::new());
+        controls
+            .stop_started
+            .lock()
+            .await
+            .insert("a".into(), stop_started.clone());
+        controls
+            .stop_release
+            .lock()
+            .await
+            .insert("a".into(), stop_release.clone());
+        let pool = reconciled_pool(vec![definition("a", "gpu-0")], runner).await;
+
+        // A sleep flight parked on its drain, joined by an identical request.
+        let held = pool.activity("a").unwrap().acquire_active();
+        let sleeping = PoolManager::begin_lifecycle(
+            &pool,
+            LifecycleRequest::Sleep(SleepRequest {
+                service: "a".into(),
+                level: SleepLevel::L2,
+                deadline: Instant::now() + Duration::from_secs(1),
+                force: false,
+            }),
+        )
+        .await
+        .unwrap();
+        wait_for_status(&pool, "a", |status| status.lifecycle == Lifecycle::Draining).await;
+
+        let audit = capture_audit(async {
+            PoolManager::begin_lifecycle(
+                &pool,
+                LifecycleRequest::Sleep(SleepRequest {
+                    service: "a".into(),
+                    level: SleepLevel::L2,
+                    deadline: Instant::now() + Duration::from_secs(1),
+                    force: false,
+                }),
+            )
+            .await
+            .unwrap()
+        })
+        .await;
+        assert!(audit.contains(r#""action":"sleep""#), "{audit}");
+        assert!(audit.contains(r#""sleep_level":"l2""#), "{audit}");
+        assert!(audit.contains(r#""joined_existing":true"#), "{audit}");
+        assert!(
+            !audit.contains(r#""force""#),
+            "a sleep record must not claim a force decision: {audit}"
+        );
+        drop(held);
+        sleeping.wait_outcome().await;
+
+        // A forced stop blocked inside the runner, joined by an identical request.
+        let stopping = PoolManager::begin_lifecycle(
+            &pool,
+            LifecycleRequest::Stop(StopRequest {
+                service: "a".into(),
+                deadline: Instant::now() + Duration::from_secs(1),
+                force: true,
+            }),
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), stop_started.notified())
+            .await
+            .expect("the forced stop should reach the blocked runner");
+
+        let audit = capture_audit(async {
+            PoolManager::begin_lifecycle(
+                &pool,
+                LifecycleRequest::Stop(StopRequest {
+                    service: "a".into(),
+                    deadline: Instant::now() + Duration::from_secs(1),
+                    force: true,
+                }),
+            )
+            .await
+            .unwrap()
+        })
+        .await;
+        assert!(audit.contains(r#""action":"stop""#), "{audit}");
+        assert!(audit.contains(r#""force":true"#), "{audit}");
+        assert!(
+            !audit.contains(r#""sleep_level""#),
+            "a stop record must not claim a sleep level: {audit}"
+        );
+        stop_release.notify_one();
+        stopping.wait_outcome().await;
     }
 
     #[tokio::test]
