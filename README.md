@@ -114,7 +114,19 @@ complete, commented service:
   manually-launched `vllm serve` would collide with the router's data plane.) There is
   no port flag or env var: ports are validated configuration (collision and loopback
   rules run at `-t` time), changed like any other setting via restart-to-apply. The
-  router logs its effective listeners at startup (`"listeners configured"`).
+  router logs its effective listeners at startup (an info-level `"listeners
+  configured"` line carrying all three addresses).
+
+  **Why three listeners instead of one port with routes:** the boundary between them
+  is enforced by *bind address*, not application code. The data plane must be
+  client-reachable (`0.0.0.0`); management can kill workloads and belongs on
+  loopback, unreachable from the network before any code runs; metrics sits apart
+  from both because its consumer is a Prometheus scraper whose location can change —
+  if monitoring runs on another host, only the metrics bind widens, and neither the
+  mutation surface nor its bearer-token auth is dragged along. Separate ports also
+  keep router-owned paths structurally disjoint from the proxied vLLM surface (which
+  has its own `/metrics`), and give the management API its own service threads so it
+  stays responsive while the data plane is saturated — exactly when you need it.
 - **`inventory`** — host RAM and each GPU by **stable UUID** (`nvidia-smi -L`) with its
   VRAM capacity. Placement and budget validation are computed against these.
 - **`services`** — one entry per model server: served model name + aliases, GPU
