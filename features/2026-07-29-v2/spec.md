@@ -1,0 +1,119 @@
+# vLLM Router — v2 Requirements
+
+Status: **backlog, not scheduled.** Captured during v1 delivery so the
+[v1 spec](../2026-07-28-pooling/spec.md) can freeze as the acceptance contract.
+Prerequisite for everything here: v1 on-box acceptance on CT 107 is complete.
+Decisions recorded here are binding on v2 design; everything else is draft.
+
+Dependency shape:
+
+```mermaid
+graph LR
+    ACC[v1 on-box acceptance] --> REG[Dynamic registration\nadd-only]
+    ACC --> RUN[Additional runners\nllama.cpp adapter]
+    ACC --> PROF[Interference profiles\nbenchmarked co-residency]
+    REG --> UI[Web configuration UI]
+    PROF --> OAP[Occupancy-aware placement]
+    RUN --> OAP
+    OAP --> UI
+    REG --> MH[Multi-host]
+    RUN --> MH
+```
+
+## 1. Additional runners (llama.cpp first)
+
+The v1 architecture already isolates runner specifics behind the `Runner` adapter
+(commands, readiness probes, API capabilities, sleep/wake behavior); the pool manager
+owns only generic resource and lifecycle concepts. v2 delivers the second adapter:
+
+- llama.cpp server adapter: unit template, health/readiness probes, model verification,
+  and its capability surface (no sleep mode; `--tensor-split` for placement — see §4).
+- The service definition's `runner` field (already present in v1 config) selects the
+  adapter; validation rules become runner-aware (e.g. vLLM-specific compatibility
+  fields are rejected for llama.cpp services).
+- GPU contention between runners is already handled generically by v1's
+  declaration-based accounting; no new scheduling concepts are required for same-host
+  mixed runners.
+
+## 2. Dynamic service registration (add-only) — decided 2026-07-29
+
+A later version will support *adding* a new service definition at runtime
+(e.g. `POST /pool/v1/services`), enabling a web UI to make a new model available
+alongside the existing inventory. Registration is purely additive — new map entries, a
+new parking semaphore, a new placement participant — so it does not reopen the
+stale-consumer invalidation class that motivated v1's immutable configuration. The
+candidate definition must pass the same full validation as boot-time configuration,
+merged against the live config, and unit generation plus `daemon-reload` must run
+before the service becomes schedulable.
+
+**Mutating or removing an existing definition stays restart-to-apply** (validated
+restart / `-u` graceful upgrade); in-place mutation is explicitly out of scope at any
+version. This dovetails with multi-host: service definitions become
+control-plane-owned data with a single writer, not a file the process re-reads.
+
+## 3. Web configuration UI
+
+The consumer of §2. Two-stage delivery:
+
+1. **Config-generator UI (no router changes):** writes the service block + `.env`
+   file, runs `-t` validation, triggers the `-u` graceful upgrade. Works against v1
+   as shipped; validates the UX cheaply. Requires host-level access — a different
+   privilege tier than the `/pool` bearer token; design the trust boundary explicitly.
+2. **Registration UI:** moves to `POST /pool/v1/services` once §2 lands.
+
+A real "make a model available" flow is mostly orchestration above the router: weight
+download (HF), disk-space checks against `/models`, quantization/TP selection that fits
+a free GPU, and the sleep hardware-validation gate. Scope that separately from the
+router work.
+
+## 4. Occupancy-aware placement — decided 2026-07-29
+
+Motivating example: M1 occupies 20 of 32 GB on GPU1 under constant load; M2 must span
+both GPUs and fits the *aggregate* free VRAM (12 GB on GPU1 + 32 GB on GPU2), but a
+naive symmetric launch (50/50) would OOM GPU1. v2 must place such a model gracefully:
+
+- **Budget ledger:** at placement time compute per-GPU free budget = capacity − awake
+  reservations − sleep residuals, from the same declaration-based accounting v1 uses.
+- **Deploy-time parameterization:** the service definition becomes a template; the
+  router computes the per-GPU memory assignment and GPU selection at start time and
+  renders them into the generated unit. A computed binding is pinned in the ledger for
+  as long as the service is running *or asleep* (a woken vLLM re-grabs its original
+  allocation).
+- **Runner-declared split capability:** asymmetric fitting is runner-specific — vLLM TP
+  is symmetric-only (uniform `gpu_memory_utilization`; verified no per-GPU cap), vLLM
+  PP can split unevenly by layers (`VLLM_PP_LAYER_PARTITION`), llama.cpp
+  (`--tensor-split`) and accelerate-style servers (`max_memory` per device) support
+  arbitrary splits natively. The `Runner` adapter gains a planning hook ("given these
+  per-GPU budgets, produce launch parameters or decline"); the pool stays generic.
+- **Refusal:** a model that fits the inventory but not the *current* free budget gets
+  the existing evict-or-503 treatment (`Retry-After`); a model that can never fit the
+  inventory is rejected at registration/validation time. No placement may overcommit.
+- **Isolation caveat:** memory fit is not performance isolation; consumer Blackwell has
+  no MIG. Enabling awake co-residency requires benchmarked interference profiles (the
+  v1 resolutions' precondition) plus a per-service latency-priority signal to bias
+  packing decisions.
+
+## 5. Multi-host
+
+The v1 `PoolManager` trait is the cut line: the pool module becomes a per-host agent
+daemon; the trait implementation in the router becomes a client; the data-plane routing
+contract is unchanged. Deferred with it from v1: mTLS between router and agents
+(replacing the single-host bearer token for the control path), cross-host placement,
+and health aggregation across agents. Distributed scheduling/consensus remains out of
+scope until a concrete need exists.
+
+## 6. Smaller carried items
+
+Eligible for a v1.x patch rather than v2 if convenient:
+
+- **Dialect-aware router error envelopes** (review-2 CO2): router-generated errors on
+  `/v1/messages` should use Anthropic's error shape; Cohere-style endpoints likewise.
+- **Multipart model extraction** so audio transcription/translation endpoints become
+  routable.
+- **Configurable runner executable path** (review-2 N2): `VLLM_EXECUTABLE` is
+  hardcoded to `/opt/vllm-venv/bin/vllm` in the unit generator.
+- **Trusted model-routing header** (v1 resolution deferred it): optional signed header
+  to skip body parsing for clients we control; body validation stays authoritative
+  upstream.
+- **Multi-LoRA**, if ever added, is modeled separately from base-model lifecycle and
+  GPU placement (carried from the v1 scope note).

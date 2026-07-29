@@ -56,54 +56,17 @@ if added later, must be modeled separately from base-model lifecycle and GPU pla
 
 ## Future Requirement
 
-Though not a v1 concern, the router should eventually provide similar functionality for
-`llama.cpp` and possibly other runners. The pool manager therefore owns generic resource and
-lifecycle concepts, while a runner adapter owns commands, readiness probes, API capabilities,
-and sleep/wake behavior specific to a runner.
+v1 must not preclude what comes next, and one constraint binds v1 architecture directly:
+the pool manager owns generic resource and lifecycle concepts, while a runner adapter
+owns commands, readiness probes, API capabilities, and sleep/wake behavior specific to a
+runner (`vllm` today; `llama.cpp` and others later). All managed runners are on the same
+host in v1; no distributed scheduling, consensus, or cross-host failure recovery.
 
-> For the short to mid term, all managed runners are on the same host. A later version may
-> place runners on multiple hosts; v1 does not need distributed scheduling, consensus, or
-> cross-host failure recovery.
-
-**Dynamic service registration (future, decided 2026-07-29):** a later version will
-support *adding* a new service definition at runtime (e.g. `POST /pool/v1/services`,
-enabling a web UI to make a new model available alongside the existing inventory).
-Registration is purely additive — new map entries, a new parking semaphore, a new
-placement participant — so it does not reopen the stale-consumer invalidation class
-that motivated immutable configuration. The candidate definition must pass the same
-full validation as boot-time configuration, merged against the live config, and unit
-generation plus `daemon-reload` run before the service becomes schedulable.
-**Mutating or removing an existing definition stays restart-to-apply** (validated
-restart / `-u` graceful upgrade); in-place mutation is explicitly out of scope at any
-version. This dovetails with the multi-host evolution: service definitions become
-control-plane-owned data with a single writer, not a file the process re-reads.
-
-**Occupancy-aware placement (future, decided 2026-07-29).** Motivating example: M1
-occupies 20 of 32 GB on GPU1 under constant load; M2 needs to span both GPUs and fits
-the *aggregate* free VRAM (12 GB on GPU1 + 32 GB on GPU2), but a naive symmetric launch
-(50/50) would OOM GPU1. A later version must place such a model gracefully:
-
-- **Budget ledger:** at placement time compute per-GPU free budget = capacity − awake
-  reservations − sleep residuals, from the same declaration-based accounting v1 uses.
-- **Deploy-time parameterization:** the service definition becomes a template; the
-  router computes the per-GPU memory assignment and GPU selection at start time and
-  renders them into the generated unit. A computed binding is pinned in the ledger for
-  as long as the service is running *or asleep* (a woken vLLM re-grabs its original
-  allocation).
-- **Runner-declared split capability:** asymmetric fitting is runner-specific — vLLM TP
-  is symmetric-only (uniform `gpu_memory_utilization`; verified no per-GPU cap), vLLM
-  PP can split unevenly by layers (`VLLM_PP_LAYER_PARTITION`), llama.cpp
-  (`--tensor-split`) and accelerate-style servers (`max_memory` per device) support
-  arbitrary splits natively. The `Runner` adapter therefore gains a planning hook
-  ("given these per-GPU budgets, produce launch parameters or decline"); the pool stays
-  generic.
-- **Refusal:** a model that fits the inventory but not the *current* free budget gets
-  the existing evict-or-503 treatment (`Retry-After`); a model that can never fit the
-  inventory is rejected at registration/validation time. No placement may overcommit.
-- **Isolation caveat:** memory fit is not performance isolation; consumer Blackwell has
-  no MIG. Enabling awake co-residency requires the benchmarked interference profiles
-  already demanded by the v1 resolutions, plus a per-service latency-priority signal to
-  bias packing decisions.
+Everything beyond that constraint — additional runners, add-only dynamic service
+registration, the web configuration UI, occupancy-aware placement with runner-computed
+splits, and multi-host — is specified in
+[`features/2026-07-29-v2/spec.md`](../2026-07-29-v2/spec.md) so this document can freeze
+as the v1 acceptance contract.
 
 ---
 
