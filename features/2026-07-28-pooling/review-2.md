@@ -113,3 +113,37 @@ Approve. Before committing: include the untracked `generator.rs` (N1), fix the
 endpoint allowlist (CO1 — small and functional), and add the spec's restart-to-apply
 amendment. CO2 and N2–N5 can ride the next change. Then proceed to the on-box
 acceptance phase on CT 107.
+
+---
+
+## Addendum (2026-07-29): carried items resolved in the final fix commit
+
+The committed fix batch (`81e975c`) went beyond the reviewed working-tree snapshot and
+closed the carried items; verified at HEAD (126 lib + 4 bin tests pass, clippy clean):
+
+- **N1** — `sysd/generator.rs` is committed.
+- **CO1** — `MODEL_ENDPOINTS` now matches the verified vLLM surface exactly: root
+  `/tokenize`, `/detokenize`, `/classify` (dead `/v1/`-prefixed variants removed),
+  plus `/v2/rerank`, `/v2/embed`, `/v1/messages/count_tokens`. README endpoint table
+  updated to match, grouped by dialect.
+- **CO2** — router errors are dialect-aware: `ErrorDialect::for_path` selects the
+  Anthropic envelope (`{"type":"error","error":{...}}`, status→type mapping incl.
+  503→`overloaded_error`) for `/v1/messages*`; resolved inside `write_error` so every
+  router error path including 502 is covered; tested for 400/404/413/503. The stale
+  "OpenAI envelope on every endpoint" caveat is gone from README/docs.
+- **N2** — `runner_executable` is per-service configuration with path validation and
+  safe exec rendering (test included); the hardcoded venv path is gone.
+- **N3** — README documents the `/run/systemd/system` reboot semantics; the router
+  unit grants the matching `ReadWritePaths`.
+- **N4** — `/is_sleeping` probe errors now increment `probe_failures` instead of
+  silently reading as awake.
+- **N5** — expected `TransitionInProgress` reconcile overlaps are no longer warned
+  (tested). The 409-for-`SleepUnsupported` mapping and bounded-ring aging remain as
+  accepted informational notes.
+
+v2-shaping note (postdates the fix commit, not a defect): when the allowlist next
+changes, shape it as a per-service capability lookup per
+`features/2026-07-29-v2/spec.md` §1/§6.
+
+**All review-1 and review-2 findings are now closed.** Remaining work is the on-box
+acceptance phase on CT 107.
