@@ -32,7 +32,61 @@ loopback Host rewriting, request/trace IDs, global/per-model parking caps,
 disconnect-aware parking, connect-only failover, inter-chunk response timeout,
 and incremental upstream-to-downstream body writes.
 
-## On-box Tier 4/5 run — 2026-07-29
+## On-box Tier 4 re-run — 2026-07-29 (post-fix, commit 00ad691)
+
+Re-run on CT 107 against the deployed fix batch, same topology as the failed run
+below. **Tier 4 passes.** Every drill that previously failed now passes on the
+hardware, not merely in tests:
+
+| Drill | Result | Evidence |
+|---|---|---|
+| Negative admission | pass | 400 / 413 at 33,554,433 B / 404 data-plane `/sleep` / OpenAI-shaped 404 / 401 unauthenticated; zero transition series |
+| Stampede + audit (**F17**) | pass | 50-way cold stampede → 49 `joined_existing` records on one `operation_id`, exactly 1 systemd start, `NRestarts=0`; 50 bounded 503s at the 20 s parking deadline |
+| Stall classification (**F17**) | pass | SIGSTOP mid-stream → `upstream response idle timeout after 120s while reading the response body`, fired at exactly 120 s; counters released to zero |
+| Busy-owner protection (**F11**) | pass | 200 s sustained load: owner `active` across all 197 samples, contender unit never activated, 8×503, **118/118** owner streams completed; both services `evictable: true`, priority 0 |
+| Deferred eviction | pass | a *draining* owner is evicted only after its work completes — 8/8 streams finished, stop followed in the same second; one awake owner throughout |
+| Force-stop count (**F12**) | pass | `affected_requests: 8` against 8 in-flight (previously `0`); streams cut at `finish_reason: "abort"` with clean SSE termination |
+| Force-stop durability (**F12**) | pass | latched `drained`, unit stayed `inactive` across 10 retry requests |
+| Restart boundary | pass | after router restart: `drained` → `stopped`, demand restarts it — matches the documented scope limit |
+| Crash recovery | pass | `kill -9` mid-stream → curl exit 18, `NRestarts=1`, observed `stale`, admission failed closed during reload |
+| Disconnect-while-parked | pass | parked 1 → 0 immediately; detached start continued |
+| Router restart under traffic | pass | **15 ms** with an active stream; model unit identical `InvocationID` and `MainPID` |
+| Graceful upgrade (**F13**) | pass | SSE stream survived the handoff — `curl exit=0`, 1,458,323 B, `[DONE]`; post-handoff request 200; old process lingered in its grace window |
+
+Measured incidentally: `qwen35b` cold start 2 m 16 s against a `typically ~180 s`
+estimate; `qwen27b` ready ~2.5 min *after* systemd reported the unit active,
+which is why `systemctl is-active` is not a readiness signal.
+
+### Residual observations (none are regressions from this batch)
+
+1. **The crash path still logs `upstream HTTP error: error decoding response
+   body`.** F17's classifier special-cases `is_timeout()` only, so a mid-stream
+   connection reset keeps reqwest's generic wrapper — the same unhelpful text
+   F17 was filed about, on a different path.
+2. **A detached placement demand outlives its client.** A request that 503s at
+   its 20 s parking deadline leaves an eviction claim queued against
+   `startup_ms` (900 s). Observed stopping a healthy model minutes later with no
+   client waiting, and two competing demands on one GPU ping-pong, each
+   displacing the other. Consider bounding the detached demand once no client
+   remains.
+3. **A process inside the grace window cannot be interrupted.** Pingora's
+   graceful path is a plain `thread::sleep`; SIGINT and SIGTERM are ignored
+   until it ends, so only SIGKILL shortens an 11-minute lingering upgrade
+   process. Compounding this, the old process has already given its listener FDs
+   away — killing the new process before it is supervised leaves *nobody*
+   holding the ports. This produced a ~6-minute data-plane outage during this
+   re-run's cleanup; model units were unaffected. The manual upgrade procedure
+   needs a documented, supervised cutover.
+4. **`gptoss20b` under-declares its VRAM reservation** — 31,097,880,576 B
+   observed against 31,000,000,000 B declared — so NVML advisory drift fires
+   continuously and degrades GPU observation for its GPU-sharing peer.
+5. **`vllm_router_admission_rejections_total` is quieter than intended.**
+   `choose_running` pre-filters candidates on lifecycle, so lifecycle-level
+   reasons rarely reach `acquire_active`. The `stale_probe` reason — the
+   fleet-outage signal it was added for — remains reachable and is the one to
+   alert on.
+
+## On-box Tier 4/5 run — 2026-07-29 (pre-fix, superseded for Tier 4)
 
 Run on CT 107 with two RTX 5090s, vLLM 0.26.0, Pingora 0.8.1, and the production
 systemd/router topology. Tier 4 is **failed** overall:
@@ -68,6 +122,17 @@ Two cross-cutting observations were repeatable: a backend can become healthy
 while the router remains in stale `starting` state until manual reconcile, and
 the graceful-upgrade retry window is shorter than a leisurely operator
 sequence unless SIGQUIT follows socket creation immediately.
+
+Tier 5 was **not** re-run against the fix batch, deliberately. Its failures are
+hardware/runtime findings that no code change in this batch addresses: the NVFP4
+TP=2 FlashInfer initialization crash (F15) and the measured L1 host-RAM overage
+(F16) are properties of this checkpoint/vLLM/GPU cell, now *recorded* in the
+service compatibility declaration rather than fixed. Sleep also remains disabled
+on every service (`hardware_validated: false`), so a re-run would first require
+deliberately enabling it. The one sleep-path change here — the `SleepFact`
+provenance fix that stops an unproven `/is_sleeping` from ageing as fresh — is
+unreachable while sleep is off. Re-run Tier 5 when someone next attempts a fresh
+hardware-validation cell; that fix is what it should exercise.
 
 Tier 5 is also **failed** overall; no tested service is eligible for
 `hardware_validated: true`:
