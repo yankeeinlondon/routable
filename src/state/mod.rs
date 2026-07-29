@@ -12,6 +12,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, watch};
 use uuid::Uuid;
 
+use crate::gpu::GpuDrift;
+
 /// The externally visible lifecycle of a managed service.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -21,6 +23,7 @@ pub enum Lifecycle {
     Starting,
     Running,
     Draining,
+    Drained,
     AsleepL1,
     AsleepL2,
     Waking,
@@ -102,6 +105,8 @@ pub struct GpuStatus {
     pub used_memory_bytes: Option<u64>,
     pub process_ids: Vec<u32>,
     pub healthy: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub drift: Vec<GpuDrift>,
 }
 
 /// A complete, point-in-time status record.
@@ -264,35 +269,6 @@ impl StateStore {
         applied
     }
 
-    /// Publish an observer result unless it predates a transition already in the store.
-    pub fn publish_observation(&self, observation: ObservedState) -> bool {
-        let Some(sender) = self
-            .services
-            .read()
-            .expect("state store lock poisoned")
-            .get(&observation.service)
-            .cloned()
-        else {
-            return false;
-        };
-        let mut observation = Some(observation);
-        let mut applied = false;
-        sender.send_if_modified(|current| {
-            let candidate = observation.as_ref().expect("observation applied twice");
-            if candidate.generation < current.generation
-                || (candidate.generation == current.generation
-                    && current.operation_id.is_some()
-                    && candidate.operation_id != current.operation_id)
-            {
-                return false;
-            }
-            *current = observation.take().expect("observation applied twice");
-            applied = true;
-            true
-        });
-        applied
-    }
-
     pub fn refresh_activity(&self, service: &str, activity: &Activity) -> bool {
         let Some(sender) = self
             .services
@@ -435,14 +411,26 @@ impl Activity {
     }
 
     pub async fn wait_until_idle(&self, deadline: Instant) -> bool {
+        self.wait_until_idle_with_registration_hook(deadline, || {})
+            .await
+    }
+
+    async fn wait_until_idle_with_registration_hook(
+        &self,
+        deadline: Instant,
+        mut registration_hook: impl FnMut(),
+    ) -> bool {
         loop {
             if self.is_idle() {
                 return true;
             }
             let notified = self.inner.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             if self.is_idle() {
                 return true;
             }
+            registration_hook();
             if tokio::time::timeout_at(deadline.into(), notified)
                 .await
                 .is_err()
@@ -460,8 +448,13 @@ pub struct ActiveGuard {
 impl Drop for ActiveGuard {
     fn drop(&mut self) {
         if let Some(inner) = self.inner.take() {
+            // Keep the timestamp lock through the decrement so a snapshot that observes
+            // zero active requests cannot also observe the pre-completion timestamp.
+            let mut last_used = inner.last_used.lock().expect("activity lock poisoned");
+            *last_used = Instant::now();
             let previous = inner.active.fetch_sub(1, Ordering::AcqRel);
             debug_assert!(previous > 0, "active request counter underflow");
+            drop(last_used);
             inner.changed.notify_waiters();
         }
     }
@@ -484,6 +477,17 @@ impl Drop for ParkedGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn drained_is_a_serialized_terminal_routing_state() {
+        assert_eq!(
+            serde_json::to_string(&Lifecycle::Drained).unwrap(),
+            "\"drained\""
+        );
+        assert!(!Lifecycle::Drained.is_ready());
+        assert!(!Lifecycle::Drained.is_transitioning());
+        assert!(!Lifecycle::Drained.owns_awake_placement());
+    }
 
     #[test]
     fn obsolete_transition_updates_are_ignored() {
@@ -528,6 +532,66 @@ mod tests {
         drop(parked);
         assert!(waiter.await.unwrap());
         assert!(activity.is_idle());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn idle_waiter_cannot_miss_drop_before_notification_is_polled() {
+        let activity = Activity::new();
+        let active = activity.acquire_active();
+        let registered = Arc::new(std::sync::Barrier::new(2));
+        let resume = Arc::new(std::sync::Barrier::new(2));
+
+        let waiter = {
+            let activity = activity.clone();
+            let registered = registered.clone();
+            let resume = resume.clone();
+            tokio::spawn(async move {
+                activity
+                    .wait_until_idle_with_registration_hook(
+                        Instant::now() + Duration::from_secs(30),
+                        || {
+                            registered.wait();
+                            resume.wait();
+                        },
+                    )
+                    .await
+            })
+        };
+
+        registered.wait();
+        drop(active);
+        resume.wait();
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), waiter)
+                .await
+                .expect("idle waiter should wake without burning its deadline")
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn completing_active_request_refreshes_last_used() {
+        let activity = Activity::new();
+        let active = activity.acquire_active();
+        let admitted_at = *activity
+            .inner
+            .last_used
+            .lock()
+            .expect("activity lock poisoned");
+
+        while admitted_at.elapsed() < Duration::from_millis(1) {
+            std::thread::yield_now();
+        }
+
+        drop(active);
+        let completed_at = *activity
+            .inner
+            .last_used
+            .lock()
+            .expect("activity lock poisoned");
+        assert!(completed_at > admitted_at);
+        assert_eq!(activity.active(), 0);
     }
 
     #[tokio::test]

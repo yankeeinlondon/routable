@@ -1,5 +1,6 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
+    future::Future,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -12,7 +13,9 @@ use pingora::{
     protocols::http::ServerSession,
     server::ShutdownWatch,
 };
-use reqwest::header::{CONTENT_LENGTH, HOST};
+use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE, HOST};
+use serde::Serialize;
+use serde_json::{Value, json};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::warn;
 use uuid::Uuid;
@@ -24,7 +27,9 @@ use crate::{
     state::{ActiveGuard, Lifecycle, ServiceStatus},
 };
 
-use super::{OpenAiError, RequestRoutingError, is_hop_by_hop, parse_model_route};
+use super::{
+    ErrorDialect, RequestRoutingError, RouterErrorEnvelope, is_hop_by_hop, parse_model_route,
+};
 
 const MODEL_ENDPOINTS: &[&str] = &[
     "/v1/chat/completions",
@@ -32,14 +37,61 @@ const MODEL_ENDPOINTS: &[&str] = &[
     "/v1/embeddings",
     "/v1/responses",
     "/v1/messages",
+    "/v1/messages/count_tokens",
     "/v1/score",
     "/v1/rerank",
+    "/v2/rerank",
+    "/v2/embed",
     "/score",
     "/rerank",
-    "/v1/classify",
-    "/v1/tokenize",
-    "/v1/detokenize",
+    "/classify",
+    "/tokenize",
+    "/detokenize",
 ];
+const MODELS_ENDPOINT: &str = "/v1/models";
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct ModelsResponse {
+    object: &'static str,
+    data: Vec<ModelDescription>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct ModelDescription {
+    id: String,
+    object: &'static str,
+    created: u64,
+    owned_by: &'static str,
+    root: String,
+    parent: Option<String>,
+}
+
+struct RouterOwnedResponse {
+    status: u16,
+    body: Value,
+}
+
+struct ActiveStreamGuard {
+    gauge: prometheus::IntGauge,
+}
+
+impl ActiveStreamGuard {
+    fn for_response(service: &str, headers: &http::HeaderMap) -> Option<Self> {
+        is_event_stream(headers).then(|| {
+            let gauge = metrics::global()
+                .active_streams
+                .with_label_values(&[service]);
+            gauge.inc();
+            Self { gauge }
+        })
+    }
+}
+
+impl Drop for ActiveStreamGuard {
+    fn drop(&mut self) {
+        self.gauge.dec();
+    }
+}
 
 /// Bounded custom ingress chosen by the Phase-0 body-replay spike.
 ///
@@ -59,16 +111,7 @@ impl DataPlane {
         pool: Arc<dyn PoolManager>,
     ) -> Result<Self, reqwest::Error> {
         let snapshot = config.snapshot();
-        let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_millis(snapshot.policies.connect_timeout_ms))
-            // Reqwest resets this timer whenever bytes arrive, so this is an
-            // inter-chunk idle deadline rather than a total generation limit.
-            .read_timeout(Duration::from_millis(
-                snapshot.policies.inter_chunk_timeout_ms,
-            ))
-            .pool_idle_timeout(Duration::from_secs(90))
-            .tcp_keepalive(Duration::from_secs(30))
-            .build()?;
+        let client = build_upstream_client(&snapshot)?;
         let mut model_parked = HashMap::new();
         for service in &snapshot.services {
             model_parked
@@ -91,7 +134,15 @@ impl DataPlane {
     }
 
     async fn process(&self, http: &mut ServerSession) -> Result<(), IngressError> {
+        let method = http.req_header().method.clone();
         let path = http.req_header().uri.path().to_owned();
+        if let Some(response) =
+            router_owned_response(&method, &path, self.config.snapshot().as_ref())
+        {
+            return self
+                .write_json(http, response.status, &response.body, None)
+                .await;
+        }
         if path.starts_with("/sleep")
             || path.starts_with("/wake_up")
             || path.starts_with("/is_sleeping")
@@ -169,10 +220,6 @@ impl DataPlane {
             }
         };
         let mut active = Some(active);
-        metrics::global()
-            .active
-            .with_label_values(&[&service.name])
-            .inc();
 
         let body = body.freeze();
         let mut result = self
@@ -180,33 +227,18 @@ impl DataPlane {
             .await;
         if matches!(&result, Err(IngressError::ConnectFailure(_))) {
             drop(active.take());
-            metrics::global()
-                .active
-                .with_label_values(&[&service.name])
-                .dec();
             if let Some((alternative, guard)) = self
                 .choose_running(&config, &route.canonical, Some(&service.name))
                 .await?
             {
                 service = alternative;
                 active = Some(guard);
-                metrics::global()
-                    .active
-                    .with_label_values(&[&service.name])
-                    .inc();
                 result = self
                     .proxy_upstream(http, &service, body, &request_id, &traceparent)
                     .await;
             }
         }
-        let held_active = active.take().is_some();
         drop(active);
-        if held_active {
-            metrics::global()
-                .active
-                .with_label_values(&[&service.name])
-                .dec();
-        }
         metrics::global()
             .request_seconds
             .with_label_values(&[&route.canonical])
@@ -245,16 +277,44 @@ impl DataPlane {
             return Ok(admission);
         }
 
-        let service = config
+        let status = self
+            .pool
+            .status(StatusRequest::default())
+            .await
+            .map_err(IngressError::Pool)?;
+        let by_name: HashMap<_, _> = status
+            .services
+            .iter()
+            .map(|status| (status.service.as_str(), status.lifecycle))
+            .collect();
+        let automatic: Vec<_> = config
             .services_for_model(model)
             .into_iter()
             .filter(|service| service.enabled && service.automatic_start)
+            .collect();
+        let all_drained = !automatic.is_empty()
+            && automatic
+                .iter()
+                .all(|service| by_name.get(service.name.as_str()) == Some(&Lifecycle::Drained));
+        let service = automatic
+            .into_iter()
+            .filter(|service| by_name.get(service.name.as_str()) != Some(&Lifecycle::Drained))
             .max_by_key(|service| service.priority)
             .cloned()
-            .ok_or_else(|| IngressError::Unavailable {
-                code: "automatic_start_disabled",
-                message: format!("no enabled auto-start service serves `{model}`"),
-                retry_after: None,
+            .ok_or_else(|| {
+                if all_drained {
+                    IngressError::Unavailable {
+                        code: "model_drained",
+                        message: format!("model `{model}` is administratively drained"),
+                        retry_after: None,
+                    }
+                } else {
+                    IngressError::Unavailable {
+                        code: "automatic_start_disabled",
+                        message: format!("no enabled auto-start service serves `{model}`"),
+                        retry_after: None,
+                    }
+                }
             })?;
         let parking_deadline = started + Duration::from_millis(service.parking.deadline_ms);
         let permits = self.acquire_parking(model, &service)?;
@@ -270,6 +330,7 @@ impl DataPlane {
             service: service.name.clone(),
             deadline: parking_deadline,
             evict: true,
+            reactivate_drained: false,
         });
         tokio::pin!(ensure);
         let outcome = tokio::select! {
@@ -336,14 +397,9 @@ impl DataPlane {
                 .get(service.name.as_str())
                 .map_or(u64::MAX, |status| status.active_requests)
         });
-        for service in candidates {
-            match self.pool.acquire_active(service.name.clone()).await {
-                Ok(guard) => return Ok(Some((service, guard))),
-                Err(PoolError::TransitionInProgress { .. }) => continue,
-                Err(error) => return Err(IngressError::Pool(error)),
-            }
-        }
-        Ok(None)
+        acquire_first_running(candidates, |service| self.pool.acquire_active(service))
+            .await
+            .map_err(IngressError::Pool)
     }
 
     fn acquire_parking(
@@ -428,6 +484,7 @@ impl DataPlane {
             }
         })?;
         let status = response.status().as_u16();
+        let _active_stream = ActiveStreamGuard::for_response(&service.name, response.headers());
         let mut downstream = ResponseHeader::build(status, Some(response.headers().len()))
             .map_err(IngressError::Pingora)?;
         let connection_headers = connection_tokens(response.headers());
@@ -471,7 +528,8 @@ impl DataPlane {
         http: &mut ServerSession,
         error: &RequestRoutingError,
     ) -> Result<(), IngressError> {
-        self.write_json(http, error.status(), &error.openai(), None)
+        let dialect = ErrorDialect::for_path(http.req_header().uri.path());
+        self.write_json(http, error.status(), &error.envelope(dialect), None)
             .await
     }
 
@@ -510,13 +568,13 @@ impl DataPlane {
         message: &str,
         retry_after: Option<u64>,
     ) -> Result<(), IngressError> {
-        let error = OpenAiError {
-            error: super::routing::OpenAiErrorBody {
-                message: message.into(),
-                error_type: "router_error".into(),
-                code: code.into(),
-            },
-        };
+        let error = RouterErrorEnvelope::new(
+            ErrorDialect::for_path(http.req_header().uri.path()),
+            status,
+            code,
+            message,
+            "router_error",
+        );
         self.write_json(http, status, &error, retry_after).await
     }
 
@@ -547,6 +605,59 @@ impl DataPlane {
             .await
             .map_err(IngressError::Pingora)
     }
+}
+
+fn build_upstream_client(config: &RouterConfig) -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_millis(config.policies.connect_timeout_ms))
+        // Reqwest resets this timer whenever bytes arrive, so this is an
+        // inter-chunk idle deadline rather than a total generation limit.
+        .read_timeout(Duration::from_millis(
+            config.policies.inter_chunk_timeout_ms,
+        ))
+        .pool_idle_timeout(Duration::from_secs(90))
+        .tcp_keepalive(Duration::from_secs(30))
+        // A reverse proxy relays 3xx responses instead of turning them into a
+        // second upstream request.
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+}
+
+async fn acquire_first_running<F, Fut>(
+    candidates: Vec<ServiceDefinition>,
+    mut acquire: F,
+) -> Result<Option<(ServiceDefinition, ActiveGuard)>, PoolError>
+where
+    F: FnMut(String) -> Fut,
+    Fut: Future<Output = Result<ActiveGuard, PoolError>>,
+{
+    for service in candidates {
+        match acquire(service.name.clone()).await {
+            Ok(guard) => return Ok(Some((service, guard))),
+            Err(error) if is_replica_local_acquire_error(&error) => {
+                warn!(
+                    service = %service.name,
+                    error = %error,
+                    "ready replica became unavailable during admission; trying the next replica"
+                );
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(None)
+}
+
+fn is_replica_local_acquire_error(error: &PoolError) -> bool {
+    matches!(
+        error,
+        PoolError::AutomaticStartDisabled(_)
+            | PoolError::ServiceDrained(_)
+            | PoolError::TransitionInProgress { .. }
+            | PoolError::PlacementUnavailable { .. }
+            | PoolError::Runner { .. }
+            | PoolError::SleepUnsupported { .. }
+            | PoolError::ParkingFull { .. }
+    )
 }
 
 #[async_trait]
@@ -623,6 +734,62 @@ fn alias_map(config: &RouterConfig) -> HashMap<String, String> {
     aliases
 }
 
+fn router_owned_response(
+    method: &http::Method,
+    path: &str,
+    config: &RouterConfig,
+) -> Option<RouterOwnedResponse> {
+    if path != MODELS_ENDPOINT {
+        return None;
+    }
+    if method != http::Method::GET {
+        return Some(RouterOwnedResponse {
+            status: 405,
+            body: json!({
+                "error": {
+                    "message": "model discovery requires GET",
+                    "type": "router_error",
+                    "code": "method_not_allowed"
+                }
+            }),
+        });
+    }
+
+    Some(RouterOwnedResponse {
+        status: 200,
+        body: serde_json::to_value(configured_models(config))
+            .expect("model discovery response contains only serializable fields"),
+    })
+}
+
+fn configured_models(config: &RouterConfig) -> ModelsResponse {
+    let mut names = BTreeMap::new();
+    for service in &config.services {
+        names
+            .entry(service.served_model.clone())
+            .or_insert_with(|| service.served_model.clone());
+        for alias in &service.aliases {
+            names
+                .entry(alias.clone())
+                .or_insert_with(|| service.served_model.clone());
+        }
+    }
+    ModelsResponse {
+        object: "list",
+        data: names
+            .into_iter()
+            .map(|(id, canonical)| ModelDescription {
+                id,
+                object: "model",
+                created: 0,
+                owned_by: "vllm-router",
+                root: canonical,
+                parent: None,
+            })
+            .collect(),
+    }
+}
+
 fn connection_tokens(headers: &http::HeaderMap) -> Vec<String> {
     headers
         .get_all("connection")
@@ -633,6 +800,14 @@ fn connection_tokens(headers: &http::HeaderMap) -> Vec<String> {
         .filter(|value| !value.is_empty())
         .map(str::to_owned)
         .collect()
+}
+
+fn is_event_stream(headers: &http::HeaderMap) -> bool {
+    headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("text/event-stream"))
 }
 
 async fn read_bounded_body(
@@ -682,13 +857,1007 @@ fn traceparent(http: &ServerSession) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        collections::HashMap,
+        net::SocketAddr,
+        sync::{
+            Mutex,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
+    };
+
+    use pingora::protocols::l4::stream::Stream as PingoraStream;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+        sync::{Notify, watch},
+        task::JoinHandle,
+    };
+
     use super::*;
+    use crate::{
+        pool::{
+            DrainRequest, LifecycleRequest, SleepRequest, StatusResponse, StopRequest,
+            TransitionHandle, TransitionResponse,
+        },
+        state::{Activity, ObservedState, ParkedGuard},
+    };
+
+    #[derive(Clone)]
+    enum EnsureBehavior {
+        Ready,
+        Pending,
+        Error(PoolError),
+    }
+
+    struct FakePool {
+        service_names: Vec<String>,
+        lifecycles: Mutex<HashMap<String, Lifecycle>>,
+        activities: HashMap<String, Activity>,
+        ensure_behavior: EnsureBehavior,
+        ensure_calls: AtomicUsize,
+        ensure_started: Notify,
+        ensure_cancelled: Arc<AtomicBool>,
+        active_attempts: Mutex<Vec<String>>,
+    }
+
+    struct CancellationFlag(Arc<AtomicBool>);
+
+    impl Drop for CancellationFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    impl FakePool {
+        fn new(config: &RouterConfig, lifecycle: Lifecycle, ensure: EnsureBehavior) -> Self {
+            let service_names: Vec<_> = config
+                .services
+                .iter()
+                .map(|service| service.name.clone())
+                .collect();
+            Self {
+                lifecycles: Mutex::new(
+                    service_names
+                        .iter()
+                        .cloned()
+                        .map(|name| (name, lifecycle))
+                        .collect(),
+                ),
+                activities: service_names
+                    .iter()
+                    .cloned()
+                    .map(|name| (name, Activity::new()))
+                    .collect(),
+                service_names,
+                ensure_behavior: ensure,
+                ensure_calls: AtomicUsize::new(0),
+                ensure_started: Notify::new(),
+                ensure_cancelled: Arc::new(AtomicBool::new(false)),
+                active_attempts: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn status_for(&self, service: &str) -> Result<ServiceStatus, PoolError> {
+            let lifecycle = *self
+                .lifecycles
+                .lock()
+                .unwrap()
+                .get(service)
+                .ok_or_else(|| PoolError::UnknownService(service.to_string()))?;
+            let activity = self
+                .activities
+                .get(service)
+                .ok_or_else(|| PoolError::UnknownService(service.to_string()))?
+                .snapshot();
+            let mut status = ObservedState::new(service);
+            status.lifecycle = lifecycle;
+            status.active_requests = activity.active;
+            status.parked_requests = activity.parked;
+            status.idle_for = activity.idle_for;
+            Ok(status)
+        }
+
+        fn activity(&self, service: &str) -> &Activity {
+            &self.activities[service]
+        }
+
+        async fn wait_for_ensure(&self) {
+            loop {
+                let notified = self.ensure_started.notified();
+                if self.ensure_calls.load(Ordering::Acquire) != 0 {
+                    return;
+                }
+                notified.await;
+            }
+        }
+
+        async fn wait_for_cancellation(&self) {
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while !self.ensure_cancelled.load(Ordering::Acquire) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("parked readiness future was not cancelled");
+        }
+
+        fn unsupported(service: String) -> PoolError {
+            PoolError::UnknownService(service)
+        }
+    }
+
+    #[async_trait]
+    impl PoolManager for FakePool {
+        async fn begin_lifecycle(
+            &self,
+            request: LifecycleRequest,
+        ) -> Result<TransitionHandle, PoolError> {
+            let service = match request {
+                LifecycleRequest::EnsureReady(request) => request.service,
+                LifecycleRequest::Drain(request) => request.service,
+                LifecycleRequest::Sleep(request) => request.service,
+                LifecycleRequest::Stop(request) => request.service,
+            };
+            Err(Self::unsupported(service))
+        }
+
+        async fn ensure_ready(
+            &self,
+            request: EnsureReadyRequest,
+        ) -> Result<TransitionResponse, PoolError> {
+            self.ensure_calls.fetch_add(1, Ordering::AcqRel);
+            self.ensure_started.notify_waiters();
+            match &self.ensure_behavior {
+                EnsureBehavior::Ready => {
+                    *self
+                        .lifecycles
+                        .lock()
+                        .unwrap()
+                        .get_mut(&request.service)
+                        .ok_or_else(|| PoolError::UnknownService(request.service.clone()))? =
+                        Lifecycle::Running;
+                    Ok(TransitionResponse {
+                        operation_id: None,
+                        affected_requests: 0,
+                        status: self.status_for(&request.service)?,
+                    })
+                }
+                EnsureBehavior::Error(error) => Err(error.clone()),
+                EnsureBehavior::Pending => {
+                    let _cancelled = CancellationFlag(self.ensure_cancelled.clone());
+                    std::future::pending::<Result<TransitionResponse, PoolError>>().await
+                }
+            }
+        }
+
+        async fn drain(&self, request: DrainRequest) -> Result<TransitionResponse, PoolError> {
+            Err(Self::unsupported(request.service))
+        }
+
+        async fn sleep(&self, request: SleepRequest) -> Result<TransitionResponse, PoolError> {
+            Err(Self::unsupported(request.service))
+        }
+
+        async fn stop(&self, request: StopRequest) -> Result<TransitionResponse, PoolError> {
+            Err(Self::unsupported(request.service))
+        }
+
+        async fn status(&self, request: StatusRequest) -> Result<StatusResponse, PoolError> {
+            let names: Vec<_> = request
+                .service
+                .map_or_else(|| self.service_names.clone(), |service| vec![service]);
+            names
+                .iter()
+                .map(|service| self.status_for(service))
+                .collect::<Result<Vec<_>, _>>()
+                .map(|services| StatusResponse { services })
+        }
+
+        async fn reconcile(&self, service: Option<String>) -> Result<StatusResponse, PoolError> {
+            self.status(StatusRequest { service }).await
+        }
+
+        fn subscribe(&self, service: String) -> Result<watch::Receiver<ServiceStatus>, PoolError> {
+            let (_, receiver) = watch::channel(self.status_for(&service)?);
+            Ok(receiver)
+        }
+
+        async fn acquire_active(&self, service: String) -> Result<ActiveGuard, PoolError> {
+            self.active_attempts.lock().unwrap().push(service.clone());
+            if self.status_for(&service)?.lifecycle != Lifecycle::Running {
+                return Err(PoolError::PlacementUnavailable {
+                    service,
+                    reason: "test service is not running".into(),
+                });
+            }
+            Ok(self.activity(&service).acquire_active())
+        }
+
+        fn acquire_parked(&self, service: String) -> Result<ParkedGuard, PoolError> {
+            self.activities
+                .get(&service)
+                .ok_or_else(|| PoolError::UnknownService(service.clone()))?
+                .try_acquire_parked(u64::MAX)
+                .ok_or(PoolError::ParkingFull { service })
+        }
+    }
+
+    fn test_config(backends: &[SocketAddr]) -> Arc<ConfigStore> {
+        test_config_named(backends, "replica")
+    }
+
+    fn test_config_named(backends: &[SocketAddr], service_prefix: &str) -> Arc<ConfigStore> {
+        Arc::new(
+            ConfigStore::new(test_router_config_named(backends, service_prefix))
+                .expect("test config should validate"),
+        )
+    }
+
+    fn test_router_config_named(backends: &[SocketAddr], service_prefix: &str) -> RouterConfig {
+        let mut config: RouterConfig = serde_yaml::from_str(include_str!("../config/example.yaml"))
+            .expect("example config should parse");
+        config.policies.connect_timeout_ms = 100;
+        config.policies.inter_chunk_timeout_ms = 1_000;
+        let template = config.services[0].clone();
+        config.services = backends
+            .iter()
+            .enumerate()
+            .map(|(index, backend)| {
+                let mut service = template.clone();
+                service.name = format!("{service_prefix}-{index}");
+                service.aliases.clear();
+                service.backend.address = backend.ip();
+                service.backend.port = backend.port();
+                service.systemd.unit = format!("vllm@{service_prefix}-{index}.service");
+                service.systemd.environment_file =
+                    format!("/etc/vllm/{service_prefix}-{index}.env").into();
+                service.parking.deadline_ms = 1_000;
+                service
+            })
+            .collect();
+        config
+    }
+
+    async fn ingress_connection(plane: Arc<DataPlane>) -> (tokio::net::TcpStream, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = tokio::net::TcpStream::connect(address).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let (shutdown_tx, shutdown) = watch::channel(false);
+        let task = tokio::spawn(async move {
+            let _shutdown_tx = shutdown_tx;
+            let stream = PingoraStream::from(server);
+            let session = ServerSession::new_http1(Box::new(stream));
+            let _ = plane.process_new_http(session, &shutdown).await;
+        });
+        (client, task)
+    }
+
+    async fn write_inference_request(client: &mut tokio::net::TcpStream, body: &[u8]) {
+        write_inference_request_to(client, "/v1/chat/completions", body).await;
+    }
+
+    async fn write_inference_request_to(
+        client: &mut tokio::net::TcpStream,
+        path: &str,
+        body: &[u8],
+    ) {
+        let header = format!(
+            "POST {path} HTTP/1.1\r\n\
+             Host: router.test\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\r\n",
+            body.len()
+        );
+        client.write_all(header.as_bytes()).await.unwrap();
+        client.write_all(body).await.unwrap();
+    }
+
+    async fn read_response(mut client: tokio::net::TcpStream) -> Vec<u8> {
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), client.read_to_end(&mut response))
+            .await
+            .expect("ingress response timed out")
+            .unwrap();
+        response
+    }
+
+    async fn read_upstream_request(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
+        let mut request = Vec::new();
+        loop {
+            let mut chunk = [0; 1024];
+            let read = stream.read(&mut chunk).await.unwrap();
+            assert!(read != 0, "upstream request ended before its body");
+            request.extend_from_slice(&chunk[..read]);
+            let Some(header_end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") else {
+                continue;
+            };
+            let header_end = header_end + 4;
+            let headers = String::from_utf8_lossy(&request[..header_end]).to_ascii_lowercase();
+            let content_length = headers
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            if request.len() >= header_end + content_length {
+                return request;
+            }
+        }
+    }
+
+    async fn closed_loopback_address() -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        address
+    }
+
+    async fn read_until(client: &mut tokio::net::TcpStream, needle: &[u8]) -> Vec<u8> {
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let mut chunk = [0; 256];
+                let read = client.read(&mut chunk).await.unwrap();
+                assert!(read != 0, "response ended before expected bytes");
+                response.extend_from_slice(&chunk[..read]);
+                if response.windows(needle.len()).any(|bytes| bytes == needle) {
+                    return;
+                }
+            }
+        })
+        .await
+        .expect("incremental response bytes were not received");
+        response
+    }
 
     #[test]
-    fn public_endpoint_allowlist_excludes_vllm_admin() {
-        assert!(MODEL_ENDPOINTS.contains(&"/v1/chat/completions"));
-        assert!(!MODEL_ENDPOINTS.contains(&"/sleep"));
-        assert!(!MODEL_ENDPOINTS.contains(&"/is_sleeping"));
-        assert!(!MODEL_ENDPOINTS.contains(&"/v1/models"));
+    fn public_endpoint_allowlist_matches_model_bearing_vllm_routes() {
+        for path in [
+            "/tokenize",
+            "/detokenize",
+            "/classify",
+            "/v2/rerank",
+            "/v2/embed",
+            "/v1/messages/count_tokens",
+        ] {
+            assert!(
+                MODEL_ENDPOINTS.contains(&path),
+                "real vLLM endpoint {path} should be exposed"
+            );
+        }
+
+        for path in [
+            "/v1/tokenize",
+            "/v1/detokenize",
+            "/v1/classify",
+            "/sleep",
+            "/is_sleeping",
+            MODELS_ENDPOINT,
+        ] {
+            assert!(
+                !MODEL_ENDPOINTS.contains(&path),
+                "unsupported or router-owned endpoint {path} should not be proxied"
+            );
+        }
+    }
+
+    #[test]
+    fn event_stream_detection_accepts_parameters_but_not_json() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            CONTENT_TYPE,
+            http::HeaderValue::from_static("Text/Event-Stream; charset=utf-8"),
+        );
+        assert!(is_event_stream(&headers));
+
+        headers.insert(
+            CONTENT_TYPE,
+            http::HeaderValue::from_static("application/json"),
+        );
+        assert!(!is_event_stream(&headers));
+    }
+
+    #[test]
+    fn model_discovery_is_an_explicit_get_only_router_owned_route() {
+        let config: RouterConfig = serde_yaml::from_str(include_str!("../config/example.yaml"))
+            .expect("example config should parse");
+
+        assert!(
+            router_owned_response(&http::Method::GET, "/v1/chat/completions", &config).is_none()
+        );
+        let method_error =
+            router_owned_response(&http::Method::POST, MODELS_ENDPOINT, &config).unwrap();
+        assert_eq!(method_error.status, 405);
+        assert_eq!(
+            method_error.body["error"]["code"],
+            Value::String("method_not_allowed".into())
+        );
+    }
+
+    #[test]
+    fn model_discovery_lists_canonical_names_and_aliases_once() {
+        let mut config: RouterConfig = serde_yaml::from_str(include_str!("../config/example.yaml"))
+            .expect("example config should parse");
+        config.services[0].aliases = vec!["alias-b".into(), "alias-a".into()];
+        let mut replica = config.services[0].clone();
+        replica.name = "replica".into();
+        replica.aliases = vec!["alias-a".into(), "alias-c".into()];
+        config.services.push(replica);
+
+        let response = router_owned_response(&http::Method::GET, MODELS_ENDPOINT, &config).unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body["object"], "list");
+        let data = response.body["data"].as_array().unwrap();
+        let ids: Vec<_> = data
+            .iter()
+            .map(|model| model["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["alias-a", "alias-b", "alias-c", "example/model-30b"]);
+        assert!(data.iter().all(|model| {
+            model["object"] == "model"
+                && model["owned_by"] == "vllm-router"
+                && model["root"] == "example/model-30b"
+                && model["parent"].is_null()
+        }));
+    }
+
+    #[tokio::test]
+    async fn replica_local_acquire_failure_falls_back_to_the_next_ready_replica() {
+        let config: RouterConfig = serde_yaml::from_str(include_str!("../config/example.yaml"))
+            .expect("example config should parse");
+        let first = config.services[0].clone();
+        let mut second = first.clone();
+        second.name = "second-replica".into();
+        let activity = Activity::new();
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+
+        let selected = acquire_first_running(vec![first, second], {
+            let attempts = Arc::clone(&attempts);
+            move |service| {
+                let activity = activity.clone();
+                let attempts = Arc::clone(&attempts);
+                async move {
+                    attempts.lock().unwrap().push(service.clone());
+                    if service == "example-30b" {
+                        Err(PoolError::PlacementUnavailable {
+                            service,
+                            reason: "readiness changed during admission".into(),
+                        })
+                    } else {
+                        Ok(activity.acquire_active())
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap()
+        .expect("second replica should be selected");
+
+        assert_eq!(selected.0.name, "second-replica");
+        assert_eq!(
+            *attempts.lock().unwrap(),
+            vec!["example-30b", "second-replica"]
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_acquire_failure_is_not_hidden_by_replica_fallback() {
+        let config: RouterConfig = serde_yaml::from_str(include_str!("../config/example.yaml"))
+            .expect("example config should parse");
+        let candidate = config.services[0].clone();
+
+        let result = acquire_first_running(vec![candidate], |service| async move {
+            Err(PoolError::TerminalFailure {
+                service,
+                message: "permanent failure".into(),
+            })
+        })
+        .await;
+
+        assert!(matches!(result, Err(PoolError::TerminalFailure { .. })));
+    }
+
+    #[tokio::test]
+    async fn parked_admission_holds_active_guard_and_streams_before_upstream_completion() {
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend = upstream.local_addr().unwrap();
+        let (first_chunk_tx, first_chunk_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let upstream_task = tokio::spawn(async move {
+            let (mut stream, _) = upstream.accept().await.unwrap();
+            let request = read_upstream_request(&mut stream).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\n\
+                      Content-Type: text/event-stream\r\n\
+                      Transfer-Encoding: chunked\r\n\
+                      Connection: close\r\n\r\n\
+                      D\r\n\
+                      data: first\n\n\r\n",
+                )
+                .await
+                .unwrap();
+            stream.flush().await.unwrap();
+            let _ = first_chunk_tx.send(());
+            release_rx.await.unwrap();
+            stream
+                .write_all(b"E\r\ndata: second\n\n\r\n0\r\n\r\n")
+                .await
+                .unwrap();
+            stream.flush().await.unwrap();
+            request
+        });
+
+        let config = test_config(&[backend]);
+        let pool = Arc::new(FakePool::new(
+            config.snapshot().as_ref(),
+            Lifecycle::Stopped,
+            EnsureBehavior::Ready,
+        ));
+        let plane = Arc::new(DataPlane::new(config, pool.clone()).unwrap());
+        let (mut client, ingress_task) = ingress_connection(plane).await;
+        let body = br#"{"model":"example/model-30b","stream":true}"#;
+        write_inference_request(&mut client, body).await;
+
+        first_chunk_rx.await.unwrap();
+        let mut response = read_until(&mut client, b"data: first").await;
+
+        assert_eq!(pool.ensure_calls.load(Ordering::Acquire), 1);
+        assert_eq!(pool.activity("replica-0").parked(), 0);
+        assert_eq!(pool.activity("replica-0").active(), 1);
+        assert_eq!(
+            metrics::global()
+                .active_streams
+                .with_label_values(&["replica-0"])
+                .get(),
+            1
+        );
+
+        release_tx.send(()).unwrap();
+        client.read_to_end(&mut response).await.unwrap();
+        ingress_task.await.unwrap();
+        let upstream_request = upstream_task.await.unwrap();
+
+        assert!(
+            response
+                .windows(b"data: second".len())
+                .any(|bytes| { bytes == b"data: second" })
+        );
+        assert!(upstream_request.ends_with(body));
+        assert_eq!(pool.activity("replica-0").active(), 0);
+        assert_eq!(
+            metrics::global()
+                .active_streams
+                .with_label_values(&["replica-0"])
+                .get(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn active_stream_gauge_releases_on_upstream_body_error() {
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend = upstream.local_addr().unwrap();
+        let (first_chunk_tx, first_chunk_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let upstream_task = tokio::spawn(async move {
+            let (mut stream, _) = upstream.accept().await.unwrap();
+            let _ = read_upstream_request(&mut stream).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\n\
+                      Content-Type: text/event-stream\r\n\
+                      Transfer-Encoding: chunked\r\n\
+                      Connection: close\r\n\r\n\
+                      D\r\n\
+                      data: first\n\n\r\n",
+                )
+                .await
+                .unwrap();
+            stream.flush().await.unwrap();
+            let _ = first_chunk_tx.send(());
+            release_rx.await.unwrap();
+            stream.write_all(b"20\r\nincomplete").await.unwrap();
+        });
+
+        let service = "stream-upstream-error-0";
+        let config = test_config_named(&[backend], "stream-upstream-error");
+        let pool = Arc::new(FakePool::new(
+            config.snapshot().as_ref(),
+            Lifecycle::Running,
+            EnsureBehavior::Ready,
+        ));
+        let plane = Arc::new(DataPlane::new(config, pool.clone()).unwrap());
+        let (mut client, ingress_task) = ingress_connection(plane).await;
+        write_inference_request(
+            &mut client,
+            br#"{"model":"example/model-30b","stream":true}"#,
+        )
+        .await;
+
+        first_chunk_rx.await.unwrap();
+        let mut response = read_until(&mut client, b"data: first").await;
+        assert_eq!(
+            metrics::global()
+                .active_streams
+                .with_label_values(&[service])
+                .get(),
+            1
+        );
+
+        release_tx.send(()).unwrap();
+        client.read_to_end(&mut response).await.unwrap();
+        ingress_task.await.unwrap();
+        upstream_task.await.unwrap();
+        assert_eq!(
+            metrics::global()
+                .active_streams
+                .with_label_values(&[service])
+                .get(),
+            0
+        );
+        assert_eq!(pool.activity(service).active(), 0);
+    }
+
+    #[tokio::test]
+    async fn active_stream_gauge_releases_on_downstream_disconnect() {
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend = upstream.local_addr().unwrap();
+        let (first_chunk_tx, first_chunk_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let upstream_task = tokio::spawn(async move {
+            let (mut stream, _) = upstream.accept().await.unwrap();
+            let _ = read_upstream_request(&mut stream).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\n\
+                      Content-Type: text/event-stream\r\n\
+                      Connection: close\r\n\r\n\
+                      data: first\n\n",
+                )
+                .await
+                .unwrap();
+            stream.flush().await.unwrap();
+            let _ = first_chunk_tx.send(());
+            release_rx.await.unwrap();
+            let payload = vec![b'x'; 64 * 1024];
+            for _ in 0..64 {
+                if stream.write_all(&payload).await.is_err() {
+                    break;
+                }
+                if stream.flush().await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let service = "stream-downstream-error-0";
+        let config = test_config_named(&[backend], "stream-downstream-error");
+        let pool = Arc::new(FakePool::new(
+            config.snapshot().as_ref(),
+            Lifecycle::Running,
+            EnsureBehavior::Ready,
+        ));
+        let plane = Arc::new(DataPlane::new(config, pool.clone()).unwrap());
+        let (mut client, ingress_task) = ingress_connection(plane).await;
+        write_inference_request(
+            &mut client,
+            br#"{"model":"example/model-30b","stream":true}"#,
+        )
+        .await;
+
+        first_chunk_rx.await.unwrap();
+        let _response = read_until(&mut client, b"data: first").await;
+        assert_eq!(
+            metrics::global()
+                .active_streams
+                .with_label_values(&[service])
+                .get(),
+            1
+        );
+
+        drop(client);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), ingress_task)
+            .await
+            .expect("ingress did not observe downstream disconnect")
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), upstream_task)
+            .await
+            .expect("upstream mock did not stop after disconnect")
+            .unwrap();
+        assert_eq!(
+            metrics::global()
+                .active_streams
+                .with_label_values(&[service])
+                .get(),
+            0
+        );
+        assert_eq!(pool.activity(service).active(), 0);
+    }
+
+    #[tokio::test]
+    async fn downstream_disconnect_cancels_parking_and_releases_every_guard() {
+        let backend = closed_loopback_address().await;
+        let config = test_config(&[backend]);
+        let pool = Arc::new(FakePool::new(
+            config.snapshot().as_ref(),
+            Lifecycle::Stopped,
+            EnsureBehavior::Pending,
+        ));
+        let plane = Arc::new(DataPlane::new(config, pool.clone()).unwrap());
+        let (mut client, ingress_task) = ingress_connection(plane).await;
+        write_inference_request(
+            &mut client,
+            br#"{"model":"example/model-30b","messages":[]}"#,
+        )
+        .await;
+
+        pool.wait_for_ensure().await;
+        assert_eq!(pool.activity("replica-0").parked(), 1);
+        drop(client);
+
+        pool.wait_for_cancellation().await;
+        tokio::time::timeout(Duration::from_secs(1), ingress_task)
+            .await
+            .expect("ingress did not observe the downstream disconnect")
+            .unwrap();
+        assert_eq!(pool.activity("replica-0").parked(), 0);
+        assert_eq!(pool.activity("replica-0").active(), 0);
+    }
+
+    #[tokio::test]
+    async fn connect_failure_replays_exact_body_to_next_running_replica() {
+        let failed_backend = closed_loopback_address().await;
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fallback_backend = upstream.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let (mut stream, _) = upstream.accept().await.unwrap();
+            let request = read_upstream_request(&mut stream).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\n\
+                      Content-Length: 8\r\n\
+                      Connection: close\r\n\r\n\
+                      fallback",
+                )
+                .await
+                .unwrap();
+            request
+        });
+
+        let config = test_config(&[failed_backend, fallback_backend]);
+        let pool = Arc::new(FakePool::new(
+            config.snapshot().as_ref(),
+            Lifecycle::Running,
+            EnsureBehavior::Ready,
+        ));
+        let plane = Arc::new(DataPlane::new(config, pool.clone()).unwrap());
+        let (mut client, ingress_task) = ingress_connection(plane).await;
+        let body = br#"{"model":"example/model-30b","messages":[{"role":"user","content":"hi"}]}"#;
+        write_inference_request(&mut client, body).await;
+        let response = read_response(client).await;
+        ingress_task.await.unwrap();
+        let upstream_request = upstream_task.await.unwrap();
+
+        assert!(response.starts_with(b"HTTP/1.1 200"));
+        assert!(response.ends_with(b"fallback"));
+        assert!(upstream_request.ends_with(body));
+        assert_eq!(
+            *pool.active_attempts.lock().unwrap(),
+            vec!["replica-0", "replica-1"]
+        );
+        assert_eq!(pool.activity("replica-0").active(), 0);
+        assert_eq!(pool.activity("replica-1").active(), 0);
+    }
+
+    #[tokio::test]
+    async fn messages_router_errors_use_anthropic_envelopes_for_400_404_413_and_503() {
+        let backend = closed_loopback_address().await;
+        let config = test_config(&[backend]);
+        let pool = Arc::new(FakePool::new(
+            config.snapshot().as_ref(),
+            Lifecycle::Running,
+            EnsureBehavior::Ready,
+        ));
+        let plane = Arc::new(DataPlane::new(config, pool).unwrap());
+        let (mut client, ingress_task) = ingress_connection(plane).await;
+        write_inference_request_to(&mut client, "/v1/messages", b"not JSON").await;
+        let response = read_response(client).await;
+        ingress_task.await.unwrap();
+        assert_anthropic_error(&response, 400, "invalid_request_error", "invalid_json");
+
+        let backend = closed_loopback_address().await;
+        let config = test_config(&[backend]);
+        let pool = Arc::new(FakePool::new(
+            config.snapshot().as_ref(),
+            Lifecycle::Running,
+            EnsureBehavior::Ready,
+        ));
+        let plane = Arc::new(DataPlane::new(config, pool).unwrap());
+        let (mut client, ingress_task) = ingress_connection(plane).await;
+        write_inference_request_to(&mut client, "/v1/messages/count_tokens", b"not JSON").await;
+        let response = read_response(client).await;
+        ingress_task.await.unwrap();
+        assert_anthropic_error(&response, 400, "invalid_request_error", "invalid_json");
+
+        let backend = closed_loopback_address().await;
+        let config = test_config(&[backend]);
+        let pool = Arc::new(FakePool::new(
+            config.snapshot().as_ref(),
+            Lifecycle::Running,
+            EnsureBehavior::Ready,
+        ));
+        let plane = Arc::new(DataPlane::new(config, pool).unwrap());
+        let (mut client, ingress_task) = ingress_connection(plane).await;
+        write_inference_request_to(
+            &mut client,
+            "/v1/messages",
+            br#"{"model":"not-configured","messages":[]}"#,
+        )
+        .await;
+        let response = read_response(client).await;
+        ingress_task.await.unwrap();
+        assert_anthropic_error(&response, 404, "not_found_error", "model_not_found");
+
+        let backend = closed_loopback_address().await;
+        let mut config = test_router_config_named(&[backend], "replica");
+        config.policies.maximum_request_body_bytes = 8;
+        let pool = Arc::new(FakePool::new(
+            &config,
+            Lifecycle::Running,
+            EnsureBehavior::Ready,
+        ));
+        let config =
+            Arc::new(ConfigStore::new(config).expect("small test body limit should validate"));
+        let plane = Arc::new(DataPlane::new(config, pool).unwrap());
+        let (mut client, ingress_task) = ingress_connection(plane).await;
+        write_inference_request_to(
+            &mut client,
+            "/v1/messages",
+            br#"{"model":"example/model-30b"}"#,
+        )
+        .await;
+        let response = read_response(client).await;
+        ingress_task.await.unwrap();
+        assert_anthropic_error(&response, 413, "request_too_large", "request_too_large");
+
+        let backend = closed_loopback_address().await;
+        let config = test_config(&[backend]);
+        let pool = Arc::new(FakePool::new(
+            config.snapshot().as_ref(),
+            Lifecycle::Stopped,
+            EnsureBehavior::Error(PoolError::Deadline {
+                service: "replica-0".into(),
+                operation: "readiness",
+            }),
+        ));
+        let plane = Arc::new(DataPlane::new(config, pool).unwrap());
+        let (mut client, ingress_task) = ingress_connection(plane).await;
+        write_inference_request_to(
+            &mut client,
+            "/v1/messages",
+            br#"{"model":"example/model-30b","messages":[]}"#,
+        )
+        .await;
+        let response = read_response(client).await;
+        ingress_task.await.unwrap();
+        assert_anthropic_error(&response, 503, "overloaded_error", "deadline_exceeded");
+        assert!(
+            String::from_utf8_lossy(&response)
+                .to_ascii_lowercase()
+                .contains("retry-after: 30")
+        );
+    }
+
+    #[tokio::test]
+    async fn pool_and_connect_errors_map_to_openai_shaped_http_responses() {
+        let backend = closed_loopback_address().await;
+        let config = test_config(&[backend]);
+        let pool = Arc::new(FakePool::new(
+            config.snapshot().as_ref(),
+            Lifecycle::Stopped,
+            EnsureBehavior::Error(PoolError::Deadline {
+                service: "replica-0".into(),
+                operation: "readiness",
+            }),
+        ));
+        let plane = Arc::new(DataPlane::new(config, pool).unwrap());
+        let (mut client, ingress_task) = ingress_connection(plane).await;
+        write_inference_request(
+            &mut client,
+            br#"{"model":"example/model-30b","messages":[]}"#,
+        )
+        .await;
+        let response = read_response(client).await;
+        ingress_task.await.unwrap();
+        let response = String::from_utf8(response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 503"));
+        assert!(response.to_ascii_lowercase().contains("retry-after: 30"));
+        assert!(response.contains(r#""code":"deadline_exceeded""#));
+
+        let backend = closed_loopback_address().await;
+        let config = test_config(&[backend]);
+        let pool = Arc::new(FakePool::new(
+            config.snapshot().as_ref(),
+            Lifecycle::Running,
+            EnsureBehavior::Ready,
+        ));
+        let plane = Arc::new(DataPlane::new(config, pool).unwrap());
+        let (mut client, ingress_task) = ingress_connection(plane).await;
+        write_inference_request(
+            &mut client,
+            br#"{"model":"example/model-30b","messages":[]}"#,
+        )
+        .await;
+        let response = read_response(client).await;
+        ingress_task.await.unwrap();
+        let response = String::from_utf8(response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 502"));
+        assert!(response.contains(r#""code":"upstream_error""#));
+    }
+
+    fn assert_anthropic_error(
+        response: &[u8],
+        expected_status: u16,
+        expected_type: &str,
+        expected_code: &str,
+    ) {
+        let split = response
+            .windows(4)
+            .position(|bytes| bytes == b"\r\n\r\n")
+            .expect("response should contain a header terminator");
+        let headers = String::from_utf8_lossy(&response[..split]);
+        assert!(
+            headers.starts_with(&format!("HTTP/1.1 {expected_status}")),
+            "{headers}"
+        );
+        let body: Value =
+            serde_json::from_slice(&response[split + 4..]).expect("response body should be JSON");
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["type"], expected_type);
+        assert!(body["error"].get("code").is_none(), "{expected_code}");
+        assert!(body["error"]["message"].is_string());
+    }
+
+    #[tokio::test]
+    async fn upstream_client_returns_redirect_without_following_it() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 1024];
+            let count = stream.read(&mut request).await.unwrap();
+            assert!(count > 0);
+            stream
+                .write_all(
+                    b"HTTP/1.1 307 Temporary Redirect\r\n\
+                      Location: /must-not-be-followed\r\n\
+                      Content-Length: 0\r\n\
+                      Connection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        });
+        let config: RouterConfig = serde_yaml::from_str(include_str!("../config/example.yaml"))
+            .expect("example config should parse");
+        let client = build_upstream_client(&config).unwrap();
+
+        let response = client
+            .post(format!("http://{address}/original"))
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            response.headers().get("location").unwrap(),
+            "/must-not-be-followed"
+        );
+        server.await.unwrap();
     }
 }

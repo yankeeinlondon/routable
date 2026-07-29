@@ -7,7 +7,7 @@ Automated verification recorded 2026-07-28:
 - `cargo test --all-targets --all-features`: 36 pass, 1 ignored, 0 fail
 - two-file `-t` configuration check: pass
 
-The fast suite covers strict/atomic configuration, model aliases and invalid
+The fast suite covers strict startup configuration, model aliases and invalid
 request rejection, generation-safe observed state, exact active/parked guards,
 50-way single-flight start, shared failure fanout, FIFO contention, safe
 priority/LRU eviction, drain deadlines, idle sleep tiers, least-inflight

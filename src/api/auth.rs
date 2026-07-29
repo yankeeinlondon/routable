@@ -1,4 +1,4 @@
-use std::{fs, path::Path};
+use std::{fs, io::Read, path::Path};
 
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
@@ -27,9 +27,20 @@ pub struct TokenAuth {
 
 impl TokenAuth {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, AuthError> {
-        let path = path.as_ref();
-        let metadata = fs::metadata(path).map_err(|source| AuthError::Read {
-            path: path.display().to_string(),
+        Self::load_with_post_validation_hook(path.as_ref(), || {})
+    }
+
+    fn load_with_post_validation_hook(
+        path: &Path,
+        post_validation_hook: impl FnOnce(),
+    ) -> Result<Self, AuthError> {
+        let display_path = path.display().to_string();
+        let mut file = fs::File::open(path).map_err(|source| AuthError::Read {
+            path: display_path.clone(),
+            source,
+        })?;
+        let metadata = file.metadata().map_err(|source| AuthError::Read {
+            path: display_path.clone(),
             source,
         })?;
         #[cfg(unix)]
@@ -41,10 +52,13 @@ impl TokenAuth {
                 return Err(AuthError::InsecurePermissions);
             }
         }
-        let raw = fs::read(path).map_err(|source| AuthError::Read {
-            path: path.display().to_string(),
-            source,
-        })?;
+        post_validation_hook();
+        let mut raw = Vec::new();
+        file.read_to_end(&mut raw)
+            .map_err(|source| AuthError::Read {
+                path: display_path,
+                source,
+            })?;
         let token = trim_ascii(&raw);
         if token.is_empty() {
             return Err(AuthError::Empty);
@@ -55,13 +69,18 @@ impl TokenAuth {
     }
 
     pub fn authorize(&self, authorization: Option<&[u8]>) -> bool {
+        const PREFIX: &[u8] = b"Bearer ";
+
         let Some(value) = authorization else {
             return false;
         };
-        let Some(candidate) = value.strip_prefix(b"Bearer ") else {
+        let Some(scheme) = value.get(..PREFIX.len()) else {
             return false;
         };
-        constant_time_eq(candidate, &self.token)
+        if !scheme.eq_ignore_ascii_case(PREFIX) {
+            return false;
+        }
+        constant_time_eq(&value[PREFIX.len()..], &self.token)
     }
 }
 
@@ -104,10 +123,36 @@ mod tests {
         #[cfg(unix)]
         fs::set_permissions(file.path(), fs::Permissions::from_mode(0o600)).unwrap();
         let auth = TokenAuth::load(file.path()).unwrap();
-        assert!(auth.authorize(Some(b"Bearer secret")));
-        assert!(!auth.authorize(Some(b"bearer secret")));
+        for authorization in [
+            b"Bearer secret".as_slice(),
+            b"bearer secret".as_slice(),
+            b"BEARER secret".as_slice(),
+            b"bEaReR secret".as_slice(),
+        ] {
+            assert!(auth.authorize(Some(authorization)));
+        }
+        assert!(!auth.authorize(Some(b"Basic secret")));
         assert!(!auth.authorize(Some(b"Bearer nope")));
         assert!(!auth.authorize(None));
+    }
+
+    #[test]
+    fn reads_token_from_the_validated_open_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("token");
+        let opened_path = directory.path().join("opened-token");
+        fs::write(&path, b"original").unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let auth = TokenAuth::load_with_post_validation_hook(&path, || {
+            fs::rename(&path, &opened_path).unwrap();
+            fs::write(&path, b"replacement").unwrap();
+        })
+        .unwrap();
+
+        assert!(auth.authorize(Some(b"Bearer original")));
+        assert!(!auth.authorize(Some(b"Bearer replacement")));
     }
 
     #[test]

@@ -38,16 +38,27 @@ Required matrix remains:
 |---:|---|---:|---|
 | 1 | FP8 | 1 | pending on-box |
 | 1 | FP8 | 2 | pending on-box |
+| 1 | FP8 | L1 → L2 | pending on-box |
 | 1 | NVFP4 | 1 | pending on-box |
 | 1 | NVFP4 | 2 | pending on-box |
+| 1 | NVFP4 | L1 → L2 | pending on-box |
 | 2 | FP8 | 1 | pending on-box |
 | 2 | FP8 | 2 | pending on-box |
+| 2 | FP8 | L1 → L2 | pending on-box |
 | 2 | NVFP4 | 1 | pending on-box |
 | 2 | NVFP4 | 2 | pending on-box |
+| 2 | NVFP4 | L1 → L2 | pending on-box |
 
 Each run must record five sleep/wake cycles, fixed-prompt output sanity, wake
 latency, `nvidia-smi` residual VRAM, pinned host RAM, 503 while asleep,
 drain-then-sleep, attempted sleep during a request, and the L2 reload sequence.
+The L1 → L2 cells specifically validate promotion by waking the L1 sleeper and
+then issuing `POST /sleep?level=2`, with no inference admitted between those
+steps. Installed vLLM 0.26 source returns early from a sleep command when the
+executor is already sleeping, so a direct second sleep call cannot perform the
+promotion. The router's request sequence and lifecycle update are covered by
+mock tests; VRAM release, output sanity, and transition latency remain gated on
+the real sm_120 host.
 
 ## S3 — systemd D-Bus
 

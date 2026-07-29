@@ -9,14 +9,15 @@ pub use managed::{
     ManagedBuildError, ManagedVllmRunner, managed_pool_from_config, pool_definition,
 };
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::{Mutex, watch};
@@ -26,6 +27,8 @@ use crate::state::{
     ActiveGuard, Activity, GpuStatus, Lifecycle, ObservedState, ParkedGuard, ProbeStatus,
     ServiceStatus, StateStore, SystemdState, SystemdStatus,
 };
+
+const MAX_CONCURRENT_RECONCILES: usize = 8;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -109,6 +112,8 @@ pub struct EnsureReadyOptions {
     /// Permit safe displacement. Data-plane demand normally sets this to true; an
     /// administrative start can set it explicitly.
     pub evict: bool,
+    /// Permit an explicit administrative start/wake to clear a terminal drain.
+    pub reactivate_drained: bool,
 }
 
 impl EnsureReadyOptions {
@@ -116,6 +121,7 @@ impl EnsureReadyOptions {
         Self {
             deadline,
             evict: true,
+            reactivate_drained: false,
         }
     }
 }
@@ -123,12 +129,16 @@ impl EnsureReadyOptions {
 #[derive(Clone, Debug)]
 pub struct DrainOptions {
     pub deadline: Instant,
+    /// Complete the drain after the deadline even if active work remains.
+    pub force: bool,
 }
 
 #[derive(Clone, Debug)]
 pub struct SleepOptions {
     pub level: SleepLevel,
     pub deadline: Instant,
+    /// After the drain deadline, force-stop instead of sleeping with active work.
+    pub force: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -143,6 +153,8 @@ pub struct EnsureReadyRequest {
     pub service: String,
     pub deadline: Instant,
     pub evict: bool,
+    /// Data-plane demand must leave this false; explicit administration may reactivate.
+    pub reactivate_drained: bool,
 }
 
 impl EnsureReadyRequest {
@@ -151,6 +163,7 @@ impl EnsureReadyRequest {
             service: service.into(),
             deadline,
             evict: true,
+            reactivate_drained: false,
         }
     }
 }
@@ -159,6 +172,7 @@ impl EnsureReadyRequest {
 pub struct DrainRequest {
     pub service: String,
     pub deadline: Instant,
+    pub force: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -166,6 +180,7 @@ pub struct SleepRequest {
     pub service: String,
     pub level: SleepLevel,
     pub deadline: Instant,
+    pub force: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -173,6 +188,14 @@ pub struct StopRequest {
     pub service: String,
     pub deadline: Instant,
     pub force: bool,
+}
+
+#[derive(Clone, Debug)]
+pub enum LifecycleRequest {
+    EnsureReady(EnsureReadyRequest),
+    Drain(DrainRequest),
+    Sleep(SleepRequest),
+    Stop(StopRequest),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -184,31 +207,67 @@ pub struct StatusRequest {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TransitionResponse {
     pub operation_id: Option<Uuid>,
+    /// Active requests displaced or left attached by a forced lifecycle transition.
+    pub affected_requests: u64,
     pub status: ServiceStatus,
+}
+
+pub struct TransitionHandle {
+    operation_id: Uuid,
+    service: String,
+    result: watch::Receiver<FlightResult>,
+    affected_requests: AffectedRequests,
+}
+
+impl TransitionHandle {
+    pub fn operation_id(&self) -> Uuid {
+        self.operation_id
+    }
+
+    /// Wait for the terminal lifecycle result while retaining force-decision metadata,
+    /// including when the transition itself fails.
+    pub async fn wait_outcome(mut self) -> TransitionOutcome {
+        loop {
+            if let FlightResult::Complete(result) = self.result.borrow().clone() {
+                return TransitionOutcome {
+                    operation_id: self.operation_id,
+                    affected_requests: self.affected_requests.get(),
+                    result: *result,
+                };
+            }
+            if self.result.changed().await.is_err() {
+                return TransitionOutcome {
+                    operation_id: self.operation_id,
+                    affected_requests: self.affected_requests.get(),
+                    result: Err(PoolError::TerminalFailure {
+                        service: self.service,
+                        message: "lifecycle transition ended without publishing a result".into(),
+                    }),
+                };
+            }
+        }
+    }
+
+    pub async fn wait(self) -> Result<TransitionResponse, PoolError> {
+        let outcome = self.wait_outcome().await;
+        outcome.result.map(|status| TransitionResponse {
+            operation_id: Some(outcome.operation_id),
+            affected_requests: outcome.affected_requests,
+            status,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransitionOutcome {
+    pub operation_id: Uuid,
+    pub affected_requests: u64,
+    pub result: Result<ServiceStatus, PoolError>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct StatusResponse {
     pub services: Vec<ServiceStatus>,
-}
-
-#[derive(Clone, Debug)]
-pub struct AdmissionRequest {
-    pub model: String,
-    pub deadline: Duration,
-}
-
-/// A selected ready backend. Holding this value holds its exact active-request slot.
-pub struct Admission {
-    pub service: String,
-    pub endpoint: SocketAddr,
-    active_guard: ActiveGuard,
-}
-
-impl Admission {
-    pub fn active_guard(&self) -> &ActiveGuard {
-        &self.active_guard
-    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -261,6 +320,8 @@ pub enum PoolError {
     UnknownService(String),
     #[error("automatic start is disabled for `{0}`")]
     AutomaticStartDisabled(String),
+    #[error("service `{0}` is administratively drained")]
+    ServiceDrained(String),
     #[error("service `{service}` has an incompatible transition in progress")]
     TransitionInProgress { service: String },
     #[error("service `{service}` cannot be placed: {reason}")]
@@ -285,6 +346,7 @@ impl PoolError {
         match self {
             Self::UnknownService(_) => "unknown_service",
             Self::AutomaticStartDisabled(_) => "automatic_start_disabled",
+            Self::ServiceDrained(_) => "service_drained",
             Self::TransitionInProgress { .. } => "transition_in_progress",
             Self::PlacementUnavailable { .. } => "placement_unavailable",
             Self::Deadline { .. } => "deadline_exceeded",
@@ -298,6 +360,11 @@ impl PoolError {
 
 #[async_trait]
 pub trait PoolManager: Send + Sync {
+    /// Start or join a serialized lifecycle transition without waiting for completion.
+    async fn begin_lifecycle(
+        &self,
+        request: LifecycleRequest,
+    ) -> Result<TransitionHandle, PoolError>;
     async fn ensure_ready(
         &self,
         request: EnsureReadyRequest,
@@ -312,7 +379,6 @@ pub trait PoolManager: Send + Sync {
     /// Atomically verify readiness and increment exact active accounting.
     async fn acquire_active(&self, service: String) -> Result<ActiveGuard, PoolError>;
     fn acquire_parked(&self, service: String) -> Result<ParkedGuard, PoolError>;
-    async fn admit(&self, request: AdmissionRequest) -> Result<Admission, PoolError>;
 }
 
 pub struct Pool<R> {
@@ -331,10 +397,14 @@ struct PoolInner<R> {
     runner: Arc<R>,
     state: StateStore,
     services: HashMap<String, Arc<ServiceEntry>>,
-    /// Tokio's mutex acquisition is FIFO. Holding this guard gives cold-placement demands
-    /// a stable arrival order, including while an eligible victim is drained.
-    placement_fifo: Mutex<()>,
+    /// Arrival-ordered demands. Only overlapping GPU sets constrain one another.
+    placement_queue: Mutex<VecDeque<PlacementDemand>>,
     readiness_poll_interval: Duration,
+}
+
+struct PlacementDemand {
+    operation_id: Uuid,
+    service: String,
 }
 
 struct ServiceEntry {
@@ -358,12 +428,26 @@ struct Flight {
     kind: TransitionKind,
     operation_id: Uuid,
     result: watch::Receiver<FlightResult>,
+    affected_requests: AffectedRequests,
 }
 
 #[derive(Clone, Debug)]
 enum FlightResult {
     Pending,
     Complete(Box<Result<ObservedState, PoolError>>),
+}
+
+#[derive(Clone, Default)]
+struct AffectedRequests(Arc<AtomicU64>);
+
+impl AffectedRequests {
+    fn capture(&self, active_requests: u64) {
+        self.0.store(active_requests, Ordering::Release);
+    }
+
+    fn get(&self) -> u64 {
+        self.0.load(Ordering::Acquire)
+    }
 }
 
 impl<R: Runner + 'static> Pool<R> {
@@ -398,7 +482,7 @@ impl<R: Runner + 'static> Pool<R> {
                 runner: Arc::new(runner),
                 state,
                 services,
-                placement_fifo: Mutex::new(()),
+                placement_queue: Mutex::new(VecDeque::new()),
                 readiness_poll_interval: Duration::from_millis(10),
             }),
         })
@@ -429,19 +513,26 @@ impl<R: Runner + 'static> Pool<R> {
         if status.lifecycle == Lifecycle::Running {
             return Ok(status);
         }
+        let handle = self.ensure_ready_flight(service, options.clone()).await?;
+        Self::wait_for_flight(handle.result, options.deadline, service, "ensure ready").await
+    }
+
+    async fn ensure_ready_flight(
+        &self,
+        service: &str,
+        options: EnsureReadyOptions,
+    ) -> Result<TransitionHandle, PoolError> {
         let service_name = service.to_string();
-        let task_options = options.clone();
-        let receiver = self
-            .get_or_spawn_flight(
-                service,
-                TransitionKind::EnsureReady,
-                move |pool, operation_id| async move {
-                    pool.do_ensure_ready(&service_name, task_options, operation_id)
-                        .await
-                },
-            )
-            .await?;
-        Self::wait_for_flight(receiver, options.deadline, service, "ensure ready").await
+        let task_options = options;
+        self.get_or_spawn_flight(
+            service,
+            TransitionKind::EnsureReady,
+            move |pool, operation_id, _affected_requests| async move {
+                pool.do_ensure_ready(&service_name, task_options, operation_id)
+                    .await
+            },
+        )
+        .await
     }
 
     pub async fn drain_status(
@@ -449,19 +540,26 @@ impl<R: Runner + 'static> Pool<R> {
         service: &str,
         options: DrainOptions,
     ) -> Result<ObservedState, PoolError> {
+        let handle = self.drain_flight(service, options.clone()).await?;
+        Self::wait_for_flight(handle.result, options.deadline, service, "drain").await
+    }
+
+    async fn drain_flight(
+        &self,
+        service: &str,
+        options: DrainOptions,
+    ) -> Result<TransitionHandle, PoolError> {
         let service_name = service.to_string();
-        let task_options = options.clone();
-        let receiver = self
-            .get_or_spawn_flight(
-                service,
-                TransitionKind::Drain,
-                move |pool, operation_id| async move {
-                    pool.do_drain(&service_name, task_options, operation_id)
-                        .await
-                },
-            )
-            .await?;
-        Self::wait_for_flight(receiver, options.deadline, service, "drain").await
+        let task_options = options;
+        self.get_or_spawn_flight(
+            service,
+            TransitionKind::Drain,
+            move |pool, operation_id, affected_requests| async move {
+                pool.do_drain(&service_name, task_options, operation_id, affected_requests)
+                    .await
+            },
+        )
+        .await
     }
 
     pub async fn sleep_status(
@@ -469,19 +567,8 @@ impl<R: Runner + 'static> Pool<R> {
         service: &str,
         options: SleepOptions,
     ) -> Result<ObservedState, PoolError> {
-        let service_name = service.to_string();
-        let task_options = options.clone();
-        let receiver = self
-            .get_or_spawn_flight(
-                service,
-                TransitionKind::Sleep(options.level),
-                move |pool, operation_id| async move {
-                    pool.do_sleep(&service_name, task_options, operation_id)
-                        .await
-                },
-            )
-            .await?;
-        Self::wait_for_flight(receiver, options.deadline, service, "sleep").await
+        let handle = self.sleep_flight(service, options.clone()).await?;
+        Self::wait_for_flight(handle.result, options.deadline, service, "sleep").await
     }
 
     pub async fn stop_status(
@@ -489,19 +576,44 @@ impl<R: Runner + 'static> Pool<R> {
         service: &str,
         options: StopOptions,
     ) -> Result<ObservedState, PoolError> {
+        let handle = self.stop_flight(service, options.clone()).await?;
+        Self::wait_for_flight(handle.result, options.deadline, service, "stop").await
+    }
+
+    async fn sleep_flight(
+        &self,
+        service: &str,
+        options: SleepOptions,
+    ) -> Result<TransitionHandle, PoolError> {
         let service_name = service.to_string();
-        let task_options = options.clone();
-        let receiver = self
-            .get_or_spawn_flight(
-                service,
-                TransitionKind::Stop,
-                move |pool, operation_id| async move {
-                    pool.do_stop(&service_name, task_options, operation_id)
-                        .await
-                },
-            )
-            .await?;
-        Self::wait_for_flight(receiver, options.deadline, service, "stop").await
+        let task_options = options;
+        self.get_or_spawn_flight(
+            service,
+            TransitionKind::Sleep(task_options.level),
+            move |pool, operation_id, affected_requests| async move {
+                pool.do_sleep(&service_name, task_options, operation_id, affected_requests)
+                    .await
+            },
+        )
+        .await
+    }
+
+    async fn stop_flight(
+        &self,
+        service: &str,
+        options: StopOptions,
+    ) -> Result<TransitionHandle, PoolError> {
+        let service_name = service.to_string();
+        let task_options = options;
+        self.get_or_spawn_flight(
+            service,
+            TransitionKind::Stop,
+            move |pool, operation_id, affected_requests| async move {
+                pool.do_stop(&service_name, task_options, operation_id, affected_requests)
+                    .await
+            },
+        )
+        .await
     }
 
     pub async fn reconcile(&self, service: &str) -> Result<ObservedState, PoolError> {
@@ -511,23 +623,80 @@ impl<R: Runner + 'static> Pool<R> {
                 service: service.to_string(),
             });
         }
+        let current = self.current_status(service)?;
+        if matches!(current.lifecycle, Lifecycle::Failed | Lifecycle::Backoff) {
+            let observation = match self.inner.runner.observe(&entry.definition).await {
+                Ok(observation) => observation,
+                Err(error) => {
+                    let error = self.runner_error(service, error);
+                    self.inner.state.update_if_current(
+                        service,
+                        current.generation,
+                        current.operation_id,
+                        |status| status.last_error = Some(error.to_string()),
+                    );
+                    return Err(error);
+                }
+            };
+            let activity = entry.activity.snapshot();
+            self.inner.state.update_if_current(
+                service,
+                current.generation,
+                current.operation_id,
+                |status| {
+                    if matches!(status.lifecycle, Lifecycle::Failed | Lifecycle::Backoff) {
+                        status.probe = observation.probe;
+                        status.systemd = observation.systemd;
+                        status.gpus = observation.gpus;
+                        status.active_requests = activity.active;
+                        status.parked_requests = activity.parked;
+                        status.idle_for = activity.idle_for;
+                    }
+                },
+            );
+            return self.current_status(service);
+        }
+        let prior_lifecycle = current.lifecycle;
+        let preserve_drained = prior_lifecycle == Lifecycle::Drained;
         let operation_id = Uuid::new_v4();
         let generation = self
             .inner
             .state
-            .begin_transition(service, Lifecycle::Reconciling, operation_id)
+            .begin_transition(
+                service,
+                if preserve_drained {
+                    Lifecycle::Drained
+                } else {
+                    Lifecycle::Reconciling
+                },
+                operation_id,
+            )
             .expect("registered service missing from state store");
-        let observation = self
-            .inner
-            .runner
-            .observe(&entry.definition)
-            .await
-            .map_err(|error| self.runner_error(service, error))?;
+        let observation = match self.inner.runner.observe(&entry.definition).await {
+            Ok(observation) => observation,
+            Err(error) => {
+                let error = self.runner_error(service, error);
+                self.inner.state.update_if_current(
+                    service,
+                    generation,
+                    Some(operation_id),
+                    |status| {
+                        status.lifecycle = prior_lifecycle;
+                        status.last_error = Some(error.to_string());
+                    },
+                );
+                return Err(error);
+            }
+        };
         let activity = entry.activity.snapshot();
         self.inner
             .state
             .update_if_current(service, generation, Some(operation_id), |status| {
-                status.lifecycle = lifecycle_from_observation(&observation);
+                status.lifecycle = if preserve_drained {
+                    Lifecycle::Drained
+                } else {
+                    lifecycle_from_observation(&observation)
+                };
                 status.probe = observation.probe;
                 status.systemd = observation.systemd;
                 status.gpus = observation.gpus;
@@ -542,10 +711,24 @@ impl<R: Runner + 'static> Pool<R> {
     pub async fn reconcile_all(&self) -> Vec<Result<ObservedState, PoolError>> {
         let mut names: Vec<_> = self.inner.services.keys().cloned().collect();
         names.sort();
-        futures_util::future::join_all(names.iter().map(|name| self.reconcile(name))).await
+        let mut results: Vec<_> = futures_util::stream::iter(
+            names
+                .into_iter()
+                .enumerate()
+                .map(|(index, name)| async move { (index, self.reconcile(&name).await) }),
+        )
+        .buffer_unordered(MAX_CONCURRENT_RECONCILES)
+        .collect()
+        .await;
+        results.sort_by_key(|(index, _)| *index);
+        results.into_iter().map(|(_, result)| result).collect()
     }
 
-    /// Apply one pass of the configured idle tiers.
+    /// Trigger one pass of the configured idle tiers.
+    ///
+    /// Lifecycle work runs in the existing per-service single-flight executor. Dropping the
+    /// receiver here deliberately detaches the background policy from drain and runner
+    /// deadlines, while the flight slot prevents later ticks from spawning duplicate work.
     pub async fn reap_idle_once(&self) {
         let now = Instant::now();
         for entry in self.inner.services.values() {
@@ -559,13 +742,18 @@ impl<R: Runner + 'static> Pool<R> {
             let idle = activity.idle_for;
             let policy = &entry.definition.idle;
             if policy.stop_after.is_some_and(|threshold| idle >= threshold)
+                && !(status.lifecycle == Lifecycle::Drained
+                    && status.systemd.state == SystemdState::Inactive)
                 && matches!(
                     status.lifecycle,
-                    Lifecycle::Running | Lifecycle::AsleepL1 | Lifecycle::AsleepL2
+                    Lifecycle::Running
+                        | Lifecycle::Drained
+                        | Lifecycle::AsleepL1
+                        | Lifecycle::AsleepL2
                 )
             {
-                let _ = self
-                    .stop_status(
+                let _receiver = self
+                    .stop_flight(
                         &entry.definition.name,
                         StopOptions {
                             deadline: now + entry.definition.stop_deadline,
@@ -575,35 +763,40 @@ impl<R: Runner + 'static> Pool<R> {
                     .await;
                 continue;
             }
-            if status.lifecycle == Lifecycle::AsleepL1
+            if (status.lifecycle == Lifecycle::AsleepL1
+                || (status.lifecycle == Lifecycle::Drained
+                    && status.probe.sleeping_level == Some(1)))
                 && policy
                     .sleep_l2_after
                     .is_some_and(|threshold| idle >= threshold)
                 && entry.definition.sleep_levels.contains(&SleepLevel::L2)
             {
-                let _ = self
-                    .sleep_status(
+                let _receiver = self
+                    .sleep_flight(
                         &entry.definition.name,
                         SleepOptions {
                             level: SleepLevel::L2,
                             deadline: now + entry.definition.drain_deadline,
+                            force: false,
                         },
                     )
                     .await;
                 continue;
             }
-            if status.lifecycle == Lifecycle::Running
+            if (status.lifecycle == Lifecycle::Running
+                || (status.lifecycle == Lifecycle::Drained && status_owns_awake_placement(&status)))
                 && policy
                     .sleep_l1_after
                     .is_some_and(|threshold| idle >= threshold)
                 && entry.definition.sleep_levels.contains(&SleepLevel::L1)
             {
-                let _ = self
-                    .sleep_status(
+                let _receiver = self
+                    .sleep_flight(
                         &entry.definition.name,
                         SleepOptions {
                             level: SleepLevel::L1,
                             deadline: now + entry.definition.drain_deadline,
+                            force: false,
                         },
                     )
                     .await;
@@ -673,16 +866,21 @@ impl<R: Runner + 'static> Pool<R> {
         service: &str,
         kind: TransitionKind,
         task: F,
-    ) -> Result<watch::Receiver<FlightResult>, PoolError>
+    ) -> Result<TransitionHandle, PoolError>
     where
-        F: FnOnce(Self, Uuid) -> Fut + Send + 'static,
+        F: FnOnce(Self, Uuid, AffectedRequests) -> Fut + Send + 'static,
         Fut: Future<Output = Result<ObservedState, PoolError>> + Send + 'static,
     {
         let entry = self.entry(service)?;
         let mut slot = entry.flight.lock().await;
         if let Some(existing) = slot.as_ref() {
             if existing.kind == kind {
-                return Ok(existing.result.clone());
+                return Ok(TransitionHandle {
+                    operation_id: existing.operation_id,
+                    service: service.to_string(),
+                    result: existing.result.clone(),
+                    affected_requests: existing.affected_requests.clone(),
+                });
             }
             return Err(PoolError::TransitionInProgress {
                 service: service.to_string(),
@@ -690,18 +888,21 @@ impl<R: Runner + 'static> Pool<R> {
         }
 
         let operation_id = Uuid::new_v4();
+        let affected_requests = AffectedRequests::default();
         let (sender, receiver) = watch::channel(FlightResult::Pending);
         *slot = Some(Flight {
             kind,
             operation_id,
             result: receiver.clone(),
+            affected_requests: affected_requests.clone(),
         });
         drop(slot);
 
         let pool = self.clone();
         let service_name = service.to_string();
+        let task_affected_requests = affected_requests.clone();
         tokio::spawn(async move {
-            let outcome = task(pool.clone(), operation_id).await;
+            let outcome = task(pool.clone(), operation_id, task_affected_requests).await;
             let entry = pool
                 .inner
                 .services
@@ -717,7 +918,12 @@ impl<R: Runner + 'static> Pool<R> {
             drop(slot);
             sender.send_replace(FlightResult::Complete(Box::new(outcome)));
         });
-        Ok(receiver)
+        Ok(TransitionHandle {
+            operation_id,
+            service: service.to_string(),
+            result: receiver,
+            affected_requests,
+        })
     }
 
     async fn do_ensure_ready(
@@ -728,6 +934,9 @@ impl<R: Runner + 'static> Pool<R> {
     ) -> Result<ObservedState, PoolError> {
         let entry = self.entry(service)?;
         let initial = self.current_status(service)?;
+        if initial.lifecycle == Lifecycle::Drained && !options.reactivate_drained {
+            return Err(PoolError::ServiceDrained(service.to_string()));
+        }
         if initial.lifecycle == Lifecycle::Running {
             return Ok(initial);
         }
@@ -743,6 +952,11 @@ impl<R: Runner + 'static> Pool<R> {
         let from_sleep = match initial.lifecycle {
             Lifecycle::AsleepL1 => Some(SleepLevel::L1),
             Lifecycle::AsleepL2 => Some(SleepLevel::L2),
+            Lifecycle::Drained => match initial.probe.sleeping_level {
+                Some(1) => Some(SleepLevel::L1),
+                Some(2) => Some(SleepLevel::L2),
+                _ => None,
+            },
             Lifecycle::Failed | Lifecycle::Backoff => {
                 return Err(PoolError::TerminalFailure {
                     service: service.to_string(),
@@ -754,30 +968,17 @@ impl<R: Runner + 'static> Pool<R> {
             _ => None,
         };
 
-        // The FIFO guard intentionally spans placement, safe eviction, and the cold command.
-        // This makes contention order deterministic instead of allowing later starts to barge.
-        let _placement_turn = timeout_future(
-            options.deadline,
-            self.inner.placement_fifo.lock(),
-            service,
-            "placement",
-        )
-        .await?;
-        self.make_placement(service, &options).await?;
-
-        // Queued demands do not claim their GPUs. The FIFO holder publishes its claim only
-        // after safe placement, preventing two queued starts for one GPU from blocking each
-        // other as phantom `starting` owners.
         let transition = if from_sleep.is_some() {
             Lifecycle::Waking
         } else {
             Lifecycle::Starting
         };
+        // Placement inspection and claim publication are atomic. The queue retains FIFO
+        // only among overlapping GPU sets; the mutex is released before every slow runner,
+        // readiness, warmup, eviction, or contention wait.
         let generation = self
-            .inner
-            .state
-            .begin_transition(service, transition, operation_id)
-            .expect("registered service missing from state store");
+            .claim_placement(service, &options, transition, operation_id)
+            .await?;
 
         let runner_result = if let Some(level) = from_sleep {
             timeout_future(
@@ -842,13 +1043,68 @@ impl<R: Runner + 'static> Pool<R> {
         self.current_status(service)
     }
 
-    async fn make_placement(
+    async fn claim_placement(
         &self,
         service: &str,
         options: &EnsureReadyOptions,
-    ) -> Result<(), PoolError> {
+        transition: Lifecycle,
+        operation_id: Uuid,
+    ) -> Result<u64, PoolError> {
+        let mut queue = timeout_future(
+            options.deadline,
+            self.inner.placement_queue.lock(),
+            service,
+            "placement",
+        )
+        .await?;
+        queue.push_back(PlacementDemand {
+            operation_id,
+            service: service.to_string(),
+        });
+        drop(queue);
+
         loop {
             let entry = self.entry(service)?;
+            let mut queue = match timeout_future(
+                options.deadline,
+                self.inner.placement_queue.lock(),
+                service,
+                "placement",
+            )
+            .await
+            {
+                Ok(queue) => queue,
+                Err(error) => {
+                    self.cancel_placement_demand(operation_id).await;
+                    return Err(error);
+                }
+            };
+            let position = queue
+                .iter()
+                .position(|demand| demand.operation_id == operation_id)
+                .expect("active placement demand disappeared");
+            let waiting_for_earlier_overlap = queue
+                .iter()
+                .take(position)
+                .any(|demand| self.services_overlap(service, &demand.service));
+            if waiting_for_earlier_overlap {
+                drop(queue);
+                if Instant::now() >= options.deadline {
+                    self.cancel_placement_demand(operation_id).await;
+                    return Err(PoolError::Deadline {
+                        service: service.to_string(),
+                        operation: "placement",
+                    });
+                }
+                tokio::time::sleep(
+                    self.inner
+                        .readiness_poll_interval
+                        .min(options.deadline.saturating_duration_since(Instant::now())),
+                )
+                .await;
+                continue;
+            }
+
             let mut blockers: Vec<_> = self
                 .inner
                 .services
@@ -863,14 +1119,17 @@ impl<R: Runner + 'static> Pool<R> {
                 })
                 .filter_map(|candidate| {
                     let status = self.current_status(&candidate.definition.name).ok()?;
-                    status
-                        .lifecycle
-                        .owns_awake_placement()
-                        .then_some((candidate.clone(), status))
+                    status_owns_awake_placement(&status).then_some((candidate.clone(), status))
                 })
                 .collect();
             if blockers.is_empty() {
-                return Ok(());
+                let generation = self
+                    .inner
+                    .state
+                    .begin_transition(service, transition, operation_id)
+                    .expect("registered service missing from state store");
+                remove_placement_demand(&mut queue, operation_id);
+                return Ok(generation);
             }
 
             blockers.sort_by(|(a_entry, a_status), (b_entry, b_status)| {
@@ -889,18 +1148,23 @@ impl<R: Runner + 'static> Pool<R> {
 
             if options.evict {
                 if let Some((victim, _)) = victim {
-                    self.evict_for_placement(victim.clone(), options.deadline)
-                        .await?;
+                    let victim = victim.clone();
+                    drop(queue);
+                    if let Err(error) = self.evict_for_placement(victim, options.deadline).await {
+                        self.cancel_placement_demand(operation_id).await;
+                        return Err(error);
+                    }
                     continue;
                 }
-                // The oldest demand retains the FIFO turn while an ineligible owner drains
-                // naturally; later cold starts cannot leapfrog it.
                 if Instant::now() >= options.deadline {
+                    let reason = blocker_reason(&blockers);
+                    remove_placement_demand(&mut queue, operation_id);
                     return Err(PoolError::PlacementUnavailable {
                         service: service.to_string(),
-                        reason: blocker_reason(&blockers),
+                        reason,
                     });
                 }
+                drop(queue);
                 tokio::time::sleep(
                     self.inner
                         .readiness_poll_interval
@@ -910,11 +1174,32 @@ impl<R: Runner + 'static> Pool<R> {
                 continue;
             }
 
+            let reason = blocker_reason(&blockers);
+            remove_placement_demand(&mut queue, operation_id);
             return Err(PoolError::PlacementUnavailable {
                 service: service.to_string(),
-                reason: blocker_reason(&blockers),
+                reason,
             });
         }
+    }
+
+    fn services_overlap(&self, first: &str, second: &str) -> bool {
+        let Some(first) = self.inner.services.get(first) else {
+            return false;
+        };
+        let Some(second) = self.inner.services.get(second) else {
+            return false;
+        };
+        first
+            .definition
+            .gpu_ids
+            .iter()
+            .any(|gpu| second.definition.gpu_ids.contains(gpu))
+    }
+
+    async fn cancel_placement_demand(&self, operation_id: Uuid) {
+        let mut queue = self.inner.placement_queue.lock().await;
+        remove_placement_demand(&mut queue, operation_id);
     }
 
     async fn evict_for_placement(
@@ -931,11 +1216,13 @@ impl<R: Runner + 'static> Pool<R> {
             });
         }
         let operation_id = Uuid::new_v4();
+        let affected_requests = AffectedRequests::default();
         let (_sender, receiver) = watch::channel(FlightResult::Pending);
         *flight_slot = Some(Flight {
             kind: TransitionKind::Stop,
             operation_id,
             result: receiver,
+            affected_requests: affected_requests.clone(),
         });
         drop(flight_slot);
 
@@ -947,6 +1234,7 @@ impl<R: Runner + 'static> Pool<R> {
                     force: false,
                 },
                 operation_id,
+                affected_requests,
             )
             .await;
         let mut flight_slot = victim.flight.lock().await;
@@ -978,7 +1266,6 @@ impl<R: Runner + 'static> Pool<R> {
                 && observation.probe.ready
                 && observation.probe.healthy
                 && observation.probe.served_model_matches
-                && observation.gpus.iter().all(|gpu| gpu.healthy)
             {
                 return Ok(observation);
             }
@@ -996,13 +1283,11 @@ impl<R: Runner + 'static> Pool<R> {
         service: &str,
         options: DrainOptions,
         operation_id: Uuid,
+        affected_requests: AffectedRequests,
     ) -> Result<ObservedState, PoolError> {
         let entry = self.entry(service)?;
         let previous = self.current_status(service)?.lifecycle;
-        if matches!(
-            previous,
-            Lifecycle::Stopped | Lifecycle::AsleepL1 | Lifecycle::AsleepL2
-        ) {
+        if previous == Lifecycle::Drained {
             return self.current_status(service);
         }
         let admission = entry.admission.lock().await;
@@ -1012,7 +1297,8 @@ impl<R: Runner + 'static> Pool<R> {
             .begin_transition(service, Lifecycle::Draining, operation_id)
             .expect("registered service missing from state store");
         drop(admission);
-        if !entry.activity.wait_until_idle(options.deadline).await {
+        let drained = entry.activity.wait_until_idle(options.deadline).await;
+        if !drained && !options.force {
             self.inner
                 .state
                 .update_if_current(service, generation, Some(operation_id), |status| {
@@ -1023,6 +1309,14 @@ impl<R: Runner + 'static> Pool<R> {
                 operation: "drain",
             });
         }
+        if !drained {
+            affected_requests.capture(entry.activity.active());
+        }
+        self.inner
+            .state
+            .update_if_current(service, generation, Some(operation_id), |status| {
+                status.lifecycle = Lifecycle::Drained
+            });
         self.current_status(service)
     }
 
@@ -1031,6 +1325,7 @@ impl<R: Runner + 'static> Pool<R> {
         service: &str,
         options: SleepOptions,
         operation_id: Uuid,
+        affected_requests: AffectedRequests,
     ) -> Result<ObservedState, PoolError> {
         let entry = self.entry(service)?;
         if !entry.definition.sleep_levels.contains(&options.level) {
@@ -1039,9 +1334,40 @@ impl<R: Runner + 'static> Pool<R> {
                 level: options.level,
             });
         }
-        let previous = self.current_status(service)?.lifecycle;
-        if previous == options.level.lifecycle() {
-            return self.current_status(service);
+        let previous_status = self.current_status(service)?;
+        let previous = previous_status.lifecycle;
+        let requested_level = match options.level {
+            SleepLevel::L1 => 1,
+            SleepLevel::L2 => 2,
+        };
+        if previous == options.level.lifecycle()
+            || (previous == Lifecycle::Drained
+                && previous_status.systemd.state == SystemdState::Active
+                && previous_status.probe.sleeping_level == Some(requested_level))
+        {
+            return Ok(previous_status);
+        }
+        let valid_source = match previous {
+            Lifecycle::Running => true,
+            Lifecycle::AsleepL1 => options.level == SleepLevel::L2,
+            Lifecycle::Drained => {
+                previous_status.systemd.state == SystemdState::Active
+                    && match previous_status.probe.sleeping_level {
+                        None => true,
+                        Some(1) => options.level == SleepLevel::L2,
+                        Some(_) => false,
+                    }
+            }
+            _ => false,
+        };
+        if !valid_source {
+            return Err(PoolError::PlacementUnavailable {
+                service: service.to_string(),
+                reason: format!(
+                    "cannot enter sleep level {requested_level} from {:?}",
+                    previous
+                ),
+            });
         }
         let admission = entry.admission.lock().await;
         let generation = self
@@ -1050,7 +1376,8 @@ impl<R: Runner + 'static> Pool<R> {
             .begin_transition(service, Lifecycle::Draining, operation_id)
             .expect("registered service missing from state store");
         drop(admission);
-        if !entry.activity.wait_until_idle(options.deadline).await {
+        let drained = entry.activity.wait_until_idle(options.deadline).await;
+        if !drained && !options.force {
             self.inner
                 .state
                 .update_if_current(service, generation, Some(operation_id), |status| {
@@ -1061,6 +1388,46 @@ impl<R: Runner + 'static> Pool<R> {
                 operation: "drain before sleep",
             });
         }
+        if !drained {
+            affected_requests.capture(entry.activity.active());
+            self.inner
+                .state
+                .update_if_current(service, generation, Some(operation_id), |status| {
+                    status.lifecycle = Lifecycle::Stopping
+                });
+            let force_stop = tokio::time::timeout(
+                entry.definition.stop_deadline,
+                self.inner.runner.stop(&entry.definition, true),
+            )
+            .await
+            .map_err(|_| PoolError::Deadline {
+                service: service.to_string(),
+                operation: "forced stop instead of unsafe sleep",
+            })
+            .and_then(|result| result.map_err(|error| self.runner_error(service, error)));
+            if let Err(error) = force_stop {
+                self.inner.state.update_if_current(
+                    service,
+                    generation,
+                    Some(operation_id),
+                    |status| {
+                        status.lifecycle = Lifecycle::Drained;
+                        status.last_error = Some(error.to_string());
+                    },
+                );
+                return Err(error);
+            }
+            self.inner
+                .state
+                .update_if_current(service, generation, Some(operation_id), |status| {
+                    status.lifecycle = Lifecycle::Drained;
+                    status.probe.ready = false;
+                    status.probe.healthy = false;
+                    status.probe.sleeping_level = None;
+                    status.systemd.state = SystemdState::Inactive;
+                });
+            return self.current_status(service);
+        }
         let result = timeout_future(
             options.deadline,
             self.inner.runner.sleep(&entry.definition, options.level),
@@ -1070,13 +1437,33 @@ impl<R: Runner + 'static> Pool<R> {
         .await
         .and_then(|result| result.map_err(|error| self.runner_error(service, error)));
         if let Err(error) = result {
-            self.record_failure(service, generation, operation_id, &error);
+            if previous == Lifecycle::Drained {
+                self.inner.state.update_if_current(
+                    service,
+                    generation,
+                    Some(operation_id),
+                    |status| {
+                        status.lifecycle = Lifecycle::Drained;
+                        status.last_error = Some(error.to_string());
+                    },
+                );
+            } else {
+                self.record_failure(service, generation, operation_id, &error);
+                self.schedule_backoff(service, operation_id);
+            }
             return Err(error);
         }
         self.inner
             .state
             .update_if_current(service, generation, Some(operation_id), |status| {
-                status.lifecycle = options.level.lifecycle()
+                status.lifecycle = if previous == Lifecycle::Drained {
+                    Lifecycle::Drained
+                } else {
+                    options.level.lifecycle()
+                };
+                status.probe.sleeping_level = Some(requested_level);
+                status.probe.ready = false;
+                status.probe.healthy = false;
             });
         self.current_status(service)
     }
@@ -1086,11 +1473,16 @@ impl<R: Runner + 'static> Pool<R> {
         service: &str,
         options: StopOptions,
         operation_id: Uuid,
+        affected_requests: AffectedRequests,
     ) -> Result<ObservedState, PoolError> {
         let entry = self.entry(service)?;
-        let previous = self.current_status(service)?.lifecycle;
-        if previous == Lifecycle::Stopped {
-            return self.current_status(service);
+        let previous_status = self.current_status(service)?;
+        let previous = previous_status.lifecycle;
+        if previous == Lifecycle::Stopped
+            || (previous == Lifecycle::Drained
+                && previous_status.systemd.state == SystemdState::Inactive)
+        {
+            return Ok(previous_status);
         }
         let admission = entry.admission.lock().await;
         let generation = self
@@ -1111,6 +1503,9 @@ impl<R: Runner + 'static> Pool<R> {
                 operation: "drain before stop",
             });
         }
+        if !drained {
+            affected_requests.capture(entry.activity.active());
+        }
         self.inner
             .state
             .update_if_current(service, generation, Some(operation_id), |status| {
@@ -1130,15 +1525,33 @@ impl<R: Runner + 'static> Pool<R> {
         .await
         .and_then(|result| result.map_err(|error| self.runner_error(service, error)));
         if let Err(error) = result {
-            self.record_failure(service, generation, operation_id, &error);
+            if previous == Lifecycle::Drained {
+                self.inner.state.update_if_current(
+                    service,
+                    generation,
+                    Some(operation_id),
+                    |status| {
+                        status.lifecycle = Lifecycle::Drained;
+                        status.last_error = Some(error.to_string());
+                    },
+                );
+            } else {
+                self.record_failure(service, generation, operation_id, &error);
+                self.schedule_backoff(service, operation_id);
+            }
             return Err(error);
         }
         self.inner
             .state
             .update_if_current(service, generation, Some(operation_id), |status| {
-                status.lifecycle = Lifecycle::Stopped;
+                status.lifecycle = if previous == Lifecycle::Drained {
+                    Lifecycle::Drained
+                } else {
+                    Lifecycle::Stopped
+                };
                 status.probe.ready = false;
                 status.probe.healthy = false;
+                status.probe.sleeping_level = None;
                 status.systemd.state = SystemdState::Inactive;
             });
         self.current_status(service)
@@ -1246,70 +1659,111 @@ impl<R: Runner + 'static> Pool<R> {
 
 #[async_trait]
 impl<R: Runner + 'static> PoolManager for Pool<R> {
+    async fn begin_lifecycle(
+        &self,
+        request: LifecycleRequest,
+    ) -> Result<TransitionHandle, PoolError> {
+        match request {
+            LifecycleRequest::EnsureReady(request) => {
+                self.ensure_ready_flight(
+                    &request.service,
+                    EnsureReadyOptions {
+                        deadline: request.deadline,
+                        evict: request.evict,
+                        reactivate_drained: request.reactivate_drained,
+                    },
+                )
+                .await
+            }
+            LifecycleRequest::Drain(request) => {
+                self.drain_flight(
+                    &request.service,
+                    DrainOptions {
+                        deadline: request.deadline,
+                        force: request.force,
+                    },
+                )
+                .await
+            }
+            LifecycleRequest::Sleep(request) => {
+                self.sleep_flight(
+                    &request.service,
+                    SleepOptions {
+                        level: request.level,
+                        deadline: request.deadline,
+                        force: request.force,
+                    },
+                )
+                .await
+            }
+            LifecycleRequest::Stop(request) => {
+                self.stop_flight(
+                    &request.service,
+                    StopOptions {
+                        deadline: request.deadline,
+                        force: request.force,
+                    },
+                )
+                .await
+            }
+        }
+    }
+
     async fn ensure_ready(
         &self,
         request: EnsureReadyRequest,
     ) -> Result<TransitionResponse, PoolError> {
-        let status = self
-            .ensure_ready_status(
-                &request.service,
-                EnsureReadyOptions {
-                    deadline: request.deadline,
-                    evict: request.evict,
-                },
-            )
-            .await?;
-        Ok(TransitionResponse {
-            operation_id: status.operation_id,
-            status,
-        })
+        self.ensure_ready_flight(
+            &request.service,
+            EnsureReadyOptions {
+                deadline: request.deadline,
+                evict: request.evict,
+                reactivate_drained: request.reactivate_drained,
+            },
+        )
+        .await?
+        .wait()
+        .await
     }
 
     async fn drain(&self, request: DrainRequest) -> Result<TransitionResponse, PoolError> {
-        let status = self
-            .drain_status(
-                &request.service,
-                DrainOptions {
-                    deadline: request.deadline,
-                },
-            )
-            .await?;
-        Ok(TransitionResponse {
-            operation_id: status.operation_id,
-            status,
-        })
+        self.drain_flight(
+            &request.service,
+            DrainOptions {
+                deadline: request.deadline,
+                force: request.force,
+            },
+        )
+        .await?
+        .wait()
+        .await
     }
 
     async fn sleep(&self, request: SleepRequest) -> Result<TransitionResponse, PoolError> {
-        let status = self
-            .sleep_status(
-                &request.service,
-                SleepOptions {
-                    level: request.level,
-                    deadline: request.deadline,
-                },
-            )
-            .await?;
-        Ok(TransitionResponse {
-            operation_id: status.operation_id,
-            status,
-        })
+        self.sleep_flight(
+            &request.service,
+            SleepOptions {
+                level: request.level,
+                deadline: request.deadline,
+                force: request.force,
+            },
+        )
+        .await?
+        .wait()
+        .await
     }
 
     async fn stop(&self, request: StopRequest) -> Result<TransitionResponse, PoolError> {
-        let status = self
-            .stop_status(
-                &request.service,
-                StopOptions {
-                    deadline: request.deadline,
-                    force: request.force,
-                },
-            )
-            .await?;
-        Ok(TransitionResponse {
-            operation_id: status.operation_id,
-            status,
-        })
+        self.stop_flight(
+            &request.service,
+            StopOptions {
+                deadline: request.deadline,
+                force: request.force,
+            },
+        )
+        .await?
+        .wait()
+        .await
     }
 
     async fn status(&self, request: StatusRequest) -> Result<StatusResponse, PoolError> {
@@ -1368,79 +1822,6 @@ impl<R: Runner + 'static> PoolManager for Pool<R> {
             .try_acquire_parked(entry.definition.parking_limit)
             .ok_or(PoolError::ParkingFull { service })
     }
-
-    async fn admit(&self, request: AdmissionRequest) -> Result<Admission, PoolError> {
-        let deadline = Instant::now() + request.deadline;
-        let mut candidates: Vec<_> = self
-            .inner
-            .services
-            .values()
-            .filter(|entry| {
-                entry.definition.enabled && entry.definition.served_model == request.model
-            })
-            .cloned()
-            .collect();
-        if candidates.is_empty() {
-            return Err(PoolError::UnknownService(request.model));
-        }
-        candidates.sort_by(|a, b| {
-            a.activity
-                .active()
-                .cmp(&b.activity.active())
-                .then_with(|| a.definition.name.cmp(&b.definition.name))
-        });
-
-        // Fast path: least-inflight among replicas that remain ready while admission is
-        // serialized against drain.
-        for entry in &candidates {
-            let admission = entry.admission.lock().await;
-            let status = self.current_status(&entry.definition.name)?;
-            if status.lifecycle == Lifecycle::Running {
-                let active_guard = entry.activity.acquire_active();
-                drop(admission);
-                return Ok(Admission {
-                    service: entry.definition.name.clone(),
-                    endpoint: entry.definition.endpoint,
-                    active_guard,
-                });
-            }
-        }
-
-        // Cold path: park against a deterministic replica. The parked guard is independent
-        // of the detached transition flight, so caller cancellation cannot cancel startup.
-        candidates.sort_by(|a, b| {
-            a.activity
-                .parked()
-                .cmp(&b.activity.parked())
-                .then_with(|| a.definition.name.cmp(&b.definition.name))
-        });
-        let target = candidates
-            .into_iter()
-            .find(|entry| entry.definition.automatic_start)
-            .ok_or_else(|| PoolError::AutomaticStartDisabled(request.model.clone()))?;
-        let parked = target
-            .activity
-            .try_acquire_parked(target.definition.parking_limit)
-            .ok_or_else(|| PoolError::ParkingFull {
-                service: target.definition.name.clone(),
-            })?;
-        self.ensure_ready_status(
-            &target.definition.name,
-            EnsureReadyOptions {
-                deadline,
-                evict: true,
-            },
-        )
-        .await?;
-        drop(parked);
-        self.acquire_active(target.definition.name.clone())
-            .await
-            .map(|active_guard| Admission {
-                service: target.definition.name.clone(),
-                endpoint: target.definition.endpoint,
-                active_guard,
-            })
-    }
 }
 
 fn lifecycle_from_observation(observation: &RunnerObservation) -> Lifecycle {
@@ -1454,14 +1835,29 @@ fn lifecycle_from_observation(observation: &RunnerObservation) -> Lifecycle {
             Some(2) => Lifecycle::AsleepL2,
             _ if observation.probe.ready
                 && observation.probe.healthy
-                && observation.probe.served_model_matches
-                && observation.gpus.iter().all(|gpu| gpu.healthy) =>
+                && observation.probe.served_model_matches =>
             {
                 Lifecycle::Running
             }
             _ => Lifecycle::Stale,
         },
         SystemdState::Unknown => Lifecycle::Unknown,
+    }
+}
+
+fn status_owns_awake_placement(status: &ObservedState) -> bool {
+    if status.lifecycle != Lifecycle::Drained {
+        return status.lifecycle.owns_awake_placement();
+    }
+    status.systemd.state != SystemdState::Inactive && status.probe.sleeping_level.is_none()
+}
+
+fn remove_placement_demand(queue: &mut VecDeque<PlacementDemand>, operation_id: Uuid) {
+    if let Some(position) = queue
+        .iter()
+        .position(|demand| demand.operation_id == operation_id)
+    {
+        queue.remove(position);
     }
 }
 
@@ -1502,6 +1898,8 @@ where
 mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize};
 
+    use tokio::sync::Notify;
+
     use super::*;
 
     struct MockService {
@@ -1516,8 +1914,22 @@ mod tests {
         start_order: Arc<Mutex<Vec<String>>>,
         stops: Arc<AtomicUsize>,
         stop_order: Arc<Mutex<Vec<String>>>,
+        stop_forces: Arc<Mutex<Vec<bool>>>,
+        sleep_order: Arc<Mutex<Vec<(String, SleepLevel)>>>,
+        wakes: Arc<AtomicUsize>,
+        observes: Arc<AtomicUsize>,
+        observe_started: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
+        observe_release: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
+        start_started: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
+        start_release: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
+        stop_started: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
+        stop_release: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
         start_delay: Duration,
+        fail_observe: Arc<AtomicBool>,
         fail_start: Arc<AtomicBool>,
+        fail_sleep: Arc<AtomicBool>,
+        fail_stop: Arc<AtomicBool>,
+        gpu_healthy: Arc<AtomicBool>,
     }
 
     impl MockRunner {
@@ -1540,8 +1952,22 @@ mod tests {
                 start_order: Arc::new(Mutex::new(Vec::new())),
                 stops: Arc::new(AtomicUsize::new(0)),
                 stop_order: Arc::new(Mutex::new(Vec::new())),
+                stop_forces: Arc::new(Mutex::new(Vec::new())),
+                sleep_order: Arc::new(Mutex::new(Vec::new())),
+                wakes: Arc::new(AtomicUsize::new(0)),
+                observes: Arc::new(AtomicUsize::new(0)),
+                observe_started: Arc::new(Mutex::new(HashMap::new())),
+                observe_release: Arc::new(Mutex::new(HashMap::new())),
+                start_started: Arc::new(Mutex::new(HashMap::new())),
+                start_release: Arc::new(Mutex::new(HashMap::new())),
+                stop_started: Arc::new(Mutex::new(HashMap::new())),
+                stop_release: Arc::new(Mutex::new(HashMap::new())),
                 start_delay: Duration::from_millis(20),
+                fail_observe: Arc::new(AtomicBool::new(false)),
                 fail_start: Arc::new(AtomicBool::new(false)),
+                fail_sleep: Arc::new(AtomicBool::new(false)),
+                fail_stop: Arc::new(AtomicBool::new(false)),
+                gpu_healthy: Arc::new(AtomicBool::new(true)),
             }
         }
     }
@@ -1552,6 +1978,28 @@ mod tests {
             &self,
             service: &ServiceDefinition,
         ) -> Result<RunnerObservation, RunnerError> {
+            self.observes.fetch_add(1, Ordering::AcqRel);
+            let started = self
+                .observe_started
+                .lock()
+                .await
+                .get(&service.name)
+                .cloned();
+            if let Some(started) = started {
+                started.notify_one();
+            }
+            let release = self
+                .observe_release
+                .lock()
+                .await
+                .get(&service.name)
+                .cloned();
+            if let Some(release) = release {
+                release.notified().await;
+            }
+            if self.fail_observe.load(Ordering::Acquire) {
+                return Err(RunnerError::new("injected observation failure"));
+            }
             let state = &self.services[&service.name];
             let running = state.running.load(Ordering::Acquire);
             let sleeping = *state.sleeping.lock().await;
@@ -1584,7 +2032,8 @@ mod tests {
                         uuid: uuid.clone(),
                         used_memory_bytes: Some(if running { 1 } else { 0 }),
                         process_ids: if running { vec![42] } else { vec![] },
-                        healthy: true,
+                        healthy: self.gpu_healthy.load(Ordering::Acquire),
+                        drift: Vec::new(),
                     })
                     .collect(),
             })
@@ -1593,6 +2042,14 @@ mod tests {
         async fn start(&self, service: &ServiceDefinition) -> Result<(), RunnerError> {
             self.starts.fetch_add(1, Ordering::AcqRel);
             self.start_order.lock().await.push(service.name.clone());
+            let started = self.start_started.lock().await.get(&service.name).cloned();
+            if let Some(started) = started {
+                started.notify_one();
+            }
+            let release = self.start_release.lock().await.get(&service.name).cloned();
+            if let Some(release) = release {
+                release.notified().await;
+            }
             tokio::time::sleep(self.start_delay).await;
             if self.fail_start.load(Ordering::Acquire) {
                 return Err(RunnerError::new("injected start failure"));
@@ -1603,9 +2060,21 @@ mod tests {
             Ok(())
         }
 
-        async fn stop(&self, service: &ServiceDefinition, _force: bool) -> Result<(), RunnerError> {
+        async fn stop(&self, service: &ServiceDefinition, force: bool) -> Result<(), RunnerError> {
             self.stops.fetch_add(1, Ordering::AcqRel);
             self.stop_order.lock().await.push(service.name.clone());
+            self.stop_forces.lock().await.push(force);
+            if self.fail_stop.swap(false, Ordering::AcqRel) {
+                return Err(RunnerError::new("injected stop failure"));
+            }
+            let started = self.stop_started.lock().await.get(&service.name).cloned();
+            if let Some(started) = started {
+                started.notify_one();
+            }
+            let release = self.stop_release.lock().await.get(&service.name).cloned();
+            if let Some(release) = release {
+                release.notified().await;
+            }
             self.services[&service.name]
                 .running
                 .store(false, Ordering::Release);
@@ -1618,6 +2087,13 @@ mod tests {
             service: &ServiceDefinition,
             level: SleepLevel,
         ) -> Result<(), RunnerError> {
+            self.sleep_order
+                .lock()
+                .await
+                .push((service.name.clone(), level));
+            if self.fail_sleep.load(Ordering::Acquire) {
+                return Err(RunnerError::new("injected sleep failure"));
+            }
             *self.services[&service.name].sleeping.lock().await = Some(level);
             Ok(())
         }
@@ -1627,6 +2103,7 @@ mod tests {
             service: &ServiceDefinition,
             _level: SleepLevel,
         ) -> Result<(), RunnerError> {
+            self.wakes.fetch_add(1, Ordering::AcqRel);
             *self.services[&service.name].sleeping.lock().await = None;
             Ok(())
         }
@@ -1650,6 +2127,197 @@ mod tests {
         pool
     }
 
+    async fn wait_for_status(
+        pool: &Pool<MockRunner>,
+        service: &str,
+        predicate: impl Fn(&ObservedState) -> bool,
+    ) -> ObservedState {
+        let mut statuses = pool
+            .inner
+            .state
+            .subscribe(service)
+            .expect("test service must be registered");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let current = statuses.borrow().clone();
+                if predicate(&current) {
+                    return current;
+                }
+                statuses
+                    .changed()
+                    .await
+                    .expect("test pool must retain the status sender");
+            }
+        })
+        .await
+        .expect("expected service status was not published")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn slow_reconcile_does_not_block_fast_service_observation() {
+        let runner = MockRunner::new(&["fast", "slow"], &["fast", "slow"]);
+        let controls = runner.clone();
+        let pool = reconciled_pool(
+            vec![definition("fast", "gpu-0"), definition("slow", "gpu-1")],
+            runner,
+        )
+        .await;
+        let initial_fast_generation = pool.current_status("fast").unwrap().generation;
+        let slow_started = Arc::new(Notify::new());
+        let slow_release = Arc::new(Notify::new());
+        controls
+            .observe_started
+            .lock()
+            .await
+            .insert("slow".into(), slow_started.clone());
+        controls
+            .observe_release
+            .lock()
+            .await
+            .insert("slow".into(), slow_release.clone());
+
+        let reconcile_pool = pool.clone();
+        let reconcile = tokio::spawn(async move { reconcile_pool.reconcile_all().await });
+        tokio::time::timeout(Duration::from_secs(1), slow_started.notified())
+            .await
+            .expect("the slow observation should start");
+
+        let fast = wait_for_status(&pool, "fast", |status| {
+            status.generation > initial_fast_generation && status.lifecycle == Lifecycle::Running
+        })
+        .await;
+        assert_eq!(fast.lifecycle, Lifecycle::Running);
+        assert!(
+            !reconcile.is_finished(),
+            "the slow observation must still be held independently"
+        );
+
+        slow_release.notify_one();
+        let results = reconcile.await.unwrap();
+        assert!(results.into_iter().all(|result| result.is_ok()));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconcile_all_bounds_in_flight_observations() {
+        let names = ["s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8"];
+        let runner = MockRunner::new(&names, &names);
+        let controls = runner.clone();
+        let definitions = names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| definition(name, &format!("gpu-{index}")))
+            .collect();
+        let pool = reconciled_pool(definitions, runner).await;
+        controls.observes.store(0, Ordering::Release);
+
+        let mut releases = Vec::new();
+        for name in names {
+            let release = Arc::new(Notify::new());
+            controls
+                .observe_release
+                .lock()
+                .await
+                .insert(name.into(), release.clone());
+            releases.push(release);
+        }
+
+        let reconcile_pool = pool.clone();
+        let reconcile = tokio::spawn(async move { reconcile_pool.reconcile_all().await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while controls.observes.load(Ordering::Acquire) < MAX_CONCURRENT_RECONCILES {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the reconcile window should fill");
+        assert_eq!(
+            controls.observes.load(Ordering::Acquire),
+            MAX_CONCURRENT_RECONCILES
+        );
+
+        releases[0].notify_one();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while controls.observes.load(Ordering::Acquire) < names.len() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("completing one observation should admit the next");
+        for release in &releases[1..] {
+            release.notify_one();
+        }
+
+        let results = reconcile.await.unwrap();
+        assert!(results.into_iter().all(|result| result.is_ok()));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn detached_idle_reap_does_not_block_tick_or_fast_service() {
+        let runner = MockRunner::new(&["fast", "slow"], &["fast", "slow"]);
+        let controls = runner.clone();
+        let mut fast = definition("fast", "gpu-0");
+        fast.idle.stop_after = Some(Duration::ZERO);
+        let mut slow = definition("slow", "gpu-1");
+        slow.idle.stop_after = Some(Duration::ZERO);
+        slow.stop_deadline = Duration::from_secs(30);
+        let pool = reconciled_pool(vec![fast, slow], runner).await;
+
+        let slow_started = Arc::new(Notify::new());
+        let slow_release = Arc::new(Notify::new());
+        controls
+            .stop_started
+            .lock()
+            .await
+            .insert("slow".into(), slow_started.clone());
+        controls
+            .stop_release
+            .lock()
+            .await
+            .insert("slow".into(), slow_release.clone());
+
+        tokio::time::timeout(Duration::from_millis(500), pool.reap_idle_once())
+            .await
+            .expect("the tick must detach idle lifecycle work");
+        tokio::time::timeout(Duration::from_secs(1), slow_started.notified())
+            .await
+            .expect("the slow stop should start in the background");
+        let fast = wait_for_status(&pool, "fast", |status| {
+            status.lifecycle == Lifecycle::Stopped
+        })
+        .await;
+        assert_eq!(fast.systemd.state, SystemdState::Inactive);
+        assert_eq!(
+            pool.current_status("slow").unwrap().lifecycle,
+            Lifecycle::Stopping
+        );
+
+        for _ in 0..16 {
+            pool.reap_idle_once().await;
+        }
+        let stop_order = controls.stop_order.lock().await;
+        assert_eq!(
+            stop_order
+                .iter()
+                .filter(|service| *service == "slow")
+                .count(),
+            1
+        );
+        assert_eq!(
+            stop_order
+                .iter()
+                .filter(|service| *service == "fast")
+                .count(),
+            1
+        );
+        drop(stop_order);
+
+        slow_release.notify_one();
+        wait_for_status(&pool, "slow", |status| {
+            status.lifecycle == Lifecycle::Stopped
+        })
+        .await;
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn fifty_concurrent_ensure_ready_calls_are_single_flight() {
         let runner = MockRunner::new(&["a"], &[]);
@@ -1671,6 +2339,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lifecycle_handles_join_one_pool_id_and_reject_a_different_kind() {
+        let runner = MockRunner::new(&["a"], &[]);
+        let controls = runner.clone();
+        let pool = reconciled_pool(vec![definition("a", "gpu-0")], runner).await;
+        let start_started = Arc::new(Notify::new());
+        let start_release = Arc::new(Notify::new());
+        controls
+            .start_started
+            .lock()
+            .await
+            .insert("a".into(), start_started.clone());
+        controls
+            .start_release
+            .lock()
+            .await
+            .insert("a".into(), start_release.clone());
+        let request = EnsureReadyRequest {
+            service: "a".into(),
+            deadline: Instant::now() + Duration::from_secs(1),
+            evict: true,
+            reactivate_drained: true,
+        };
+
+        let first =
+            PoolManager::begin_lifecycle(&pool, LifecycleRequest::EnsureReady(request.clone()))
+                .await
+                .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), start_started.notified())
+            .await
+            .expect("the authoritative pool flight should start");
+        let second = PoolManager::begin_lifecycle(&pool, LifecycleRequest::EnsureReady(request))
+            .await
+            .unwrap();
+        assert_eq!(first.operation_id(), second.operation_id());
+
+        let rejected = PoolManager::begin_lifecycle(
+            &pool,
+            LifecycleRequest::Drain(DrainRequest {
+                service: "a".into(),
+                deadline: Instant::now() + Duration::from_secs(1),
+                force: false,
+            }),
+        )
+        .await;
+        assert!(matches!(
+            rejected,
+            Err(PoolError::TransitionInProgress { .. })
+        ));
+        let in_progress = pool.current_status("a").unwrap();
+        assert_eq!(in_progress.lifecycle, Lifecycle::Starting);
+        assert_eq!(in_progress.operation_id, Some(first.operation_id()));
+
+        let operation_id = first.operation_id();
+        start_release.notify_one();
+        let first_terminal = first.wait().await.unwrap();
+        let second_terminal = second.wait().await.unwrap();
+        assert_eq!(first_terminal.operation_id, Some(operation_id));
+        assert_eq!(second_terminal.operation_id, Some(operation_id));
+        assert_eq!(first_terminal.status.lifecycle, Lifecycle::Running);
+        assert_eq!(second_terminal.status.operation_id, Some(operation_id));
+    }
+
+    #[tokio::test]
+    async fn degraded_gpu_observation_does_not_block_readiness_or_active_acquisition() {
+        let runner = MockRunner::new(&["a"], &[]);
+        runner.gpu_healthy.store(false, Ordering::Release);
+        let pool = reconciled_pool(vec![definition("a", "gpu-0")], runner).await;
+
+        pool.ensure_ready_status(
+            "a",
+            EnsureReadyOptions::by(Instant::now() + Duration::from_secs(1)),
+        )
+        .await
+        .unwrap();
+        let active = PoolManager::acquire_active(&pool, "a".into())
+            .await
+            .unwrap();
+        let status = pool.current_status("a").unwrap();
+
+        assert_eq!(status.lifecycle, Lifecycle::Running);
+        assert!(!status.gpus[0].healthy);
+        assert_eq!(pool.activity("a").unwrap().active(), 1);
+        drop(active);
+
+        let reconciled = pool.reconcile("a").await.unwrap();
+        assert_eq!(reconciled.lifecycle, Lifecycle::Running);
+        assert!(!reconciled.gpus[0].healthy);
+        PoolManager::acquire_active(&pool, "a".into())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn drain_waits_for_guards_and_restores_state_on_deadline() {
         let runner = MockRunner::new(&["a"], &["a"]);
         let pool = reconciled_pool(vec![definition("a", "gpu-0")], runner).await;
@@ -1680,6 +2441,7 @@ mod tests {
                 "a",
                 DrainOptions {
                     deadline: Instant::now() + Duration::from_millis(30),
+                    force: false,
                 },
             )
             .await
@@ -1694,13 +2456,393 @@ mod tests {
         let pool_for_drain = pool.clone();
         let task = tokio::spawn(async move {
             pool_for_drain
-                .drain_status("a", DrainOptions { deadline })
+                .drain_status(
+                    "a",
+                    DrainOptions {
+                        deadline,
+                        force: false,
+                    },
+                )
                 .await
         });
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(!task.is_finished());
         drop(guard);
-        assert_eq!(task.await.unwrap().unwrap().lifecycle, Lifecycle::Draining);
+        assert_eq!(task.await.unwrap().unwrap().lifecycle, Lifecycle::Drained);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn force_drain_waits_for_deadline_then_preserves_active_work_and_reports_it() {
+        let runner = MockRunner::new(&["a"], &["a"]);
+        let stops = runner.stops.clone();
+        let pool = reconciled_pool(vec![definition("a", "gpu-0")], runner).await;
+        let guard = pool.activity("a").unwrap().acquire_active();
+        let drain_pool = pool.clone();
+        let drain = tokio::spawn(async move {
+            PoolManager::drain(
+                &drain_pool,
+                DrainRequest {
+                    service: "a".into(),
+                    deadline: Instant::now() + Duration::from_millis(40),
+                    force: true,
+                },
+            )
+            .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            !drain.is_finished(),
+            "force must not skip the drain deadline"
+        );
+        let response = drain.await.unwrap().unwrap();
+        assert_eq!(response.status.lifecycle, Lifecycle::Drained);
+        assert_eq!(response.affected_requests, 1);
+        assert_eq!(pool.activity("a").unwrap().active(), 1);
+        assert_eq!(stops.load(Ordering::Acquire), 0);
+        assert!(matches!(
+            PoolManager::acquire_active(&pool, "a".into()).await,
+            Err(PoolError::PlacementUnavailable { .. })
+        ));
+        drop(guard);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn force_sleep_waits_then_force_stops_without_sleeping_active_work() {
+        let runner = MockRunner::new(&["a"], &["a"]);
+        let stops = runner.stops.clone();
+        let stop_forces = runner.stop_forces.clone();
+        let sleep_order = runner.sleep_order.clone();
+        let pool = reconciled_pool(vec![definition("a", "gpu-0")], runner).await;
+        let guard = pool.activity("a").unwrap().acquire_active();
+
+        let refused = PoolManager::sleep(
+            &pool,
+            SleepRequest {
+                service: "a".into(),
+                level: SleepLevel::L1,
+                deadline: Instant::now() + Duration::from_millis(20),
+                force: false,
+            },
+        )
+        .await;
+        assert!(matches!(refused, Err(PoolError::Deadline { .. })));
+        assert_eq!(
+            pool.current_status("a").unwrap().lifecycle,
+            Lifecycle::Running
+        );
+        assert!(sleep_order.lock().await.is_empty());
+        assert_eq!(stops.load(Ordering::Acquire), 0);
+
+        let sleep_pool = pool.clone();
+        let forced = tokio::spawn(async move {
+            PoolManager::sleep(
+                &sleep_pool,
+                SleepRequest {
+                    service: "a".into(),
+                    level: SleepLevel::L1,
+                    deadline: Instant::now() + Duration::from_millis(40),
+                    force: true,
+                },
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            !forced.is_finished(),
+            "force must not skip the drain deadline"
+        );
+        let response = forced.await.unwrap().unwrap();
+
+        assert_eq!(response.status.lifecycle, Lifecycle::Drained);
+        assert_eq!(response.status.systemd.state, SystemdState::Inactive);
+        assert_eq!(response.affected_requests, 1);
+        assert_eq!(pool.activity("a").unwrap().active(), 1);
+        assert!(sleep_order.lock().await.is_empty());
+        assert_eq!(stops.load(Ordering::Acquire), 1);
+        assert_eq!(*stop_forces.lock().await, vec![true]);
+        drop(guard);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forced_stop_reports_force_decision_count_after_active_guard_drops() {
+        let runner = MockRunner::new(&["a"], &["a"]);
+        let stop_started = Arc::new(Notify::new());
+        let stop_release = Arc::new(Notify::new());
+        runner
+            .stop_started
+            .lock()
+            .await
+            .insert("a".into(), stop_started.clone());
+        runner
+            .stop_release
+            .lock()
+            .await
+            .insert("a".into(), stop_release.clone());
+        let pool = reconciled_pool(vec![definition("a", "gpu-0")], runner).await;
+        let active = pool.activity("a").unwrap().acquire_active();
+        let handle = PoolManager::begin_lifecycle(
+            &pool,
+            LifecycleRequest::Stop(StopRequest {
+                service: "a".into(),
+                deadline: Instant::now() + Duration::from_millis(20),
+                force: true,
+            }),
+        )
+        .await
+        .unwrap();
+        let operation_id = handle.operation_id();
+
+        tokio::time::timeout(Duration::from_secs(1), stop_started.notified())
+            .await
+            .expect("forced stop should reach the blocked runner");
+        drop(active);
+        assert_eq!(pool.activity("a").unwrap().active(), 0);
+        stop_release.notify_one();
+
+        let outcome = handle.wait_outcome().await;
+        assert_eq!(outcome.operation_id, operation_id);
+        assert_eq!(
+            outcome.affected_requests, 1,
+            "terminal metadata must retain the count captured before runner.stop"
+        );
+        assert_eq!(outcome.result.unwrap().lifecycle, Lifecycle::Stopped);
+    }
+
+    #[tokio::test]
+    async fn forced_stop_failure_retains_force_decision_count() {
+        let runner = MockRunner::new(&["a"], &["a"]);
+        runner.fail_stop.store(true, Ordering::Release);
+        let pool = reconciled_pool(vec![definition("a", "gpu-0")], runner).await;
+        let active = pool.activity("a").unwrap().acquire_active();
+        let handle = PoolManager::begin_lifecycle(
+            &pool,
+            LifecycleRequest::Stop(StopRequest {
+                service: "a".into(),
+                deadline: Instant::now(),
+                force: true,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let outcome = handle.wait_outcome().await;
+        assert_eq!(outcome.affected_requests, 1);
+        assert!(matches!(outcome.result, Err(PoolError::Runner { .. })));
+        drop(active);
+    }
+
+    #[tokio::test]
+    async fn non_force_noop_reports_zero_affected_requests_even_with_active_work() {
+        let runner = MockRunner::new(&["a"], &["a"]);
+        let pool = reconciled_pool(vec![definition("a", "gpu-0")], runner).await;
+        let active = pool.activity("a").unwrap().acquire_active();
+
+        let response = PoolManager::ensure_ready(
+            &pool,
+            EnsureReadyRequest {
+                service: "a".into(),
+                deadline: Instant::now() + Duration::from_secs(1),
+                evict: false,
+                reactivate_drained: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status.active_requests, 1);
+        assert_eq!(response.affected_requests, 0);
+        drop(active);
+    }
+
+    #[tokio::test]
+    async fn automatic_demand_cannot_undo_drain_but_explicit_reactivation_can() {
+        let runner = MockRunner::new(&["a"], &["a"]);
+        let starts = runner.starts.clone();
+        let pool = reconciled_pool(vec![definition("a", "gpu-0")], runner).await;
+        pool.drain_status(
+            "a",
+            DrainOptions {
+                deadline: Instant::now() + Duration::from_secs(1),
+                force: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            pool.reconcile("a").await.unwrap().lifecycle,
+            Lifecycle::Drained
+        );
+
+        let automatic = pool
+            .ensure_ready_status(
+                "a",
+                EnsureReadyOptions {
+                    deadline: Instant::now() + Duration::from_secs(1),
+                    evict: true,
+                    reactivate_drained: false,
+                },
+            )
+            .await;
+        assert_eq!(automatic, Err(PoolError::ServiceDrained("a".into())));
+        assert_eq!(starts.load(Ordering::Acquire), 0);
+        assert_eq!(
+            pool.current_status("a").unwrap().lifecycle,
+            Lifecycle::Drained
+        );
+
+        let explicit = pool
+            .ensure_ready_status(
+                "a",
+                EnsureReadyOptions {
+                    deadline: Instant::now() + Duration::from_secs(1),
+                    evict: true,
+                    reactivate_drained: true,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(explicit.lifecycle, Lifecycle::Running);
+        assert_eq!(starts.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn drained_intent_preserves_refreshed_underlying_ownership_facts() {
+        let runner = MockRunner::new(&["a"], &[]);
+        let observed = runner.services["a"].clone();
+        let pool = reconciled_pool(vec![definition("a", "gpu-0")], runner).await;
+
+        let stopped = pool
+            .drain_status(
+                "a",
+                DrainOptions {
+                    deadline: Instant::now() + Duration::from_secs(1),
+                    force: false,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(stopped.lifecycle, Lifecycle::Drained);
+        assert_eq!(stopped.systemd.state, SystemdState::Inactive);
+        assert!(!status_owns_awake_placement(&stopped));
+
+        observed.running.store(true, Ordering::Release);
+        let awake = pool.reconcile("a").await.unwrap();
+        assert_eq!(awake.lifecycle, Lifecycle::Drained);
+        assert_eq!(awake.systemd.state, SystemdState::Active);
+        assert!(status_owns_awake_placement(&awake));
+
+        *observed.sleeping.lock().await = Some(SleepLevel::L1);
+        let asleep = pool.reconcile("a").await.unwrap();
+        assert_eq!(asleep.lifecycle, Lifecycle::Drained);
+        assert_eq!(asleep.probe.sleeping_level, Some(1));
+        assert!(!status_owns_awake_placement(&asleep));
+
+        let runner = MockRunner::new(&["b"], &["b"]);
+        let wakes = runner.wakes.clone();
+        let pool = reconciled_pool(vec![definition("b", "gpu-0")], runner).await;
+        pool.sleep_status(
+            "b",
+            SleepOptions {
+                level: SleepLevel::L1,
+                deadline: Instant::now() + Duration::from_secs(1),
+                force: false,
+            },
+        )
+        .await
+        .unwrap();
+        let drained_asleep = pool
+            .drain_status(
+                "b",
+                DrainOptions {
+                    deadline: Instant::now() + Duration::from_secs(1),
+                    force: false,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(drained_asleep.lifecycle, Lifecycle::Drained);
+        assert_eq!(drained_asleep.probe.sleeping_level, Some(1));
+        assert!(!status_owns_awake_placement(&drained_asleep));
+
+        let reactivated = pool
+            .ensure_ready_status(
+                "b",
+                EnsureReadyOptions {
+                    deadline: Instant::now() + Duration::from_secs(1),
+                    evict: true,
+                    reactivate_drained: true,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(reactivated.lifecycle, Lifecycle::Running);
+        assert_eq!(wakes.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn drained_owner_is_idle_reapable_and_evictable() {
+        let runner = MockRunner::new(&["owner", "new"], &["owner"]);
+        let stops = runner.stops.clone();
+        let mut owner = definition("owner", "gpu-0");
+        owner.idle.stop_after = Some(Duration::ZERO);
+        let pool = reconciled_pool(vec![owner.clone(), definition("new", "gpu-0")], runner).await;
+        pool.drain_status(
+            "owner",
+            DrainOptions {
+                deadline: Instant::now() + Duration::from_secs(1),
+                force: false,
+            },
+        )
+        .await
+        .unwrap();
+        pool.reap_idle_once().await;
+        wait_for_status(&pool, "owner", |status| {
+            status.lifecycle == Lifecycle::Drained && status.systemd.state == SystemdState::Inactive
+        })
+        .await;
+        assert_eq!(
+            pool.current_status("owner").unwrap().lifecycle,
+            Lifecycle::Drained
+        );
+        assert_eq!(
+            pool.current_status("owner").unwrap().systemd.state,
+            SystemdState::Inactive
+        );
+        pool.reap_idle_once().await;
+        assert_eq!(stops.load(Ordering::Acquire), 1);
+
+        let runner = MockRunner::new(&["owner", "new"], &["owner"]);
+        let pool = reconciled_pool(vec![owner, definition("new", "gpu-0")], runner).await;
+        pool.drain_status(
+            "owner",
+            DrainOptions {
+                deadline: Instant::now() + Duration::from_secs(1),
+                force: false,
+            },
+        )
+        .await
+        .unwrap();
+        let started = pool
+            .ensure_ready_status(
+                "new",
+                EnsureReadyOptions {
+                    deadline: Instant::now() + Duration::from_secs(1),
+                    evict: true,
+                    reactivate_drained: false,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(started.lifecycle, Lifecycle::Running);
+        assert_eq!(
+            pool.current_status("owner").unwrap().lifecycle,
+            Lifecycle::Drained
+        );
+        assert_eq!(
+            pool.current_status("owner").unwrap().systemd.state,
+            SystemdState::Inactive
+        );
     }
 
     #[tokio::test]
@@ -1718,6 +2860,7 @@ mod tests {
                 EnsureReadyOptions {
                     deadline: Instant::now() + Duration::from_millis(40),
                     evict: true,
+                    reactivate_drained: false,
                 },
             )
             .await;
@@ -1748,6 +2891,7 @@ mod tests {
                 EnsureReadyOptions {
                     deadline: Instant::now() + Duration::from_secs(1),
                     evict: true,
+                    reactivate_drained: false,
                 },
             )
             .await
@@ -1785,6 +2929,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn status_reads_advance_probe_age_without_another_observation() {
+        let runner = MockRunner::new(&["a"], &["a"]);
+        let observes = Arc::clone(&runner.observes);
+        let pool = reconciled_pool(vec![definition("a", "gpu-0")], runner).await;
+        let current = pool.current_status("a").unwrap();
+        pool.inner.state.update_if_current(
+            "a",
+            current.generation,
+            current.operation_id,
+            |status| status.probe.age = Some(Duration::from_secs(3)),
+        );
+        let observations_before_status_reads = observes.load(Ordering::Acquire);
+
+        let first = PoolManager::status(
+            &pool,
+            StatusRequest {
+                service: Some("a".into()),
+            },
+        )
+        .await
+        .unwrap()
+        .services
+        .pop()
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let second = PoolManager::status(
+            &pool,
+            StatusRequest {
+                service: Some("a".into()),
+            },
+        )
+        .await
+        .unwrap()
+        .services
+        .pop()
+        .unwrap();
+
+        assert!(first.probe.age >= Some(Duration::from_secs(3)));
+        assert!(
+            second.probe.age >= first.probe.age.map(|age| age + Duration::from_millis(10)),
+            "probe age did not advance across status reads: first={:?}, second={:?}",
+            first.probe.age,
+            second.probe.age
+        );
+        assert_eq!(
+            observes.load(Ordering::Acquire),
+            observations_before_status_reads,
+            "status reads must not run another probe"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_error_restores_prior_lifecycle_with_new_attempt_identity() {
+        for prior_lifecycle in [Lifecycle::Stopped, Lifecycle::Running, Lifecycle::Drained] {
+            let runner = MockRunner::new(&["a"], &[]);
+            let controls = runner.clone();
+            let pool = reconciled_pool(vec![definition("a", "gpu-0")], runner).await;
+            let seeded_operation = Uuid::new_v4();
+            pool.inner
+                .state
+                .begin_transition("a", prior_lifecycle, seeded_operation)
+                .unwrap();
+            let before = pool.current_status("a").unwrap();
+            controls.fail_observe.store(true, Ordering::Release);
+
+            let error = pool.reconcile("a").await.unwrap_err();
+            let restored = pool.current_status("a").unwrap();
+
+            assert!(matches!(error, PoolError::Runner { .. }));
+            assert_eq!(restored.lifecycle, prior_lifecycle);
+            assert_eq!(restored.generation, before.generation + 1);
+            assert_ne!(restored.operation_id, before.operation_id);
+            assert!(restored.operation_id.is_some());
+            assert!(
+                restored
+                    .last_error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("injected observation failure"))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reconcile_error_does_not_obsolete_failed_or_backoff_authority() {
+        for prior_lifecycle in [Lifecycle::Failed, Lifecycle::Backoff] {
+            let runner = MockRunner::new(&["a"], &[]);
+            let controls = runner.clone();
+            let pool = reconciled_pool(vec![definition("a", "gpu-0")], runner).await;
+            let seeded_operation = Uuid::new_v4();
+            pool.inner
+                .state
+                .begin_transition("a", prior_lifecycle, seeded_operation)
+                .unwrap();
+            let before = pool.current_status("a").unwrap();
+            controls.fail_observe.store(true, Ordering::Release);
+
+            pool.reconcile("a").await.unwrap_err();
+            let restored = pool.current_status("a").unwrap();
+
+            assert_eq!(restored.lifecycle, prior_lifecycle);
+            assert_eq!(restored.generation, before.generation);
+            assert_eq!(restored.operation_id, before.operation_id);
+            assert!(
+                restored
+                    .last_error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("injected observation failure"))
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn terminal_start_failure_is_fanned_out_to_all_waiters() {
         let runner = MockRunner::new(&["a"], &[]);
         runner.fail_start.store(true, Ordering::Release);
@@ -1812,52 +3068,368 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn object_safe_admission_selects_least_inflight_and_holds_raii_slot() {
-        let runner = MockRunner::new(&["a", "b"], &["a", "b"]);
-        let mut a = definition("a", "gpu-0");
-        a.served_model = "shared".to_string();
-        a.endpoint = "127.0.0.1:8101".parse().unwrap();
-        let mut b = definition("b", "gpu-1");
-        b.served_model = "shared".to_string();
-        b.endpoint = "127.0.0.1:8102".parse().unwrap();
-        let pool = reconciled_pool(vec![a, b], runner).await;
-        let busy = PoolManager::acquire_active(&pool, "a".to_string())
-            .await
-            .unwrap();
-        let manager: Arc<dyn PoolManager> = Arc::new(pool.clone());
+    async fn sleeping_a_stopped_service_is_rejected_without_runner_or_state_mutation() {
+        let runner = MockRunner::new(&["a"], &[]);
+        let sleep_order = runner.sleep_order.clone();
+        let pool = reconciled_pool(vec![definition("a", "gpu-0")], runner).await;
+        let before = pool.current_status("a").unwrap();
 
-        let admission = manager
-            .admit(AdmissionRequest {
-                model: "shared".to_string(),
-                deadline: Duration::from_secs(1),
-            })
+        let error = pool
+            .sleep_status(
+                "a",
+                SleepOptions {
+                    level: SleepLevel::L1,
+                    deadline: Instant::now() + Duration::from_secs(1),
+                    force: false,
+                },
+            )
             .await
-            .unwrap();
-        assert_eq!(admission.service, "b");
-        assert_eq!(admission.endpoint.port(), 8102);
-        assert_eq!(pool.activity("b").unwrap().active(), 1);
-        drop(admission);
-        assert_eq!(pool.activity("b").unwrap().active(), 0);
-        drop(busy);
+            .unwrap_err();
 
-        let all = manager
-            .status(StatusRequest { service: None })
-            .await
-            .unwrap();
-        assert_eq!(all.services.len(), 2);
+        assert!(matches!(error, PoolError::PlacementUnavailable { .. }));
+        assert!(sleep_order.lock().await.is_empty());
+        let after = pool.current_status("a").unwrap();
+        assert_eq!(after.lifecycle, Lifecycle::Stopped);
+        assert_eq!(after.generation, before.generation);
+        assert_eq!(after.operation_id, before.operation_id);
+        assert_eq!(after.last_error, before.last_error);
+        assert_eq!(pool.entry("a").unwrap().failures.load(Ordering::Acquire), 0);
     }
 
     #[tokio::test]
-    async fn idle_reaper_moves_through_configured_sleep_tier() {
+    async fn failed_sleep_enters_backoff_gates_retry_and_cleans_up() {
         let runner = MockRunner::new(&["a"], &["a"]);
+        let controls = runner.clone();
+        let starts = runner.starts.clone();
+        let stops = runner.stops.clone();
+        let mut service = definition("a", "gpu-0");
+        service.backoff_initial = Duration::ZERO;
+        service.backoff_max = Duration::ZERO;
+        let pool = reconciled_pool(vec![service], runner).await;
+        let cleanup_release = Arc::new(Notify::new());
+        controls
+            .stop_release
+            .lock()
+            .await
+            .insert("a".into(), cleanup_release.clone());
+        controls.fail_sleep.store(true, Ordering::Release);
+
+        let error = pool
+            .sleep_status(
+                "a",
+                SleepOptions {
+                    level: SleepLevel::L1,
+                    deadline: Instant::now() + Duration::from_secs(1),
+                    force: false,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, PoolError::Runner { .. }));
+        let failed_operation =
+            wait_for_status(&pool, "a", |status| status.lifecycle == Lifecycle::Backoff)
+                .await
+                .operation_id;
+
+        let retry = pool
+            .ensure_ready_status(
+                "a",
+                EnsureReadyOptions::by(Instant::now() + Duration::from_secs(1)),
+            )
+            .await;
+        assert!(matches!(retry, Err(PoolError::TerminalFailure { .. })));
+        assert_eq!(starts.load(Ordering::Acquire), 0);
+
+        cleanup_release.notify_one();
+        let stopped =
+            wait_for_status(&pool, "a", |status| status.lifecycle == Lifecycle::Stopped).await;
+        assert_eq!(stopped.operation_id, failed_operation);
+        assert_eq!(stops.load(Ordering::Acquire), 1);
+
+        controls.fail_sleep.store(false, Ordering::Release);
+        let recovered = pool
+            .ensure_ready_status(
+                "a",
+                EnsureReadyOptions::by(Instant::now() + Duration::from_secs(1)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(recovered.lifecycle, Lifecycle::Running);
+        assert_eq!(starts.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_stop_enters_backoff_gates_retry_and_retries_cleanup_once() {
+        let runner = MockRunner::new(&["a"], &["a"]);
+        let controls = runner.clone();
+        let starts = runner.starts.clone();
+        let stops = runner.stops.clone();
+        let mut service = definition("a", "gpu-0");
+        service.backoff_initial = Duration::ZERO;
+        service.backoff_max = Duration::ZERO;
+        let pool = reconciled_pool(vec![service], runner).await;
+        let cleanup_release = Arc::new(Notify::new());
+        controls
+            .stop_release
+            .lock()
+            .await
+            .insert("a".into(), cleanup_release.clone());
+        controls.fail_stop.store(true, Ordering::Release);
+
+        let error = pool
+            .stop_status(
+                "a",
+                StopOptions {
+                    deadline: Instant::now() + Duration::from_secs(1),
+                    force: false,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, PoolError::Runner { .. }));
+        let failed_operation =
+            wait_for_status(&pool, "a", |status| status.lifecycle == Lifecycle::Backoff)
+                .await
+                .operation_id;
+
+        let retry = pool
+            .ensure_ready_status(
+                "a",
+                EnsureReadyOptions::by(Instant::now() + Duration::from_secs(1)),
+            )
+            .await;
+        assert!(matches!(retry, Err(PoolError::TerminalFailure { .. })));
+        assert_eq!(starts.load(Ordering::Acquire), 0);
+
+        cleanup_release.notify_one();
+        let stopped =
+            wait_for_status(&pool, "a", |status| status.lifecycle == Lifecycle::Stopped).await;
+        assert_eq!(stopped.operation_id, failed_operation);
+        assert_eq!(stops.load(Ordering::Acquire), 2);
+
+        let recovered = pool
+            .ensure_ready_status(
+                "a",
+                EnsureReadyOptions::by(Instant::now() + Duration::from_secs(1)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(recovered.lifecycle, Lifecycle::Running);
+        assert_eq!(starts.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_sleep_from_drained_preserves_drain_intent_and_can_be_retried() {
+        let runner = MockRunner::new(&["a"], &["a"]);
+        let controls = runner.clone();
+        let pool = reconciled_pool(vec![definition("a", "gpu-0")], runner).await;
+        pool.drain_status(
+            "a",
+            DrainOptions {
+                deadline: Instant::now() + Duration::from_secs(1),
+                force: false,
+            },
+        )
+        .await
+        .unwrap();
+        controls.fail_sleep.store(true, Ordering::Release);
+
+        pool.sleep_status(
+            "a",
+            SleepOptions {
+                level: SleepLevel::L1,
+                deadline: Instant::now() + Duration::from_secs(1),
+                force: false,
+            },
+        )
+        .await
+        .unwrap_err();
+        let failed = pool.current_status("a").unwrap();
+        assert_eq!(failed.lifecycle, Lifecycle::Drained);
+        assert!(failed.last_error.is_some());
+        assert_eq!(pool.entry("a").unwrap().failures.load(Ordering::Acquire), 0);
+
+        controls.fail_sleep.store(false, Ordering::Release);
+        let slept = pool
+            .sleep_status(
+                "a",
+                SleepOptions {
+                    level: SleepLevel::L1,
+                    deadline: Instant::now() + Duration::from_secs(1),
+                    force: false,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(slept.lifecycle, Lifecycle::Drained);
+        assert_eq!(slept.probe.sleeping_level, Some(1));
+    }
+
+    #[tokio::test]
+    async fn reconcile_cannot_neutralize_or_obsolete_failure_backoff() {
+        let runner = MockRunner::new(&["a"], &[]);
+        runner.fail_start.store(true, Ordering::Release);
+        let starts = runner.starts.clone();
+        let stops = runner.stops.clone();
+        let mut service = definition("a", "gpu-0");
+        service.backoff_initial = Duration::from_millis(250);
+        service.backoff_max = Duration::from_millis(250);
+        let pool = reconciled_pool(vec![service], runner).await;
+
+        pool.ensure_ready_status(
+            "a",
+            EnsureReadyOptions::by(Instant::now() + Duration::from_secs(1)),
+        )
+        .await
+        .unwrap_err();
+        let failure = pool.current_status("a").unwrap();
+        assert!(matches!(
+            failure.lifecycle,
+            Lifecycle::Failed | Lifecycle::Backoff
+        ));
+        assert!(failure.operation_id.is_some());
+        assert!(failure.last_error.is_some());
+
+        for _ in 0..8 {
+            let reconciled = pool.reconcile("a").await.unwrap();
+            assert!(matches!(
+                reconciled.lifecycle,
+                Lifecycle::Failed | Lifecycle::Backoff
+            ));
+            assert_eq!(reconciled.generation, failure.generation);
+            assert_eq!(reconciled.operation_id, failure.operation_id);
+            assert_eq!(reconciled.last_error, failure.last_error);
+        }
+
+        let retry = pool
+            .ensure_ready_status(
+                "a",
+                EnsureReadyOptions::by(Instant::now() + Duration::from_secs(1)),
+            )
+            .await;
+        assert!(matches!(retry, Err(PoolError::TerminalFailure { .. })));
+        assert_eq!(starts.load(Ordering::Acquire), 1);
+
+        let stopped = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let status = pool.current_status("a").unwrap();
+                if status.lifecycle == Lifecycle::Stopped {
+                    break status;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("scheduled backoff cleanup should remain authoritative");
+        assert_eq!(stopped.generation, failure.generation);
+        assert_eq!(stopped.operation_id, failure.operation_id);
+        assert_eq!(stops.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn idle_reaper_requests_l2_after_l1_and_updates_state() {
+        let runner = MockRunner::new(&["a"], &["a"]);
+        let sleep_order = runner.sleep_order.clone();
+        let wakes = runner.wakes.clone();
         let mut service = definition("a", "gpu-0");
         service.idle.sleep_l1_after = Some(Duration::ZERO);
+        service.idle.sleep_l2_after = Some(Duration::ZERO);
         let pool = reconciled_pool(vec![service], runner).await;
+
         pool.reap_idle_once().await;
+        wait_for_status(&pool, "a", |status| status.lifecycle == Lifecycle::AsleepL1).await;
         assert_eq!(
             pool.current_status("a").unwrap().lifecycle,
             Lifecycle::AsleepL1
         );
+
+        pool.reap_idle_once().await;
+        wait_for_status(&pool, "a", |status| status.lifecycle == Lifecycle::AsleepL2).await;
+        assert_eq!(
+            pool.current_status("a").unwrap().lifecycle,
+            Lifecycle::AsleepL2
+        );
+        assert_eq!(
+            *sleep_order.lock().await,
+            vec![
+                ("a".to_string(), SleepLevel::L1),
+                ("a".to_string(), SleepLevel::L2)
+            ]
+        );
+        // The adapter owns vLLM's required wake/resleep sequence; the pool keeps
+        // this as one draining-to-asleep transition.
+        assert_eq!(wakes.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn slow_cold_start_does_not_block_disjoint_gpu_wake() {
+        let mut runner = MockRunner::new(&["slow", "queued", "fast"], &["fast"]);
+        *runner.services["fast"].sleeping.lock().await = Some(SleepLevel::L1);
+        runner.start_delay = Duration::from_millis(300);
+        let starts = runner.starts.clone();
+        let start_order = runner.start_order.clone();
+        let wakes = runner.wakes.clone();
+        let pool = reconciled_pool(
+            vec![
+                definition("slow", "gpu-a"),
+                definition("queued", "gpu-a"),
+                definition("fast", "gpu-b"),
+            ],
+            runner,
+        )
+        .await;
+        let slow_pool = pool.clone();
+        let slow = tokio::spawn(async move {
+            slow_pool
+                .ensure_ready_status(
+                    "slow",
+                    EnsureReadyOptions::by(Instant::now() + Duration::from_secs(2)),
+                )
+                .await
+        });
+        while starts.load(Ordering::Acquire) == 0 {
+            tokio::task::yield_now().await;
+        }
+        let queued_pool = pool.clone();
+        let queued = tokio::spawn(async move {
+            queued_pool
+                .ensure_ready_status(
+                    "queued",
+                    EnsureReadyOptions::by(Instant::now() + Duration::from_secs(2)),
+                )
+                .await
+        });
+        loop {
+            if pool
+                .inner
+                .placement_queue
+                .lock()
+                .await
+                .iter()
+                .any(|demand| demand.service == "queued")
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        let fast = tokio::time::timeout(
+            Duration::from_millis(100),
+            pool.ensure_ready_status(
+                "fast",
+                EnsureReadyOptions::by(Instant::now() + Duration::from_secs(1)),
+            ),
+        )
+        .await
+        .expect("disjoint wake must not wait for the slow cold start")
+        .unwrap();
+        assert_eq!(fast.lifecycle, Lifecycle::Running);
+        assert_eq!(wakes.load(Ordering::Acquire), 1);
+        assert!(!slow.is_finished());
+        assert!(!queued.is_finished());
+        assert_eq!(slow.await.unwrap().unwrap().lifecycle, Lifecycle::Running);
+        assert_eq!(queued.await.unwrap().unwrap().lifecycle, Lifecycle::Running);
+        assert_eq!(*start_order.lock().await, vec!["slow", "queued"]);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -111,10 +111,12 @@ complete, commented service:
 - **`inventory`** — host RAM and each GPU by **stable UUID** (`nvidia-smi -L`) with its
   VRAM capacity. Placement and budget validation are computed against these.
 - **`services`** — one entry per model server: served model name + aliases, GPU
-  assignment and parallelism, backend loopback port, systemd unit, readiness probes,
-  deadlines, idle tiers (`sleep_l1_after_ms` → `sleep_l2_after_ms` → `stop_after_ms`),
-  parking policy, priority/evictability, and sleep settings. Sleep stays off unless the
-  service is explicitly marked `hardware_validated: true`.
+  assignment and parallelism, absolute `runner_executable` path, backend loopback port,
+  systemd unit, readiness probes, deadlines, idle tiers (`sleep_l1_after_ms` →
+  `sleep_l2_after_ms` → `stop_after_ms`), parking policy, priority/evictability, and
+  sleep settings. Sleep stays off unless the service is explicitly marked
+  `hardware_validated: true`. If omitted, `runner_executable` defaults to
+  `/opt/vllm-venv/bin/vllm` for compatibility with existing deployments.
 
 ## API surface
 
@@ -126,20 +128,23 @@ resolve to the canonical name):
 
 | Protocol family | Endpoints |
 |---|---|
-| OpenAI-compatible | `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/responses`, `/v1/tokenize`, `/v1/detokenize` |
-| Anthropic Messages | `/v1/messages` |
-| Cohere/Jina-style pooling | `/v1/score`, `/v1/rerank`, `/v1/classify` (plus legacy `/score`, `/rerank`) |
+| OpenAI-compatible | `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/responses` |
+| Anthropic Messages | `/v1/messages`, `/v1/messages/count_tokens` |
+| Cohere/Jina-style pooling | `/v1/score`, `/v1/rerank`, `/v2/rerank`, `/v2/embed` (plus legacy `/score`, `/rerank`) |
+| vLLM native | `/tokenize`, `/detokenize`, `/classify` |
 
 Everything else — including vLLM's admin endpoints (`/sleep`, `/wake_up`, …) — is
-refused on this listener. Two caveats: multipart endpoints such as audio
-transcription/translation are not currently routed (the router parses JSON bodies for
-the `model` field), and *router-generated* errors use the OpenAI error envelope on every
-endpoint, including `/v1/messages` — errors originating from vLLM itself pass through in
-their native shape. Router errors look like:
+refused on this listener. Multipart endpoints such as audio transcription/translation
+are not currently routed (the router parses JSON bodies for the `model` field).
+Router-generated errors use the Anthropic error envelope on Messages endpoints:
 
 ```json
-{"error": {"message": "model `x` is not configured", "type": "invalid_request_error", "code": "model_not_found"}}
+{"type": "error", "error": {"message": "model `x` is not configured", "type": "not_found_error"}}
 ```
+
+OpenAI-compatible, Cohere/Jina-style, and vLLM-native endpoints retain the OpenAI-shaped
+envelope. Errors originating from vLLM itself pass through unchanged in their native
+shape.
 
 Notable statuses: `400` malformed JSON / missing model, `404` unknown model, `413` body
 over the configured limit, `503` + `Retry-After` when parking capacity or the parking
@@ -191,12 +196,24 @@ Prometheus text format:
 - **Logs** are structured lines on stderr → `journalctl -u vllm-router`. Audit events for
   control-API mutations are tagged `audit=true`. Request bodies and tokens are never
   logged.
+- **Generated model units are boot-ephemeral.** The router writes them under
+  `/run/systemd/system` and asks systemd to reload its unit files during router startup.
+  Because `/run` is cleared on host reboot, enable `vllm-router.service` as the boot entry
+  point and let it start once before starting any model service. Do not independently
+  enable generated model units for boot; they do not exist until router initialization
+  regenerates them and completes the systemd reload.
 - **Router restart/upgrade never stops healthy models.** For zero-downtime binary
   upgrades, start the new binary with `-u` (after it passes `-t`) and send `SIGQUIT` to
   the old one; listeners hand over via the upgrade socket and in-flight streams drain
   within the configured grace period.
 - **Manual changes reconcile.** If you `systemctl stop` a model behind the router's back,
   the periodic reconciler observes and converges; `POST /pool/v1/reconcile` forces it.
+- **Configuration changes are restart-to-apply.** The router uses one immutable snapshot
+  for its process lifetime. Always validate the replacement files with
+  `vllm-router -t -c /etc/vllm-router/pingora.yaml --router-config /etc/vllm-router/router.yaml`
+  before either a supervised restart or a `-u` graceful upgrade. If validation fails, leave
+  the current process serving its last valid snapshot. Running systemd-owned model processes
+  remain up and are reconstructed by reconciliation.
 
 ## Development
 

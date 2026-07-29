@@ -7,13 +7,13 @@ use pingora::{
     services::{background::BackgroundService, listening::Service},
 };
 use tokio::time::MissedTickBehavior;
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 use vllm_router::{
     PoolManager,
     api::{ControlPlane, TokenAuth},
     config::{ConfigStore, RouterConfig},
     metrics,
-    pool::{ManagedVllmRunner, Pool, managed_pool_from_config},
+    pool::{ManagedVllmRunner, Pool, PoolError, managed_pool_from_config},
     proxy::DataPlane,
     state::Lifecycle,
 };
@@ -37,6 +37,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // exits, so config-check mode covers both files.
     let router_config = RouterConfig::load(&arguments.router_config)?;
     let mut server = Server::new(Some(arguments.pingora))?;
+    ensure_foreground_mode(server.configuration.daemon)?;
     server.bootstrap();
 
     let config = Arc::new(ConfigStore::new(router_config.clone())?);
@@ -92,7 +93,14 @@ impl BackgroundService for PoolBackground {
                 _ = ticker.tick() => {
                     for result in self.pool.reconcile_all().await {
                         if let Err(error) = result {
-                            warn!(error = %error, "service reconciliation failed");
+                            if should_warn_reconciliation_error(&error) {
+                                warn!(error = %error, "service reconciliation failed");
+                            } else {
+                                debug!(
+                                    error = %error,
+                                    "service reconciliation deferred during lifecycle transition"
+                                );
+                            }
                         }
                     }
                     self.pool.reap_idle_once().await;
@@ -106,6 +114,10 @@ impl BackgroundService for PoolBackground {
     }
 }
 
+fn should_warn_reconciliation_error(error: &PoolError) -> bool {
+    !matches!(error, PoolError::TransitionInProgress { .. })
+}
+
 fn publish_state_metrics(services: &[vllm_router::state::ServiceStatus]) {
     const STATES: &[(&str, Lifecycle)] = &[
         ("reconciling", Lifecycle::Reconciling),
@@ -113,6 +125,7 @@ fn publish_state_metrics(services: &[vllm_router::state::ServiceStatus]) {
         ("starting", Lifecycle::Starting),
         ("running", Lifecycle::Running),
         ("draining", Lifecycle::Draining),
+        ("drained", Lifecycle::Drained),
         ("asleep_l1", Lifecycle::AsleepL1),
         ("asleep_l2", Lifecycle::AsleepL2),
         ("waking", Lifecycle::Waking),
@@ -146,10 +159,18 @@ fn observation_interval(config: &RouterConfig) -> Duration {
 }
 
 fn parse_arguments() -> Result<Arguments, String> {
+    parse_arguments_from(
+        env::args().skip(1),
+        env::var("VLLM_ROUTER_CONFIG").unwrap_or_else(|_| "/etc/vllm-router/router.yaml".into()),
+    )
+}
+
+fn parse_arguments_from(
+    arguments: impl IntoIterator<Item = String>,
+    mut router_config: String,
+) -> Result<Arguments, String> {
     let mut pingora = Opt::default();
-    let mut router_config =
-        env::var("VLLM_ROUTER_CONFIG").unwrap_or_else(|_| "/etc/vllm-router/router.yaml".into());
-    let mut arguments = env::args().skip(1);
+    let mut arguments = arguments.into_iter();
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "-c" | "--conf" => {
@@ -164,13 +185,13 @@ fn parse_arguments() -> Result<Arguments, String> {
                     .next()
                     .ok_or_else(|| "--router-config requires a path".to_string())?;
             }
-            "-d" | "--daemon" => pingora.daemon = true,
+            "-d" | "--daemon" => return Err(daemon_mode_error()),
             "-t" | "--test" => pingora.test = true,
             "-u" | "--upgrade" => pingora.upgrade = true,
             "--nocapture" => pingora.nocapture = true,
             "-h" | "--help" => {
                 return Err(
-                    "usage: vllm-router [-dtu] -c <pingora.yaml> --router-config <router.yaml>"
+                    "usage: vllm-router [-tu] -c <pingora.yaml> --router-config <router.yaml>"
                         .into(),
                 );
             }
@@ -184,4 +205,71 @@ fn parse_arguments() -> Result<Arguments, String> {
         pingora,
         router_config,
     })
+}
+
+fn ensure_foreground_mode(daemon: bool) -> Result<(), String> {
+    if daemon {
+        return Err(daemon_mode_error());
+    }
+    Ok(())
+}
+
+fn daemon_mode_error() -> String {
+    "daemon mode is unsupported: run vllm-router in the foreground under a process supervisor \
+     (the supplied systemd unit uses Type=simple)"
+        .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use pingora::server::configuration::ServerConf;
+    use vllm_router::pool::PoolError;
+
+    use super::{ensure_foreground_mode, parse_arguments_from, should_warn_reconciliation_error};
+
+    #[test]
+    fn rejects_daemon_command_line_modes() {
+        for daemon_flag in ["-d", "--daemon"] {
+            let error = parse_arguments_from(
+                vec![
+                    daemon_flag.to_string(),
+                    "-c".to_string(),
+                    "pingora.yaml".to_string(),
+                ],
+                "router.yaml".to_string(),
+            )
+            .err()
+            .expect("daemon mode must be rejected");
+
+            assert!(error.contains("daemon mode is unsupported"));
+        }
+    }
+
+    #[test]
+    fn rejects_daemon_mode_from_pingora_configuration() {
+        let configuration = ServerConf::from_yaml("---\nversion: 1\ndaemon: true\n")
+            .expect("test Pingora configuration should parse");
+
+        let error =
+            ensure_foreground_mode(configuration.daemon).expect_err("daemon mode must be rejected");
+        assert!(error.contains("Type=simple"));
+    }
+
+    #[test]
+    fn accepts_foreground_mode() {
+        ensure_foreground_mode(false).expect("foreground mode must remain supported");
+    }
+
+    #[test]
+    fn expected_reconciliation_overlap_is_not_warned_but_real_failures_are() {
+        assert!(!should_warn_reconciliation_error(
+            &PoolError::TransitionInProgress {
+                service: "model-a".into(),
+            }
+        ));
+        assert!(should_warn_reconciliation_error(&PoolError::Runner {
+            service: "model-a".into(),
+            message: "systemd observation failed".into(),
+        }));
+    }
 }

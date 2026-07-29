@@ -1,12 +1,12 @@
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
 
 use super::*;
 
 const GIB: u64 = 1024 * 1024 * 1024;
 type RejectionCase = (&'static str, fn(&mut RouterConfig), &'static str);
+type IdleAcceptanceCase = (&'static str, fn(&mut ServiceDefinition));
 
 fn valid_config() -> RouterConfig {
     RouterConfig {
@@ -39,6 +39,7 @@ fn valid_service(name: &str, served_model: &str, port: u16, gpu_uuid: &str) -> S
         name: name.into(),
         enabled: true,
         runner: RunnerType::Vllm,
+        runner_executable: PathBuf::from("/opt/vllm-venv/bin/vllm"),
         served_model: served_model.into(),
         aliases: Vec::new(),
         model_path: PathBuf::from(format!("/models/{name}")),
@@ -107,8 +108,95 @@ fn checked_in_example_parses_and_validates() {
 }
 
 #[test]
+fn rejects_listener_inventory_and_global_policy_errors_table() {
+    let cases: &[RejectionCase] = &[
+        (
+            "listener collision",
+            |config| config.listeners.management = config.listeners.data_plane,
+            "listeners.management uses port 8000, already used by listeners.data_plane",
+        ),
+        (
+            "zero host RAM",
+            |config| config.inventory.host_ram_capacity_bytes = 0,
+            "host_ram_capacity_bytes must be greater than zero",
+        ),
+        (
+            "empty GPU inventory",
+            |config| config.inventory.gpus.clear(),
+            "gpus must contain at least one GPU",
+        ),
+        (
+            "empty GPU UUID",
+            |config| config.inventory.gpus[0].uuid = " ".into(),
+            "uuid must not be empty",
+        ),
+        (
+            "duplicate GPU UUID",
+            |config| config.inventory.gpus[1].uuid = config.inventory.gpus[0].uuid.clone(),
+            "duplicate GPU UUID",
+        ),
+        (
+            "zero GPU VRAM",
+            |config| config.inventory.gpus[0].vram_capacity_bytes = 0,
+            "vram_capacity_bytes must be greater than zero",
+        ),
+        (
+            "zero body limit",
+            |config| config.policies.maximum_request_body_bytes = 0,
+            "maximum_request_body_bytes must be greater than zero",
+        ),
+        (
+            "zero global parking limit",
+            |config| config.policies.global_parked_request_limit = 0,
+            "global_parked_request_limit must be greater than zero",
+        ),
+        (
+            "zero per-model parking limit",
+            |config| config.policies.per_model_parked_request_limit = 0,
+            "per_model_parked_request_limit must be greater than zero",
+        ),
+        (
+            "per-model parking exceeds global",
+            |config| {
+                config.policies.global_parked_request_limit = 1;
+                config.policies.per_model_parked_request_limit = 2;
+                config.services[0].parking.queue_limit = 1;
+            },
+            "per_model_parked_request_limit cannot exceed global_parked_request_limit",
+        ),
+        (
+            "zero connect timeout",
+            |config| config.policies.connect_timeout_ms = 0,
+            "connection and inter-chunk timeouts must be greater than zero",
+        ),
+        (
+            "unsupported awake co-residency",
+            |config| config.policies.max_awake_owners_per_gpu = 2,
+            "max_awake_owners_per_gpu must be 1",
+        ),
+        (
+            "empty services",
+            |config| config.services.clear(),
+            "services must contain at least one service definition",
+        ),
+    ];
+
+    assert_rejections(cases);
+}
+
+#[test]
 fn rejects_identity_and_network_collisions_table() {
     let cases: &[RejectionCase] = &[
+        (
+            "empty service name",
+            |config| config.services[0].name = " ".into(),
+            "name must not be empty",
+        ),
+        (
+            "unsafe service name",
+            |config| config.services[0].name = "bad/name".into(),
+            "name may contain only ASCII letters",
+        ),
         (
             "service name",
             |config| {
@@ -116,6 +204,11 @@ fn rejects_identity_and_network_collisions_table() {
                 config.services.push(service);
             },
             "duplicate service name",
+        ),
+        (
+            "empty served model",
+            |config| config.services[0].served_model = " ".into(),
+            "served_model must not be empty",
         ),
         (
             "backend port",
@@ -129,6 +222,25 @@ fn rejects_identity_and_network_collisions_table() {
             "listener port",
             |config| config.services[0].backend.port = 8000,
             "conflicts with listeners.data_plane",
+        ),
+        (
+            "duplicate systemd unit",
+            |config| {
+                let mut service = valid_service("beta", "model-b", 8101, "GPU-b");
+                service.systemd.unit = config.services[0].systemd.unit.clone();
+                config.services.push(service);
+            },
+            "systemd.unit \"vllm@alpha.service\" is already used by service \"alpha\"",
+        ),
+        (
+            "duplicate environment file",
+            |config| {
+                let mut service = valid_service("beta", "model-b", 8101, "GPU-b");
+                service.systemd.environment_file =
+                    config.services[0].systemd.environment_file.clone();
+                config.services.push(service);
+            },
+            "systemd.environment_file \"/etc/vllm/alpha.env\" is already used by service \"alpha\"",
         ),
         (
             "non-loopback backend",
@@ -146,6 +258,21 @@ fn rejects_identity_and_network_collisions_table() {
             "is ambiguous",
         ),
         (
+            "empty alias",
+            |config| config.services[0].aliases = vec![" ".into()],
+            "aliases must not contain an empty alias",
+        ),
+        (
+            "alias repeats canonical model",
+            |config| config.services[0].aliases = vec!["model-a".into()],
+            "aliases contains canonical model name",
+        ),
+        (
+            "duplicate alias within service",
+            |config| config.services[0].aliases = vec!["friendly".into(), "friendly".into()],
+            "aliases contains duplicate",
+        ),
+        (
             "alias versus canonical",
             |config| {
                 config.services[0].aliases = vec!["model-b".into()];
@@ -157,11 +284,7 @@ fn rejects_identity_and_network_collisions_table() {
         ),
     ];
 
-    for (name, mutate, expected) in cases {
-        let mut config = valid_config();
-        mutate(&mut config);
-        assert!(messages(&config).contains(expected), "case {name}");
-    }
+    assert_rejections(cases);
 }
 
 #[test]
@@ -173,6 +296,18 @@ fn rejects_paths_topology_and_unsafe_fields_table() {
                 config.listeners.management_bearer_token_file = "token".into();
             },
             "management_bearer_token_file must be an absolute",
+        ),
+        (
+            "relative runner executable",
+            |config| config.services[0].runner_executable = "bin/vllm".into(),
+            "runner_executable must be an absolute",
+        ),
+        (
+            "unsafe runner executable",
+            |config| {
+                config.services[0].runner_executable = PathBuf::from("/opt/vllm\nEnvironment=oops");
+            },
+            "runner_executable contains a forbidden control character",
         ),
         (
             "relative model",
@@ -200,6 +335,32 @@ fn rejects_paths_topology_and_unsafe_fields_table() {
             "TP × PP × DP requires 2",
         ),
         (
+            "zero parallelism",
+            |config| config.services[0].placement.pipeline_parallelism = 0,
+            "parallelism values must all be greater than zero",
+        ),
+        (
+            "parallelism product overflow",
+            |config| {
+                config.services[0].placement.tensor_parallelism = usize::MAX;
+                config.services[0].placement.pipeline_parallelism = 2;
+            },
+            "parallelism product overflows usize",
+        ),
+        (
+            "duplicate assigned GPU",
+            |config| {
+                config.services[0].placement.tensor_parallelism = 2;
+                config.services[0].placement.gpu_uuids = vec!["GPU-a".into(), "GPU-a".into()];
+            },
+            "assigns GPU UUID \"GPU-a\" more than once",
+        ),
+        (
+            "zero VRAM reservation",
+            |config| config.services[0].placement.vram_reservation_bytes_per_gpu = 0,
+            "vram_reservation_bytes_per_gpu must be greater than zero",
+        ),
+        (
             "unsafe unit",
             |config| config.services[0].systemd.unit = "vllm;reboot.service".into(),
             "safely named .service",
@@ -223,22 +384,72 @@ fn rejects_paths_topology_and_unsafe_fields_table() {
             },
             "forbidden control",
         ),
+        (
+            "non-boolean runner flag",
+            |config| {
+                config.services[0].runner_args.insert(
+                    "enable-prefix-caching".into(),
+                    RunnerArgValue::String("yes".into()),
+                );
+            },
+            "enable-prefix-caching must have a boolean value",
+        ),
+        (
+            "non-finite runner number",
+            |config| {
+                config.services[0]
+                    .runner_args
+                    .insert("rope-theta".into(), RunnerArgValue::Float(f64::NAN));
+            },
+            "rope-theta must have a finite numeric value",
+        ),
+        (
+            "Ray executor",
+            |config| {
+                config.services[0].runner_args.insert(
+                    "distributed-executor-backend".into(),
+                    RunnerArgValue::String("RAY".into()),
+                );
+            },
+            "cannot be `ray`",
+        ),
+        (
+            "relative download directory",
+            |config| {
+                config.services[0].runner_args.insert(
+                    "download-dir".into(),
+                    RunnerArgValue::String("downloads".into()),
+                );
+            },
+            "runner_args.download-dir must be an absolute path",
+        ),
     ];
 
-    for (name, mutate, expected) in cases {
-        let mut config = valid_config();
-        mutate(&mut config);
-        assert!(messages(&config).contains(expected), "case {name}");
-    }
+    assert_rejections(cases);
 }
 
 #[test]
 fn rejects_threshold_deadline_and_policy_errors_table() {
     let cases: &[RejectionCase] = &[
         (
+            "relative health path",
+            |config| config.services[0].readiness.health_path = "health".into(),
+            "health_path must be an absolute HTTP path",
+        ),
+        (
+            "authority-style models path",
+            |config| config.services[0].readiness.models_path = "//models".into(),
+            "models_path must be an absolute HTTP path",
+        ),
+        (
             "probe threshold",
             |config| config.services[0].readiness.consecutive_successes = 0,
             "consecutive thresholds",
+        ),
+        (
+            "zero probe interval",
+            |config| config.services[0].readiness.interval_ms = 0,
+            "intervals, timeout, and maximum probe age must be greater than zero",
         ),
         (
             "probe timeout",
@@ -246,9 +457,19 @@ fn rejects_threshold_deadline_and_policy_errors_table() {
             "timeout_ms must be less",
         ),
         (
+            "probe maximum age below interval",
+            |config| config.services[0].readiness.maximum_probe_age_ms = 1_000,
+            "maximum_probe_age_ms must be at least interval_ms",
+        ),
+        (
             "deadline",
             |config| config.services[0].deadlines.wake_ms = 0,
             "deadlines must all",
+        ),
+        (
+            "zero retry attempts",
+            |config| config.services[0].retry.maximum_attempts = 0,
+            "maximum_attempts must be greater than zero",
         ),
         (
             "backoff ordering",
@@ -257,6 +478,21 @@ fn rejects_threshold_deadline_and_policy_errors_table() {
                 config.services[0].retry.maximum_backoff_ms = 5;
             },
             "initial_backoff_ms <= maximum_backoff_ms",
+        ),
+        (
+            "retry multiplier below one",
+            |config| config.services[0].retry.multiplier = 0.5,
+            "multiplier must be finite and at least 1",
+        ),
+        (
+            "retry jitter outside unit interval",
+            |config| config.services[0].retry.jitter_fraction = 1.1,
+            "jitter_fraction must be finite and between 0 and 1",
+        ),
+        (
+            "zero parking field",
+            |config| config.services[0].parking.retry_after_seconds = 0,
+            "parking deadline, queue limit, and retry-after must be greater than zero",
         ),
         (
             "parking longer than startup",
@@ -275,17 +511,28 @@ fn rejects_threshold_deadline_and_policy_errors_table() {
             "exceeds policies.per_model",
         ),
         (
-            "awake co-residency",
-            |config| config.policies.max_awake_owners_per_gpu = 2,
-            "must be 1",
+            "relative warmup path",
+            |config| config.services[0].warmup.as_mut().unwrap().path = "warmup".into(),
+            "warmup.path must be an absolute HTTP path",
+        ),
+        (
+            "non-object warmup body",
+            |config| config.services[0].warmup.as_mut().unwrap().body = serde_json::json!("prompt"),
+            "warmup.body must be a JSON object",
+        ),
+        (
+            "zero maximum model length",
+            |config| config.services[0].compatibility.maximum_model_length = Some(0),
+            "maximum_model_length must be greater than zero",
+        ),
+        (
+            "invalid GPU memory utilization",
+            |config| config.services[0].compatibility.gpu_memory_utilization = f64::NAN,
+            "gpu_memory_utilization must be finite and in (0, 1]",
         ),
     ];
 
-    for (name, mutate, expected) in cases {
-        let mut config = valid_config();
-        mutate(&mut config);
-        assert!(messages(&config).contains(expected), "case {name}");
-    }
+    assert_rejections(cases);
 }
 
 fn enable_l1(service: &mut ServiceDefinition, residual: u64, host: u64) {
@@ -300,9 +547,58 @@ fn enable_l1(service: &mut ServiceDefinition, residual: u64, host: u64) {
     service.idle.stop_after_ms = Some(2_000);
 }
 
+fn enable_l2(service: &mut ServiceDefinition, residual: u64) {
+    service.sleep = SleepConfig {
+        enabled: true,
+        hardware_validated: true,
+        levels: vec![SleepLevel::L2],
+        residual_vram_bytes_per_gpu: residual,
+        l1_host_ram_bytes: 0,
+    };
+    service.idle.sleep_l2_after_ms = Some(1_000);
+    service.idle.stop_after_ms = Some(2_000);
+}
+
+#[test]
+fn evictability_is_independent_from_valid_idle_policy_table() {
+    let cases: &[IdleAcceptanceCase] = &[
+        ("evictable with default idle stop", |_| {}),
+        ("non-evictable with default idle stop", |service| {
+            service.evictable = false;
+        }),
+        ("non-evictable with idle policy disabled", |service| {
+            service.evictable = false;
+            service.idle.stop_after_ms = None;
+        }),
+        (
+            "non-evictable with validated idle sleep and stop",
+            |service| {
+                service.evictable = false;
+                enable_l1(service, GIB, 8 * GIB);
+            },
+        ),
+    ];
+
+    for (name, mutate) in cases {
+        let mut config = valid_config();
+        mutate(&mut config.services[0]);
+        config
+            .validate()
+            .unwrap_or_else(|error| panic!("case {name} should be valid: {error}"));
+    }
+}
+
 #[test]
 fn rejects_sleep_and_resource_budget_errors_table() {
     let cases: &[RejectionCase] = &[
+        (
+            "duplicate sleep level",
+            |config| {
+                enable_l1(&mut config.services[0], GIB, 8 * GIB);
+                config.services[0].sleep.levels.push(SleepLevel::L1);
+            },
+            "sleep.levels contains a duplicate level",
+        ),
         (
             "unvalidated sleep",
             |config| {
@@ -312,9 +608,78 @@ fn rejects_sleep_and_resource_budget_errors_table() {
             "hardware_validated is false",
         ),
         (
+            "enabled sleep without levels",
+            |config| {
+                config.services[0].sleep.enabled = true;
+                config.services[0].sleep.hardware_validated = true;
+                config.services[0].sleep.residual_vram_bytes_per_gpu = GIB;
+            },
+            "sleep.levels must not be empty",
+        ),
+        (
+            "zero sleep residual",
+            |config| {
+                enable_l1(&mut config.services[0], GIB, 8 * GIB);
+                config.services[0].sleep.residual_vram_bytes_per_gpu = 0;
+            },
+            "residual_vram_bytes_per_gpu must be greater than zero",
+        ),
+        (
+            "zero L1 host memory",
+            |config| enable_l1(&mut config.services[0], GIB, 0),
+            "l1_host_ram_bytes must be greater than zero for L1",
+        ),
+        (
+            "missing L1 idle threshold",
+            |config| {
+                enable_l1(&mut config.services[0], GIB, 8 * GIB);
+                config.services[0].idle.sleep_l1_after_ms = None;
+            },
+            "sleep_l1_after_ms is required when L1 is enabled",
+        ),
+        (
+            "L1 threshold without L1",
+            |config| {
+                enable_l2(&mut config.services[0], GIB);
+                config.services[0].idle.sleep_l1_after_ms = Some(500);
+            },
+            "sleep_l1_after_ms requires sleep level L1",
+        ),
+        (
+            "missing L2 idle threshold",
+            |config| {
+                enable_l2(&mut config.services[0], GIB);
+                config.services[0].idle.sleep_l2_after_ms = None;
+            },
+            "sleep_l2_after_ms is required when L2 is enabled",
+        ),
+        (
+            "L2 threshold without L2",
+            |config| {
+                enable_l1(&mut config.services[0], GIB, 8 * GIB);
+                config.services[0].idle.sleep_l2_after_ms = Some(1_500);
+            },
+            "sleep_l2_after_ms requires sleep level L2",
+        ),
+        (
+            "disabled sleep with residual policy",
+            |config| config.services[0].sleep.hardware_validated = true,
+            "sleep is disabled, so sleep resources, levels, and idle sleep thresholds must be unset",
+        ),
+        (
+            "zero idle threshold",
+            |config| config.services[0].idle.stop_after_ms = Some(0),
+            "idle.stop_after_ms must be greater than zero",
+        ),
+        (
             "sleep residual exceeds awake",
             |config| enable_l1(&mut config.services[0], 25 * GIB, 8 * GIB),
             "exceeds its awake reservation",
+        ),
+        (
+            "awake reservation exceeds GPU",
+            |config| config.services[0].placement.vram_reservation_bytes_per_gpu = 33 * GIB,
+            "awake VRAM reservation",
         ),
         (
             "host RAM",
@@ -325,6 +690,47 @@ fn rejects_sleep_and_resource_budget_errors_table() {
                 config.services.push(second);
             },
             "L1 pinned host RAM overcommit",
+        ),
+        (
+            "host RAM sum overflow",
+            |config| {
+                enable_l1(&mut config.services[0], 1, u64::MAX);
+                let mut second = valid_service("beta", "model-b", 8101, "GPU-b");
+                enable_l1(&mut second, 1, 1);
+                config.services.push(second);
+            },
+            "L1 pinned host RAM reservations overflow u64",
+        ),
+        (
+            "all-sleep residual overcommit",
+            |config| {
+                enable_l2(&mut config.services[0], 20 * GIB);
+                let mut second = valid_service("beta", "model-b", 8101, "GPU-a");
+                enable_l2(&mut second, 20 * GIB);
+                config.services.push(second);
+            },
+            "residual sleep VRAM overcommit",
+        ),
+        (
+            "all-sleep residual sum overflow",
+            |config| {
+                enable_l2(&mut config.services[0], u64::MAX);
+                config.services[0].placement.vram_reservation_bytes_per_gpu = u64::MAX;
+                let mut second = valid_service("beta", "model-b", 8101, "GPU-a");
+                enable_l2(&mut second, 1);
+                config.services.push(second);
+            },
+            "residual sleep VRAM reservations overflow u64",
+        ),
+        (
+            "awake plus residual sum overflow",
+            |config| {
+                config.services[0].placement.vram_reservation_bytes_per_gpu = u64::MAX;
+                let mut second = valid_service("beta", "model-b", 8101, "GPU-a");
+                enable_l2(&mut second, 1);
+                config.services.push(second);
+            },
+            "VRAM reservations overflow u64 when service \"alpha\" is awake",
         ),
         (
             "awake plus residual",
@@ -346,6 +752,10 @@ fn rejects_sleep_and_resource_budget_errors_table() {
         ),
     ];
 
+    assert_rejections(cases);
+}
+
+fn assert_rejections(cases: &[RejectionCase]) {
     for (name, mutate, expected) in cases {
         let mut config = valid_config();
         mutate(&mut config);
@@ -354,26 +764,13 @@ fn rejects_sleep_and_resource_budget_errors_table() {
 }
 
 #[test]
-fn yaml_load_is_strict_and_reload_is_atomic() {
+fn yaml_load_is_strict_and_store_exposes_an_immutable_snapshot() {
     let directory = tempfile::tempdir().unwrap();
     let good_path = directory.path().join("good.yaml");
-    let bad_path = directory.path().join("bad.yaml");
     std::fs::write(&good_path, serde_yaml::to_string(&valid_config()).unwrap()).unwrap();
-    std::fs::write(
-        &bad_path,
-        serde_yaml::to_string(&{
-            let mut config = valid_config();
-            config.services[0].backend.address = "192.0.2.1".parse().unwrap();
-            config
-        })
-        .unwrap(),
-    )
-    .unwrap();
 
     let store = ConfigStore::load(&good_path).unwrap();
-    let original = store.snapshot();
-    assert!(store.reload(&bad_path).is_err());
-    assert!(Arc::ptr_eq(&original, &store.snapshot()));
+    assert_eq!(store.snapshot().services[0].name, "alpha");
 
     std::fs::write(
         directory.path().join("unknown.yaml"),
@@ -384,4 +781,17 @@ fn yaml_load_is_strict_and_reload_is_atomic() {
         .unwrap_err()
         .to_string();
     assert!(error.contains("unknown field") || error.contains("missing field"));
+}
+
+#[test]
+fn omitted_runner_executable_uses_the_backward_compatible_default() {
+    let yaml = include_str!("example.yaml")
+        .replace("    runner_executable: /opt/vllm-venv/bin/vllm\n", "");
+    let config: RouterConfig = serde_yaml::from_str(&yaml).unwrap();
+
+    assert_eq!(
+        config.services[0].runner_executable,
+        Path::new("/opt/vllm-venv/bin/vllm")
+    );
+    config.validate().unwrap();
 }

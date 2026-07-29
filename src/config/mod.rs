@@ -1,4 +1,4 @@
-//! Router configuration schema, loading, validation, and atomic replacement.
+//! Router configuration schema, loading, validation, and immutable runtime access.
 //!
 //! The schema intentionally owns every vLLM option which affects placement or
 //! lifecycle. `runner_args` is only an escape hatch for explicitly allowlisted,
@@ -9,7 +9,7 @@ use std::fmt;
 use std::fs;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -88,18 +88,19 @@ impl RouterConfig {
     }
 }
 
-/// A validated configuration holder. A failed reload never replaces the
-/// currently active configuration.
+/// A validated configuration snapshot that is immutable for the process lifetime.
+///
+/// Applying configuration changes requires a supervised router restart.
 #[derive(Debug)]
 pub struct ConfigStore {
-    current: RwLock<Arc<RouterConfig>>,
+    current: Arc<RouterConfig>,
 }
 
 impl ConfigStore {
     pub fn new(config: RouterConfig) -> Result<Self, ValidationErrors> {
         config.validate()?;
         Ok(Self {
-            current: RwLock::new(Arc::new(config)),
+            current: Arc::new(config),
         })
     }
 
@@ -108,21 +109,7 @@ impl ConfigStore {
     }
 
     pub fn snapshot(&self) -> Arc<RouterConfig> {
-        Arc::clone(
-            &self
-                .current
-                .read()
-                .expect("configuration lock poisoned by a previous panic"),
-        )
-    }
-
-    pub fn reload(&self, path: impl AsRef<Path>) -> Result<Arc<RouterConfig>, ConfigError> {
-        let replacement = Arc::new(RouterConfig::load(path)?);
-        *self
-            .current
-            .write()
-            .expect("configuration lock poisoned by a previous panic") = Arc::clone(&replacement);
-        Ok(replacement)
+        Arc::clone(&self.current)
     }
 }
 
@@ -183,6 +170,9 @@ pub struct ServiceDefinition {
     pub enabled: bool,
     #[serde(default)]
     pub runner: RunnerType,
+    /// Absolute path to the runner binary used in this service's generated unit.
+    #[serde(default = "default_vllm_executable")]
+    pub runner_executable: PathBuf,
     pub served_model: String,
     #[serde(default)]
     pub aliases: Vec<String>,
@@ -212,6 +202,8 @@ pub struct ServiceDefinition {
     pub parking: ParkingConfig,
     #[serde(default)]
     pub priority: i32,
+    /// Whether the scheduler may displace this service for competing demand.
+    /// Explicit idle sleep/stop policy remains independent of eviction.
     #[serde(default = "default_true")]
     pub evictable: bool,
     #[serde(default = "default_true")]
@@ -570,6 +562,8 @@ fn validate_services(config: &RouterConfig, errors: &mut Vec<String>) {
     let mut names = HashSet::new();
     let mut ports: HashMap<u16, &str> = HashMap::new();
     let mut alias_owners: HashMap<&str, &str> = HashMap::new();
+    let mut systemd_units: HashMap<&str, &str> = HashMap::new();
+    let mut environment_files: HashMap<&Path, &str> = HashMap::new();
 
     for (index, service) in config.services.iter().enumerate() {
         let location = format!("services[{index}] ({:?})", service.name);
@@ -585,6 +579,7 @@ fn validate_services(config: &RouterConfig, errors: &mut Vec<String>) {
         if service.served_model.trim().is_empty() {
             errors.push(format!("{location}.served_model must not be empty"));
         }
+        validate_runner_executable(service, &location, errors);
         require_absolute(
             &service.model_path,
             &format!("{location}.model_path"),
@@ -603,11 +598,44 @@ fn validate_services(config: &RouterConfig, errors: &mut Vec<String>) {
         validate_placement(service, &location, &known_gpus, errors);
         validate_backend(service, &location, &listener_ports, &mut ports, errors);
         validate_systemd(service, &location, errors);
+        if let Some(previous) =
+            systemd_units.insert(service.systemd.unit.as_str(), service.name.as_str())
+        {
+            errors.push(format!(
+                "{location}.systemd.unit {:?} is already used by service {previous:?}",
+                service.systemd.unit
+            ));
+        }
+        if let Some(previous) = environment_files.insert(
+            service.systemd.environment_file.as_path(),
+            service.name.as_str(),
+        ) {
+            errors.push(format!(
+                "{location}.systemd.environment_file {:?} is already used by service {previous:?}",
+                service.systemd.environment_file
+            ));
+        }
         validate_runner_args(service, &location, errors);
         validate_readiness(service, &location, errors);
         validate_timing(service, &location, config, errors);
         validate_sleep(service, &location, errors);
         validate_compatibility(service, &location, errors);
+    }
+}
+
+fn validate_runner_executable(
+    service: &ServiceDefinition,
+    location: &str,
+    errors: &mut Vec<String>,
+) {
+    let field = format!("{location}.runner_executable");
+    require_absolute(&service.runner_executable, &field, errors);
+    match service.runner_executable.to_str() {
+        Some(path) if path.chars().any(char::is_control) => {
+            errors.push(format!("{field} contains a forbidden control character"));
+        }
+        Some(_) => {}
+        None => errors.push(format!("{field} must be valid UTF-8")),
     }
 }
 
@@ -930,6 +958,9 @@ fn validate_timing(
                 "{location}.warmup.path must be an absolute HTTP path"
             ));
         }
+        if !warmup.body.is_object() {
+            errors.push(format!("{location}.warmup.body must be a JSON object"));
+        }
     }
 }
 
@@ -1018,11 +1049,6 @@ fn validate_sleep(service: &ServiceDefinition, location: &str, errors: &mut Vec<
             }
             previous = Some((name, value));
         }
-    }
-    if !service.evictable && idle.stop_after_ms.is_some() {
-        errors.push(format!(
-            "{location} is not evictable but configures an automatic stop threshold"
-        ));
     }
 }
 
@@ -1152,6 +1178,10 @@ fn is_safe_name(name: &str) -> bool {
 
 const fn default_true() -> bool {
     true
+}
+
+fn default_vllm_executable() -> PathBuf {
+    PathBuf::from("/opt/vllm-venv/bin/vllm")
 }
 
 const fn default_parallelism() -> usize {

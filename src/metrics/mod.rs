@@ -5,6 +5,10 @@ use prometheus::{
     register_histogram_vec, register_int_counter_vec, register_int_gauge, register_int_gauge_vec,
 };
 
+const LLM_DURATION_BUCKETS: &[f64] = &[
+    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0,
+];
+
 /// Metrics shared by the data plane, lifecycle engine, and observer.
 ///
 /// Labels deliberately exclude service operation IDs and request IDs: both are
@@ -18,6 +22,7 @@ pub struct RouterMetrics {
     pub transitions: IntCounterVec,
     pub probe_failures: IntCounterVec,
     pub active: IntGaugeVec,
+    pub active_streams: IntGaugeVec,
     pub service_state: IntGaugeVec,
     pub global_parked: IntGauge,
 }
@@ -37,7 +42,8 @@ impl RouterMetrics {
                 HistogramOpts::new(
                     "vllm_router_request_duration_seconds",
                     "End-to-end downstream request duration"
-                ),
+                )
+                .buckets(LLM_DURATION_BUCKETS.to_vec()),
                 &["model"]
             )
             .expect("request latency metric registration"),
@@ -53,7 +59,8 @@ impl RouterMetrics {
                 HistogramOpts::new(
                     "vllm_router_parking_duration_seconds",
                     "Time spent waiting for model readiness"
-                ),
+                )
+                .buckets(LLM_DURATION_BUCKETS.to_vec()),
                 &["model"]
             )
             .expect("parking latency metric registration"),
@@ -81,6 +88,14 @@ impl RouterMetrics {
                 &["service"]
             )
             .expect("active metric registration"),
+            active_streams: register_int_gauge_vec!(
+                Opts::new(
+                    "vllm_router_active_streams",
+                    "Exact active streaming response count by service"
+                ),
+                &["service"]
+            )
+            .expect("active stream metric registration"),
             service_state: register_int_gauge_vec!(
                 Opts::new(
                     "vllm_router_service_state",
@@ -116,5 +131,37 @@ mod tests {
                 .iter()
                 .any(|family| family.get_name() == "vllm_router_parked_requests_total_current")
         );
+    }
+
+    #[test]
+    fn latency_histograms_use_llm_scale_buckets() {
+        global()
+            .request_seconds
+            .with_label_values(&["bucket-test"])
+            .observe(0.01);
+        global()
+            .parking_seconds
+            .with_label_values(&["bucket-test"])
+            .observe(120.0);
+
+        for name in [
+            "vllm_router_request_duration_seconds",
+            "vllm_router_parking_duration_seconds",
+        ] {
+            let families = prometheus::gather();
+            let histogram = families
+                .iter()
+                .find(|family| family.get_name() == name)
+                .expect("histogram should be registered")
+                .get_metric()[0]
+                .get_histogram()
+                .clone();
+            let upper_bounds: Vec<_> = histogram
+                .get_bucket()
+                .iter()
+                .map(|bucket| bucket.get_upper_bound())
+                .collect();
+            assert_eq!(upper_bounds, LLM_DURATION_BUCKETS);
+        }
     }
 }

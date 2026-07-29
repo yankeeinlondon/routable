@@ -22,6 +22,7 @@ services:
   - name: example-30b
     enabled: true
     runner: vllm
+    runner_executable: /opt/vllm-venv/bin/vllm
     served_model: example/model-30b
     aliases: [example-30b]
     model_path: /srv/models/example-30b

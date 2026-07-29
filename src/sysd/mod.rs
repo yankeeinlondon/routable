@@ -1,24 +1,27 @@
-use std::{future::pending, time::Duration};
+use std::{sync::Arc, time::Duration};
 
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::{
-    sync::watch,
-    task::JoinHandle,
-    time::{Instant, MissedTickBehavior},
-};
+use tokio::sync::OnceCell;
 use zbus::{Connection, Proxy, zvariant::OwnedObjectPath};
+
+mod generator;
+
+pub use generator::{GENERATED_UNIT_DIRECTORY, GeneratedSystemdError, install_generated_inputs};
 
 const SYSTEMD_DESTINATION: &str = "org.freedesktop.systemd1";
 const SYSTEMD_MANAGER_PATH: &str = "/org/freedesktop/systemd1";
 const SYSTEMD_MANAGER_INTERFACE: &str = "org.freedesktop.systemd1.Manager";
 const SYSTEMD_UNIT_INTERFACE: &str = "org.freedesktop.systemd1.Unit";
+const SYSTEMD_SERVICE_INTERFACE: &str = "org.freedesktop.systemd1.Service";
+const SYSTEMD_UNIT_LOOKUP_OPERATION: &str = "LoadUnit";
 
 #[derive(Clone)]
 pub struct SystemdManager {
     connection: Connection,
     timeout: Duration,
+    subscribed_to_jobs: Arc<OnceCell<()>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -61,18 +64,7 @@ pub struct UnitStatus {
     pub load_state: String,
     pub active_state: UnitActiveState,
     pub sub_state: String,
-}
-
-#[derive(Clone, Debug)]
-pub struct UnitObservation {
-    pub status: Option<UnitStatus>,
-    pub error: Option<String>,
-    pub observed_at: Instant,
-}
-
-pub struct UnitObserver {
-    receiver: watch::Receiver<UnitObservation>,
-    task: JoinHandle<()>,
+    pub main_pid: Option<u32>,
 }
 
 #[derive(Debug, Error)]
@@ -101,6 +93,62 @@ pub enum SystemdError {
         #[source]
         source: zbus::Error,
     },
+    #[error("systemd {operation} job for {unit:?} completed with result {result:?}")]
+    JobFailed {
+        operation: &'static str,
+        unit: String,
+        result: String,
+    },
+    #[error("systemd stopped reporting jobs while waiting for {operation} of {unit:?}")]
+    JobSignalEnded {
+        operation: &'static str,
+        unit: String,
+    },
+}
+
+#[derive(Debug)]
+struct JobRemoved {
+    path: OwnedObjectPath,
+    result: String,
+}
+
+fn optional_main_pid(main_pid: u32) -> Option<u32> {
+    (main_pid != 0).then_some(main_pid)
+}
+
+async fn wait_for_job_result<S>(
+    operation: &'static str,
+    unit: &str,
+    job_path: &OwnedObjectPath,
+    events: S,
+) -> Result<(), SystemdError>
+where
+    S: Stream<Item = Result<JobRemoved, zbus::Error>>,
+{
+    tokio::pin!(events);
+    while let Some(event) = events.next().await {
+        let event = event.map_err(|source| SystemdError::Call {
+            operation: "decode JobRemoved",
+            unit: unit.to_owned(),
+            source,
+        })?;
+        if &event.path != job_path {
+            continue;
+        }
+        return if event.result == "done" {
+            Ok(())
+        } else {
+            Err(SystemdError::JobFailed {
+                operation,
+                unit: unit.to_owned(),
+                result: event.result,
+            })
+        };
+    }
+    Err(SystemdError::JobSignalEnded {
+        operation,
+        unit: unit.to_owned(),
+    })
 }
 
 impl SystemdManager {
@@ -116,6 +164,7 @@ impl SystemdManager {
         Ok(Self {
             connection,
             timeout,
+            subscribed_to_jobs: Arc::new(OnceCell::new()),
         })
     }
 
@@ -123,6 +172,7 @@ impl SystemdManager {
         Self {
             connection,
             timeout,
+            subscribed_to_jobs: Arc::new(OnceCell::new()),
         }
     }
 
@@ -143,10 +193,12 @@ impl SystemdManager {
     async fn unit_path(&self, unit: &str) -> Result<OwnedObjectPath, SystemdError> {
         let proxy = self.manager_proxy().await?;
         proxy
-            .call("GetUnit", &(unit,))
+            // LoadUnit returns an object even when an inactive unit has been
+            // garbage-collected from systemd's in-memory unit set.
+            .call(SYSTEMD_UNIT_LOOKUP_OPERATION, &(unit,))
             .await
             .map_err(|source| SystemdError::Call {
-                operation: "GetUnit",
+                operation: SYSTEMD_UNIT_LOOKUP_OPERATION,
                 unit: unit.to_owned(),
                 source,
             })
@@ -157,15 +209,52 @@ impl SystemdManager {
         operation: &'static str,
         unit: &str,
     ) -> Result<OwnedObjectPath, SystemdError> {
+        self.ensure_job_subscription().await?;
         let proxy = self.manager_proxy().await?;
-        proxy
+        // Register the match before queueing the job so an immediately
+        // completing unit cannot race past the listener.
+        let signals =
+            proxy
+                .receive_signal("JobRemoved")
+                .await
+                .map_err(|source| SystemdError::Call {
+                    operation: "subscribe to JobRemoved",
+                    unit: unit.to_owned(),
+                    source,
+                })?;
+        let job_path = proxy
             .call(operation, &(unit, "replace"))
             .await
             .map_err(|source| SystemdError::Call {
                 operation,
                 unit: unit.to_owned(),
                 source,
+            })?;
+        let events = signals.map(|message| {
+            message
+                .body()
+                .deserialize::<(u32, OwnedObjectPath, String, String)>()
+                .map(|(_, path, _, result)| JobRemoved { path, result })
+        });
+        wait_for_job_result(operation, unit, &job_path, events).await?;
+        Ok(job_path)
+    }
+
+    async fn ensure_job_subscription(&self) -> Result<(), SystemdError> {
+        self.subscribed_to_jobs
+            .get_or_try_init(|| async {
+                let proxy = self.manager_proxy().await?;
+                proxy
+                    .call("Subscribe", &())
+                    .await
+                    .map_err(|source| SystemdError::Call {
+                        operation: "Subscribe",
+                        unit: "<manager>".into(),
+                        source,
+                    })
             })
+            .await
+            .map(|_| ())
     }
 
     pub async fn start_unit(&self, unit: &str) -> Result<OwnedObjectPath, SystemdError> {
@@ -188,6 +277,29 @@ impl SystemdManager {
             })?
     }
 
+    /// Ask systemd to reload unit files after generated inputs are installed.
+    pub async fn reload(&self) -> Result<(), SystemdError> {
+        tokio::time::timeout(self.timeout, self.reload_inner())
+            .await
+            .map_err(|_| SystemdError::Timeout {
+                operation: "Reload",
+                unit: "<manager>".into(),
+                timeout: self.timeout,
+            })?
+    }
+
+    async fn reload_inner(&self) -> Result<(), SystemdError> {
+        let proxy = self.manager_proxy().await?;
+        proxy
+            .call("Reload", &())
+            .await
+            .map_err(|source| SystemdError::Call {
+                operation: "Reload",
+                unit: "<manager>".into(),
+                source,
+            })
+    }
+
     pub async fn unit_status(&self, unit: &str) -> Result<UnitStatus, SystemdError> {
         tokio::time::timeout(self.timeout, self.unit_status_inner(unit))
             .await
@@ -203,7 +315,7 @@ impl SystemdManager {
         let proxy = Proxy::new(
             &self.connection,
             SYSTEMD_DESTINATION,
-            path,
+            path.clone(),
             SYSTEMD_UNIT_INTERFACE,
         )
         .await
@@ -235,109 +347,44 @@ impl SystemdManager {
                 unit: unit.to_owned(),
                 source,
             })?;
+        let service_proxy = Proxy::new(
+            &self.connection,
+            SYSTEMD_DESTINATION,
+            path,
+            SYSTEMD_SERVICE_INTERFACE,
+        )
+        .await
+        .map_err(|source| SystemdError::Proxy {
+            interface: SYSTEMD_SERVICE_INTERFACE,
+            source,
+        })?;
+        let main_pid = service_proxy
+            .get_property::<u32>("MainPID")
+            .await
+            .map_err(|source| SystemdError::Call {
+                operation: "read MainPID",
+                unit: unit.to_owned(),
+                source,
+            })?;
         Ok(UnitStatus {
             name: unit.to_owned(),
             load_state,
             active_state: UnitActiveState::from_systemd(active_state),
             sub_state,
+            main_pid: optional_main_pid(main_pid),
         })
-    }
-
-    /// Publishes D-Bus `ActiveState` property changes through a watch channel.
-    /// A bounded periodic refresh catches coalesced/missed signals. Each unit
-    /// owns an independent task, so a hung operation cannot stall another
-    /// service and the steady-state path never shells out.
-    pub fn observe_unit(&self, unit: impl Into<String>, interval: Duration) -> UnitObserver {
-        let unit = unit.into();
-        let manager = self.clone();
-        let initial = UnitObservation {
-            status: None,
-            error: None,
-            observed_at: Instant::now(),
-        };
-        let (sender, receiver) = watch::channel(initial);
-        let task = tokio::spawn(async move {
-            let signal_proxy = match manager.unit_path(&unit).await {
-                Ok(path) => Proxy::new(
-                    &manager.connection,
-                    SYSTEMD_DESTINATION,
-                    path,
-                    SYSTEMD_UNIT_INTERFACE,
-                )
-                .await
-                .ok(),
-                Err(_) => None,
-            };
-            let mut active_state_changes = match signal_proxy.as_ref() {
-                Some(proxy) => Some(
-                    proxy
-                        .receive_property_changed::<String>("ActiveState")
-                        .await,
-                ),
-                None => None,
-            };
-            let mut ticker = tokio::time::interval(interval);
-            ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-            let mut previous: Option<(Option<UnitStatus>, Option<String>)> = None;
-            loop {
-                tokio::select! {
-                    _ = ticker.tick() => {}
-                    change = async {
-                        match active_state_changes.as_mut() {
-                            Some(changes) => changes.next().await,
-                            None => pending().await,
-                        }
-                    } => {
-                        if change.is_none() {
-                            active_state_changes = None;
-                        }
-                    }
-                }
-                let (status, error) = match manager.unit_status(&unit).await {
-                    Ok(status) => (Some(status), None),
-                    Err(error) => (None, Some(error.to_string())),
-                };
-                let current = (status, error);
-                if previous.as_ref() != Some(&current) {
-                    previous = Some(current.clone());
-                    let observation = UnitObservation {
-                        status: current.0,
-                        error: current.1,
-                        observed_at: Instant::now(),
-                    };
-                    if sender.send(observation).is_err() {
-                        break;
-                    }
-                }
-            }
-        });
-        UnitObserver { receiver, task }
-    }
-}
-
-impl UnitObserver {
-    pub fn subscribe(&self) -> watch::Receiver<UnitObservation> {
-        self.receiver.clone()
-    }
-
-    pub fn current(&self) -> UnitObservation {
-        self.receiver.borrow().clone()
-    }
-
-    pub fn abort(&self) {
-        self.task.abort();
-    }
-}
-
-impl Drop for UnitObserver {
-    fn drop(&mut self) {
-        self.task.abort();
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use futures_util::stream;
+
     use super::*;
+
+    fn job_path(id: u32) -> OwnedObjectPath {
+        OwnedObjectPath::try_from(format!("/org/freedesktop/systemd1/job/{id}")).unwrap()
+    }
 
     #[test]
     fn active_state_mapping_is_forward_compatible() {
@@ -350,6 +397,70 @@ mod tests {
             UnitActiveState::from_systemd("future-state".into()),
             UnitActiveState::Unknown("future-state".into())
         );
+    }
+
+    #[test]
+    fn inactive_unit_lookup_uses_load_unit() {
+        assert_eq!(SYSTEMD_UNIT_LOOKUP_OPERATION, "LoadUnit");
+    }
+
+    #[test]
+    fn main_pid_zero_maps_to_absent_and_process_ids_are_preserved() {
+        assert_eq!(optional_main_pid(0), None);
+        assert_eq!(optional_main_pid(42), Some(42));
+    }
+
+    #[tokio::test]
+    async fn job_result_waiter_matches_the_returned_path_and_accepts_done() {
+        let expected = job_path(42);
+        let events = stream::iter([
+            Ok(JobRemoved {
+                path: job_path(41),
+                result: "failed".into(),
+            }),
+            Ok(JobRemoved {
+                path: expected.clone(),
+                result: "done".into(),
+            }),
+        ]);
+
+        wait_for_job_result("StartUnit", "vllm@example.service", &expected, events)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn job_result_waiter_surfaces_every_non_done_result() {
+        for expected_result in [
+            "canceled",
+            "timeout",
+            "failed",
+            "dependency",
+            "skipped",
+            "future-result",
+        ] {
+            let expected = job_path(42);
+            let events = stream::iter([Ok(JobRemoved {
+                path: expected.clone(),
+                result: expected_result.into(),
+            })]);
+
+            let error = wait_for_job_result("StopUnit", "vllm@example.service", &expected, events)
+                .await
+                .unwrap_err();
+            match error {
+                SystemdError::JobFailed {
+                    operation,
+                    unit,
+                    result,
+                } => {
+                    assert_eq!(operation, "StopUnit");
+                    assert_eq!(unit, "vllm@example.service");
+                    assert_eq!(result, expected_result);
+                }
+                other => panic!("unexpected error for job result {expected_result:?}: {other}"),
+            }
+        }
     }
 
     #[tokio::test]

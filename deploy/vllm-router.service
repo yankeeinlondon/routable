@@ -11,11 +11,14 @@ RestartSec=2
 TimeoutStartSec=30
 TimeoutStopSec=900
 LimitNOFILE=262144
+ConfigurationDirectory=vllm
+ConfigurationDirectoryMode=0750
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=read-only
 ProtectSystem=strict
-ReadOnlyPaths=/etc/vllm-router /etc/vllm
+ReadOnlyPaths=/etc/vllm-router
+ReadWritePaths=/etc/vllm /run/systemd/system
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 
 [Install]

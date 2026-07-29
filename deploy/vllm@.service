@@ -6,7 +6,6 @@ Wants=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=/etc/vllm/%i.env
-Environment=VLLM_SERVER_DEV_MODE=1
 ExecStart=/opt/vllm-venv/bin/vllm serve ${MODEL_PATH} $VLLM_ARGS
 Restart=on-failure
 RestartSec=10

@@ -6,7 +6,7 @@ use thiserror::Error;
 
 mod vllm;
 
-pub use vllm::{VllmRunner, VllmRunnerConfig};
+pub use vllm::{VllmRunner, VllmRunnerConfig, VllmTimeouts};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -26,16 +26,9 @@ impl SleepLevel {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WarmupRequest {
+    pub path: String,
     pub model: String,
-    pub prompt: String,
-    #[serde(default = "default_max_tokens")]
-    pub max_tokens: u32,
-    #[serde(default)]
-    pub temperature: f32,
-}
-
-const fn default_max_tokens() -> u32 {
-    1
+    pub body: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Error)]

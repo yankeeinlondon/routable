@@ -199,13 +199,18 @@ per-model) so cold-start stampedes are bounded before they reach the pool.
 `config/` deserializes strict YAML (unknown fields rejected) and then cross-validates:
 identity (duplicate names/aliases/ports, alias-vs-canonical ambiguity), placement
 (unknown GPU UUIDs, parallelism vs GPU count, per-GPU awake-owner policy), safety
-(loopback-only backends, absolute paths, allowlisted vLLM runner arguments with
-control-character and Ray-executor rejection, newline-safe environment values), timing
+(loopback-only backends, a per-service absolute runner executable path, absolute model
+paths, allowlisted vLLM runner arguments with control-character and Ray-executor rejection,
+newline-safe systemd command/environment values), timing
 (threshold/interval/deadline sanity, parking vs startup deadlines), and **budgets** —
 host pinned-RAM under the all-L1-asleep worst case, and per-GPU VRAM for both
 all-asleep and each-awake-plus-others-asleep combinations, which under the
-one-awake-owner rule are exactly the reachable states. `ConfigStore` swaps validated
-snapshots atomically; an invalid file leaves the previous configuration active.
+one-awake-owner rule are exactly the reachable states. `ConfigStore` holds one validated
+snapshot that is immutable for the router process lifetime. There is no SIGHUP or control
+endpoint for live reload: edit the YAML, validate it with `vllm-router -t`, and apply it
+with a supervised router restart. An invalid configuration prevents the replacement
+process from starting; systemd-owned model processes remain up and are reconstructed by
+startup reconciliation.
 
 ## Security model
 

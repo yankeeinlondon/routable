@@ -145,7 +145,7 @@ in-flight streams per spec.
 ```
 src/
   main.rs          server assembly: pingora Server, listeners, background services
-  config/          schema, validation, atomic reload
+  config/          schema, validation, immutable runtime snapshot
   proxy/           data plane: ProxyHttp impl, parking, selection, error mapping
   api/             /pool/v1 + livez/readyz HttpServerApp, auth, audit
   metrics/         prometheus registry + service

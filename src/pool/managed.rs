@@ -1,8 +1,8 @@
 //! Production composition of the generic pool runner seam.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use thiserror::Error;
@@ -12,18 +12,50 @@ use super::{
     ServiceDefinition, SleepLevel, SystemdState, SystemdStatus,
 };
 use crate::config::{self, RouterConfig};
-use crate::gpu::{ExpectedGpuState, GpuInventory};
+use crate::gpu::{ExpectedGpuState, ExpectedGpuUsage, GpuInventory, GpuSnapshot};
+use crate::metrics;
 use crate::runner::{
-    Runner as VllmApi, SleepLevel as VllmSleepLevel, VllmRunner, VllmRunnerConfig,
+    Runner as VllmApi, SleepLevel as VllmSleepLevel, VllmRunner, VllmRunnerConfig, VllmTimeouts,
     WarmupRequest as VllmWarmupRequest,
 };
-use crate::sysd::{SystemdError, SystemdManager, UnitActiveState};
+use crate::sysd::{
+    GeneratedSystemdError, SystemdError, SystemdManager, UnitActiveState, UnitStatus,
+    install_generated_inputs,
+};
 
 struct ManagedService {
     config: config::ServiceDefinition,
     vllm: VllmRunner,
     probe: Mutex<ProbeDebounce>,
-    commanded_sleep: Mutex<Option<SleepLevel>>,
+    observed_systemd: Mutex<Option<SystemdStatus>>,
+    sleep: Mutex<SleepObservationState>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct SleepObservationState {
+    commanded: Option<SleepLevel>,
+    observed_sleeping: bool,
+}
+
+impl SleepObservationState {
+    /// Apply an authoritative `/is_sleeping` response, or retain the last
+    /// authoritative state when the endpoint itself could not be observed.
+    fn update(&mut self, observed: Option<bool>) -> Option<u8> {
+        match observed {
+            Some(true) => self.observed_sleeping = true,
+            Some(false) => {
+                self.observed_sleeping = false;
+                self.commanded = None;
+            }
+            None => {}
+        }
+
+        self.observed_sleeping
+            .then(|| match reported_sleep_level(self.commanded) {
+                SleepLevel::L1 => 1,
+                SleepLevel::L2 => 2,
+            })
+    }
 }
 
 #[derive(Default)]
@@ -31,6 +63,59 @@ struct ProbeDebounce {
     successes: u32,
     failures: u32,
     ready: bool,
+    healthy: bool,
+    served_model_matches: bool,
+    sleeping_level: Option<u8>,
+    observed_at: Option<Instant>,
+}
+
+impl ProbeDebounce {
+    fn record(
+        &mut self,
+        healthy: bool,
+        served_model_matches: bool,
+        sleeping_level: Option<u8>,
+        consecutive_successes: u32,
+        consecutive_failures: u32,
+        observed_at: Instant,
+    ) -> ProbeStatus {
+        self.healthy = healthy;
+        self.served_model_matches = served_model_matches;
+        self.sleeping_level = sleeping_level;
+        self.observed_at = Some(observed_at);
+        if sleeping_level.is_some() {
+            self.successes = 0;
+            self.failures = 0;
+            self.ready = false;
+        } else if healthy && served_model_matches {
+            self.successes = self.successes.saturating_add(1);
+            self.failures = 0;
+            if self.successes >= consecutive_successes {
+                self.ready = true;
+            }
+        } else {
+            self.successes = 0;
+            self.failures = self.failures.saturating_add(1);
+            if self.failures >= consecutive_failures {
+                self.ready = false;
+            }
+        }
+        self.status_at(Instant::now())
+    }
+
+    fn status_at(&self, now: Instant) -> ProbeStatus {
+        ProbeStatus {
+            healthy: self.healthy,
+            ready: self.ready,
+            served_model_matches: self.served_model_matches,
+            sleeping_level: self.sleeping_level,
+            consecutive_successes: self.successes,
+            consecutive_failures: self.failures,
+            age: self
+                .observed_at
+                .map(|observed_at| now.saturating_duration_since(observed_at)),
+        }
+    }
 }
 
 /// Runner implementation composed from the host's systemd, vLLM HTTP, and NVML adapters.
@@ -42,6 +127,8 @@ pub struct ManagedVllmRunner {
 
 #[derive(Debug, Error)]
 pub enum ManagedBuildError {
+    #[error(transparent)]
+    GeneratedSystemd(#[from] GeneratedSystemdError),
     #[error(transparent)]
     Systemd(#[from] SystemdError),
     #[error("could not construct vLLM adapter for `{service}`: {source}")]
@@ -57,6 +144,7 @@ pub enum ManagedBuildError {
 impl ManagedVllmRunner {
     /// Connect to the system bus and construct one bounded HTTP adapter per service.
     pub async fn connect(config: &RouterConfig) -> Result<Self, ManagedBuildError> {
+        install_generated_inputs(config)?;
         let systemd_timeout = config
             .services
             .iter()
@@ -64,6 +152,7 @@ impl ManagedVllmRunner {
             .max()
             .unwrap_or(Duration::from_secs(30));
         let systemd = SystemdManager::connect_system(systemd_timeout).await?;
+        systemd.reload().await?;
         Self::from_parts(config, systemd, GpuInventory::initialize())
     }
 
@@ -75,10 +164,9 @@ impl ManagedVllmRunner {
     ) -> Result<Self, ManagedBuildError> {
         let mut services = HashMap::new();
         for service in &config.services {
-            let request_timeout = Duration::from_millis(service.readiness.timeout_ms);
             let vllm = VllmRunner::new(VllmRunnerConfig {
                 base_url: format!("http://{}", service.backend.socket_addr()),
-                request_timeout,
+                timeouts: vllm_timeouts(service),
                 api_key: None,
             })
             .map_err(|source| ManagedBuildError::Vllm {
@@ -91,7 +179,8 @@ impl ManagedVllmRunner {
                     config: service.clone(),
                     vllm,
                     probe: Mutex::new(ProbeDebounce::default()),
-                    commanded_sleep: Mutex::new(None),
+                    observed_systemd: Mutex::new(None),
+                    sleep: Mutex::new(SleepObservationState::default()),
                 },
             );
         }
@@ -110,37 +199,144 @@ impl ManagedVllmRunner {
 
     fn update_probe(
         service: &ManagedService,
-        successful: bool,
+        healthy: bool,
+        served_model_matches: bool,
         sleeping_level: Option<u8>,
+        observed_at: Instant,
     ) -> ProbeStatus {
-        let mut probe = service.probe.lock().expect("probe lock poisoned");
-        if sleeping_level.is_some() {
-            probe.successes = 0;
-            probe.failures = 0;
-            probe.ready = false;
-        } else if successful {
-            probe.successes = probe.successes.saturating_add(1);
-            probe.failures = 0;
-            if probe.successes >= service.config.readiness.consecutive_successes {
-                probe.ready = true;
-            }
-        } else {
-            probe.successes = 0;
-            probe.failures = probe.failures.saturating_add(1);
-            if probe.failures >= service.config.readiness.consecutive_failures {
-                probe.ready = false;
-            }
-        }
-        ProbeStatus {
-            healthy: probe.ready,
-            ready: probe.ready,
-            served_model_matches: probe.ready,
+        service.probe.lock().expect("probe lock poisoned").record(
+            healthy,
+            served_model_matches,
             sleeping_level,
-            consecutive_successes: probe.successes,
-            consecutive_failures: probe.failures,
-            age: Some(Duration::ZERO),
+            service.config.readiness.consecutive_successes,
+            service.config.readiness.consecutive_failures,
+            observed_at,
+        )
+    }
+
+    fn expected_gpu_state(&self) -> ExpectedGpuState {
+        expected_gpu_state(self.services.values().map(|service| {
+            let systemd = service
+                .observed_systemd
+                .lock()
+                .expect("systemd-observation lock poisoned")
+                .clone();
+            let sleeping_level = service
+                .probe
+                .lock()
+                .expect("probe lock poisoned")
+                .sleeping_level;
+            (&service.config, systemd, sleeping_level)
+        }))
+    }
+}
+
+fn expected_gpu_state<'a>(
+    services: impl IntoIterator<
+        Item = (
+            &'a config::ServiceDefinition,
+            Option<SystemdStatus>,
+            Option<u8>,
+        ),
+    >,
+) -> ExpectedGpuState {
+    let mut expected = ExpectedGpuState::default();
+    for (service, systemd, sleeping_level) in services {
+        let maximum_used_memory_bytes =
+            expected_service_memory(service, systemd.as_ref(), sleeping_level);
+        let process_facts_known = expected_process_facts_known(systemd.as_ref());
+        let main_pid = systemd.as_ref().and_then(|status| status.main_pid);
+        for uuid in &service.placement.gpu_uuids {
+            let usage = expected
+                .devices
+                .entry(uuid.clone())
+                .or_insert_with(|| ExpectedGpuUsage {
+                    maximum_used_memory_bytes: Some(0),
+                    allowed_compute_pids: BTreeSet::new(),
+                    allow_unexpected_compute_pids: false,
+                });
+            usage.maximum_used_memory_bytes =
+                match (usage.maximum_used_memory_bytes, maximum_used_memory_bytes) {
+                    (Some(total), Some(service_maximum)) => total.checked_add(service_maximum),
+                    _ => None,
+                };
+            if let Some(main_pid) = main_pid {
+                usage.allowed_compute_pids.insert(main_pid);
+            }
+            if !process_facts_known {
+                usage.allow_unexpected_compute_pids = true;
+            }
         }
     }
+    expected
+}
+
+fn expected_service_memory(
+    service: &config::ServiceDefinition,
+    systemd: Option<&SystemdStatus>,
+    sleeping_level: Option<u8>,
+) -> Option<u64> {
+    match systemd {
+        Some(SystemdStatus {
+            state: SystemdState::Active,
+            ..
+        }) => Some(if sleeping_level.is_some() && service.sleep.enabled {
+            service.sleep.residual_vram_bytes_per_gpu
+        } else {
+            service.placement.vram_reservation_bytes_per_gpu
+        }),
+        Some(SystemdStatus {
+            state: SystemdState::Inactive | SystemdState::Failed,
+            main_pid: None,
+            ..
+        }) => Some(0),
+        Some(_) | None => None,
+    }
+}
+
+fn expected_process_facts_known(systemd: Option<&SystemdStatus>) -> bool {
+    matches!(
+        systemd,
+        Some(SystemdStatus {
+            state: SystemdState::Active,
+            main_pid: Some(_),
+            ..
+        }) | Some(SystemdStatus {
+            state: SystemdState::Inactive | SystemdState::Failed,
+            main_pid: None,
+            ..
+        })
+    )
+}
+
+fn gpu_statuses(definition: &ServiceDefinition, snapshot: &GpuSnapshot) -> Vec<GpuStatus> {
+    definition
+        .gpu_ids
+        .iter()
+        .map(|uuid| {
+            let observed = snapshot.devices.get(uuid);
+            let drift: Vec<_> = snapshot
+                .drift
+                .iter()
+                .filter(|drift| drift.uuid() == uuid)
+                .cloned()
+                .collect();
+            GpuStatus {
+                uuid: uuid.clone(),
+                used_memory_bytes: observed.map(|gpu| gpu.used_memory_bytes),
+                process_ids: observed
+                    .map(|gpu| {
+                        gpu.compute_processes
+                            .iter()
+                            .map(|process| process.pid)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                healthy: snapshot.available && observed.is_some() && drift.is_empty(),
+                drift,
+            }
+        })
+        .collect()
 }
 
 /// Convert the validated configuration schema into the generic scheduler schema.
@@ -206,78 +402,119 @@ impl Runner for ManagedVllmRunner {
             .unit_status(&service.config.systemd.unit)
             .await
             .map_err(|error| RunnerError::new(error.to_string()))?;
-        let systemd = SystemdStatus {
-            state: systemd_state(&unit.active_state),
-            sub_state: Some(unit.sub_state),
-            main_pid: None,
-        };
+        let systemd = runner_systemd_status(unit);
 
-        let gpu_snapshot = self.gpu.snapshot_async(ExpectedGpuState::default()).await;
-        let gpus = definition
-            .gpu_ids
-            .iter()
-            .map(|uuid| {
-                let observed = gpu_snapshot.devices.get(uuid);
-                GpuStatus {
-                    uuid: uuid.clone(),
-                    used_memory_bytes: observed.map(|gpu| gpu.used_memory_bytes),
-                    process_ids: observed
-                        .map(|gpu| {
-                            gpu.compute_processes
-                                .iter()
-                                .map(|process| process.pid)
-                                .collect()
-                        })
-                        .unwrap_or_default(),
-                    healthy: gpu_snapshot.available && observed.is_some(),
-                }
-            })
-            .collect();
-
-        if systemd.state != SystemdState::Active {
-            return Ok(RunnerObservation {
-                systemd,
-                probe: Self::update_probe(service, false, None),
-                gpus,
-            });
-        }
-
-        let sleeping = if service.config.sleep.enabled {
-            VllmApi::is_sleeping(&service.vllm).await.ok()
-        } else {
-            None
-        };
-        let sleeping_level = if sleeping == Some(true) {
-            let remembered = *service
-                .commanded_sleep
+        let probe = if systemd.state != SystemdState::Active {
+            // Sleep observations only describe the current vLLM process. Once
+            // systemd says it is no longer active, a later process must
+            // rediscover sleep state (and therefore retain unknown wake
+            // provenance) rather than inherit stale command history.
+            *service
+                .sleep
                 .lock()
-                .expect("sleep-level lock poisoned");
-            Some(match remembered.unwrap_or(SleepLevel::L1) {
-                SleepLevel::L1 => 1,
-                SleepLevel::L2 => 2,
-            })
+                .expect("sleep-observation lock poisoned") = SleepObservationState::default();
+            Self::update_probe(service, false, false, None, Instant::now())
         } else {
-            None
-        };
-        let successful = if sleeping_level.is_some() {
-            false
-        } else {
-            let health = VllmApi::health(&service.vllm).await;
-            let models = if health.is_ok() {
-                VllmApi::models(&service.vllm).await.ok()
+            let sleeping_level = if service.config.sleep.enabled {
+                let sleeping = match VllmApi::is_sleeping(&service.vllm).await {
+                    Ok(sleeping) => Some(sleeping),
+                    Err(error) => {
+                        metrics::global()
+                            .probe_failures
+                            .with_label_values(&[&definition.name, "is_sleeping"])
+                            .inc();
+                        tracing::warn!(
+                            service = %definition.name,
+                            error = %error,
+                            "sleep observation failed; retaining last authoritative state"
+                        );
+                        None
+                    }
+                };
+                service
+                    .sleep
+                    .lock()
+                    .expect("sleep-observation lock poisoned")
+                    .update(sleeping)
             } else {
                 None
             };
-            health.is_ok()
-                && models.is_some_and(|models| {
-                    models
-                        .iter()
-                        .any(|model| model == &service.config.served_model)
-                })
+            let (healthy, served_model_matches) = if sleeping_level.is_some() {
+                (false, false)
+            } else {
+                let health = VllmApi::health(&service.vllm).await;
+                let models = if health.is_ok() {
+                    VllmApi::models(&service.vllm).await.ok()
+                } else {
+                    None
+                };
+                (
+                    health.is_ok(),
+                    models.is_some_and(|models| {
+                        models
+                            .iter()
+                            .any(|model| model == &service.config.served_model)
+                    }),
+                )
+            };
+            Self::update_probe(
+                service,
+                healthy,
+                served_model_matches,
+                sleeping_level,
+                Instant::now(),
+            )
         };
+        *service
+            .observed_systemd
+            .lock()
+            .expect("systemd-observation lock poisoned") = Some(systemd.clone());
+
+        let gpu_snapshot = self.gpu.snapshot_async(self.expected_gpu_state()).await;
+        let assigned_drift: Vec<_> = gpu_snapshot
+            .drift
+            .iter()
+            .filter(|drift| definition.gpu_ids.iter().any(|uuid| uuid == drift.uuid()))
+            .collect();
+        let gpu_observation_healthy = gpu_snapshot.available
+            && definition
+                .gpu_ids
+                .iter()
+                .all(|uuid| gpu_snapshot.devices.contains_key(uuid))
+            && assigned_drift.is_empty();
+        if !gpu_observation_healthy {
+            metrics::global()
+                .probe_failures
+                .with_label_values(&[&definition.name, "nvml"])
+                .inc();
+            tracing::warn!(
+                service = %definition.name,
+                reason = gpu_snapshot
+                    .unavailable_reason
+                    .as_deref()
+                    .unwrap_or("one or more assigned GPUs are missing or have drift"),
+                "GPU observation degraded; lifecycle readiness remains probe-driven"
+            );
+        }
+        for drift in assigned_drift {
+            metrics::global()
+                .probe_failures
+                .with_label_values(&[&definition.name, "nvml_drift"])
+                .inc();
+            tracing::warn!(
+                service = %definition.name,
+                gpu_uuid = drift.uuid(),
+                drift_kind = drift.kind(),
+                drift = ?drift,
+                advisory = true,
+                "NVML drift detected"
+            );
+        }
+        let gpus = gpu_statuses(definition, &gpu_snapshot);
+
         Ok(RunnerObservation {
             systemd,
-            probe: Self::update_probe(service, successful, sleeping_level),
+            probe,
             gpus,
         })
     }
@@ -289,9 +526,9 @@ impl Runner for ManagedVllmRunner {
             .await
             .map_err(|error| RunnerError::new(error.to_string()))?;
         *service
-            .commanded_sleep
+            .sleep
             .lock()
-            .expect("sleep-level lock poisoned") = None;
+            .expect("sleep-observation lock poisoned") = SleepObservationState::default();
         Ok(())
     }
 
@@ -302,9 +539,9 @@ impl Runner for ManagedVllmRunner {
             .await
             .map_err(|error| RunnerError::new(error.to_string()))?;
         *service
-            .commanded_sleep
+            .sleep
             .lock()
-            .expect("sleep-level lock poisoned") = None;
+            .expect("sleep-observation lock poisoned") = SleepObservationState::default();
         Ok(())
     }
 
@@ -314,65 +551,60 @@ impl Runner for ManagedVllmRunner {
         level: SleepLevel,
     ) -> Result<(), RunnerError> {
         let service = self.service(&definition.name)?;
-        VllmApi::sleep(&service.vllm, vllm_sleep_level(level))
+        let sleep = *service
+            .sleep
+            .lock()
+            .expect("sleep-observation lock poisoned");
+        service
+            .vllm
+            .sleep_from(
+                sleep.commanded.map(vllm_sleep_level),
+                sleep.observed_sleeping,
+                vllm_sleep_level(level),
+            )
             .await
             .map_err(|error| RunnerError::new(error.to_string()))?;
         *service
-            .commanded_sleep
+            .sleep
             .lock()
-            .expect("sleep-level lock poisoned") = Some(level);
+            .expect("sleep-observation lock poisoned") = SleepObservationState {
+            commanded: Some(level),
+            observed_sleeping: true,
+        };
         Ok(())
     }
 
     async fn wake(
         &self,
         definition: &ServiceDefinition,
-        level: SleepLevel,
+        _level: SleepLevel,
     ) -> Result<(), RunnerError> {
         let service = self.service(&definition.name)?;
-        VllmApi::wake(&service.vllm, vllm_sleep_level(level))
+        let current = service
+            .sleep
+            .lock()
+            .expect("sleep-observation lock poisoned")
+            .commanded;
+        service
+            .vllm
+            .wake_from(current.map(vllm_sleep_level))
             .await
             .map_err(|error| RunnerError::new(error.to_string()))?;
         *service
-            .commanded_sleep
+            .sleep
             .lock()
-            .expect("sleep-level lock poisoned") = None;
+            .expect("sleep-observation lock poisoned") = SleepObservationState::default();
         Ok(())
     }
 
     async fn warmup(&self, definition: &ServiceDefinition) -> Result<(), RunnerError> {
         let service = self.service(&definition.name)?;
-        let Some(configured) = &service.config.warmup else {
+        let Some(request) = vllm_warmup_request(&service.config)? else {
             return Ok(());
         };
-        let prompt = configured
-            .body
-            .get("prompt")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("warmup")
-            .to_string();
-        let max_tokens = configured
-            .body
-            .get("max_tokens")
-            .and_then(serde_json::Value::as_u64)
-            .and_then(|value| u32::try_from(value).ok())
-            .unwrap_or(1);
-        let temperature = configured
-            .body
-            .get("temperature")
-            .and_then(serde_json::Value::as_f64)
-            .unwrap_or(0.0) as f32;
-        VllmApi::warmup(
-            &service.vllm,
-            &VllmWarmupRequest {
-                model: service.config.served_model.clone(),
-                prompt,
-                max_tokens,
-                temperature,
-            },
-        )
-        .await
-        .map_err(|error| RunnerError::new(error.to_string()))
+        VllmApi::warmup(&service.vllm, &request)
+            .await
+            .map_err(|error| RunnerError::new(error.to_string()))
     }
 }
 
@@ -381,6 +613,40 @@ fn vllm_sleep_level(level: SleepLevel) -> VllmSleepLevel {
         SleepLevel::L1 => VllmSleepLevel::L1,
         SleepLevel::L2 => VllmSleepLevel::L2,
     }
+}
+
+fn vllm_timeouts(service: &config::ServiceDefinition) -> VllmTimeouts {
+    VllmTimeouts {
+        probe: Duration::from_millis(service.readiness.timeout_ms),
+        sleep: Duration::from_millis(service.deadlines.drain_ms),
+        wake: Duration::from_millis(service.deadlines.wake_ms),
+        warmup: Duration::from_millis(service.deadlines.startup_ms.max(service.deadlines.wake_ms)),
+    }
+}
+
+fn vllm_warmup_request(
+    service: &config::ServiceDefinition,
+) -> Result<Option<VllmWarmupRequest>, RunnerError> {
+    let Some(configured) = &service.warmup else {
+        return Ok(None);
+    };
+    let body = configured
+        .body
+        .as_object()
+        .cloned()
+        .ok_or_else(|| RunnerError::new("configured warmup body must be a JSON object"))?;
+    Ok(Some(VllmWarmupRequest {
+        path: configured.path.clone(),
+        model: service.served_model.clone(),
+        body,
+    }))
+}
+
+fn reported_sleep_level(commanded: Option<SleepLevel>) -> SleepLevel {
+    // `/is_sleeping` has no level field. Report unknown sleepers as L1 so
+    // capacity accounting reserves the possible pinned host RAM, but do not
+    // write that reporting assumption back into command history.
+    commanded.unwrap_or(SleepLevel::L1)
 }
 
 fn systemd_state(state: &UnitActiveState) -> SystemdState {
@@ -396,9 +662,18 @@ fn systemd_state(state: &UnitActiveState) -> SystemdState {
     }
 }
 
+fn runner_systemd_status(unit: UnitStatus) -> SystemdStatus {
+    SystemdStatus {
+        state: systemd_state(&unit.active_state),
+        sub_state: Some(unit.sub_state),
+        main_pid: unit.main_pid,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gpu::{GpuDevice, GpuDrift, GpuObservation, GpuProcess};
 
     #[test]
     fn maps_validated_service_policy_to_generic_definition() {
@@ -415,5 +690,286 @@ mod tests {
             converted.parking_limit,
             u64::try_from(source.parking.queue_limit).unwrap()
         );
+        assert_eq!(
+            vllm_timeouts(source),
+            VllmTimeouts {
+                probe: Duration::from_millis(source.readiness.timeout_ms),
+                sleep: Duration::from_millis(source.deadlines.drain_ms),
+                wake: Duration::from_millis(source.deadlines.wake_ms),
+                warmup: Duration::from_millis(
+                    source.deadlines.startup_ms.max(source.deadlines.wake_ms)
+                ),
+            }
+        );
+
+        let mut wake_dominates = source.clone();
+        wake_dominates.deadlines.startup_ms = 10;
+        wake_dominates.deadlines.wake_ms = 20;
+        assert_eq!(
+            vllm_timeouts(&wake_dominates).warmup,
+            Duration::from_millis(20)
+        );
+
+        let mut arbitrary_warmup = source.clone();
+        let body = serde_json::json!({
+            "model": "must-be-overridden",
+            "stream": true,
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "warm"}]}],
+            "guided_json": {"type": "object"},
+            "custom": {"nested": [1, 2, 3]}
+        });
+        arbitrary_warmup.warmup.as_mut().unwrap().path = "/v1/chat/completions".into();
+        arbitrary_warmup.warmup.as_mut().unwrap().body = body.clone();
+        let request = vllm_warmup_request(&arbitrary_warmup).unwrap().unwrap();
+        assert_eq!(request.path, "/v1/chat/completions");
+        assert_eq!(request.model, arbitrary_warmup.served_model);
+        assert_eq!(request.body, body.as_object().unwrap().clone());
+    }
+
+    #[test]
+    fn unknown_sleep_level_reports_l1_without_losing_unknown_provenance() {
+        let unknown = None;
+        assert_eq!(reported_sleep_level(unknown), SleepLevel::L1);
+        assert_eq!(unknown, None);
+        assert_eq!(reported_sleep_level(Some(SleepLevel::L1)), SleepLevel::L1);
+        assert_eq!(reported_sleep_level(Some(SleepLevel::L2)), SleepLevel::L2);
+    }
+
+    #[test]
+    fn failed_sleep_observation_preserves_authoritative_sleep_state() {
+        let mut state = SleepObservationState {
+            commanded: Some(SleepLevel::L2),
+            observed_sleeping: true,
+        };
+
+        assert_eq!(state.update(None), Some(2));
+        assert_eq!(
+            state,
+            SleepObservationState {
+                commanded: Some(SleepLevel::L2),
+                observed_sleeping: true,
+            }
+        );
+    }
+
+    #[test]
+    fn awake_sleep_observation_clears_remembered_sleep_state() {
+        let mut state = SleepObservationState {
+            commanded: Some(SleepLevel::L2),
+            observed_sleeping: true,
+        };
+
+        assert_eq!(state.update(Some(false)), None);
+        assert_eq!(state, SleepObservationState::default());
+        assert_eq!(state.update(None), None);
+    }
+
+    #[test]
+    fn failed_sleep_observation_without_history_remains_unknown() {
+        let mut state = SleepObservationState::default();
+
+        assert_eq!(state.update(None), None);
+        assert_eq!(state, SleepObservationState::default());
+    }
+
+    #[test]
+    fn restart_discovered_sleeper_keeps_unknown_command_provenance() {
+        let mut state = SleepObservationState::default();
+
+        assert_eq!(state.update(Some(true)), Some(1));
+        assert_eq!(state.commanded, None);
+        assert!(state.observed_sleeping);
+        assert_eq!(state.update(None), Some(1));
+        assert_eq!(state.commanded, None);
+    }
+
+    #[test]
+    fn healthy_wrong_model_is_distinct_and_probe_age_uses_observation_time() {
+        let observed_at = Instant::now();
+        let mut probe = ProbeDebounce::default();
+
+        let wrong_model = probe.record(true, false, None, 1, 1, observed_at);
+
+        assert!(wrong_model.healthy);
+        assert!(!wrong_model.served_model_matches);
+        assert!(!wrong_model.ready);
+        assert_eq!(wrong_model.consecutive_failures, 1);
+        let later = probe.status_at(observed_at + Duration::from_secs(5));
+        assert_eq!(later.age, Some(Duration::from_secs(5)));
+        assert!(later.age > wrong_model.age);
+    }
+
+    #[test]
+    fn systemd_main_pid_is_carried_into_runner_status() {
+        let status = runner_systemd_status(UnitStatus {
+            name: "vllm@example.service".into(),
+            load_state: "loaded".into(),
+            active_state: UnitActiveState::Active,
+            sub_state: "running".into(),
+            main_pid: Some(4242),
+        });
+
+        assert_eq!(status.state, SystemdState::Active);
+        assert_eq!(status.sub_state.as_deref(), Some("running"));
+        assert_eq!(status.main_pid, Some(4242));
+    }
+
+    #[test]
+    fn expected_gpu_state_combines_reservations_and_allows_managed_main_pids() {
+        let config: RouterConfig =
+            serde_yaml::from_str(include_str!("../config/example.yaml")).unwrap();
+        let awake = config.services[0].clone();
+        let mut sleeping = awake.clone();
+        sleeping.name = "sleeping-replica".into();
+        sleeping.sleep.enabled = true;
+        sleeping.sleep.residual_vram_bytes_per_gpu = 5;
+        let mut missing = awake.clone();
+        missing.name = "missing-replica".into();
+        missing.placement.gpu_uuids = vec!["GPU-missing".into()];
+        let awake_status = SystemdStatus {
+            state: SystemdState::Active,
+            sub_state: Some("running".into()),
+            main_pid: Some(101),
+        };
+        let sleeping_status = SystemdStatus {
+            state: SystemdState::Active,
+            sub_state: Some("running".into()),
+            main_pid: Some(202),
+        };
+
+        let expected = expected_gpu_state([
+            (&awake, Some(awake_status), None),
+            (&sleeping, Some(sleeping_status), Some(1)),
+            (
+                &missing,
+                Some(SystemdStatus {
+                    state: SystemdState::Inactive,
+                    sub_state: Some("dead".into()),
+                    main_pid: None,
+                }),
+                None,
+            ),
+        ]);
+        let uuid = awake.placement.gpu_uuids[0].clone();
+        let usage = &expected.devices[&uuid];
+
+        assert_eq!(
+            usage.maximum_used_memory_bytes,
+            Some(awake.placement.vram_reservation_bytes_per_gpu + 5)
+        );
+        assert_eq!(usage.allowed_compute_pids, BTreeSet::from([101, 202]));
+        assert!(!usage.allow_unexpected_compute_pids);
+
+        let maximum = usage.maximum_used_memory_bytes.unwrap();
+        let observed = [(
+            uuid.clone(),
+            GpuObservation {
+                device: GpuDevice {
+                    uuid: uuid.clone(),
+                    index: 0,
+                    name: "GPU".into(),
+                    total_memory_bytes: maximum + 100,
+                },
+                used_memory_bytes: maximum + 1,
+                free_memory_bytes: 99,
+                reserved_memory_bytes: 0,
+                compute_processes: [101, 202, 999]
+                    .into_iter()
+                    .map(|pid| GpuProcess {
+                        pid,
+                        used_memory_bytes: None,
+                    })
+                    .collect(),
+            },
+        )]
+        .into();
+        let drift = crate::gpu::detect_drift(&observed, &expected);
+        assert!(drift.contains(&GpuDrift::MemoryReservationExceeded {
+            uuid: uuid.clone(),
+            observed_bytes: maximum + 1,
+            maximum_bytes: maximum,
+        }));
+        assert!(drift.contains(&GpuDrift::UnexpectedComputeProcess {
+            uuid: uuid.clone(),
+            pid: 999,
+        }));
+        assert!(!drift.iter().any(|drift| matches!(
+            drift,
+            GpuDrift::UnexpectedComputeProcess { pid: 101 | 202, .. }
+        )));
+        assert!(drift.contains(&GpuDrift::MissingGpu {
+            uuid: "GPU-missing".into(),
+        }));
+
+        let unknown = expected_gpu_state([(&awake, None, None)]);
+        let unknown_usage = &unknown.devices[&awake.placement.gpu_uuids[0]];
+        assert_eq!(unknown_usage.maximum_used_memory_bytes, None);
+        assert!(unknown_usage.allow_unexpected_compute_pids);
+    }
+
+    #[test]
+    fn managed_gpu_status_exposes_memory_process_and_missing_drift() {
+        let config: RouterConfig =
+            serde_yaml::from_str(include_str!("../config/example.yaml")).unwrap();
+        let mut definition = pool_definition(&config.services[0]);
+        definition.gpu_ids.push("GPU-missing".into());
+        let uuid = definition.gpu_ids[0].clone();
+        let observed = GpuObservation {
+            device: GpuDevice {
+                uuid: uuid.clone(),
+                index: 0,
+                name: "GPU".into(),
+                total_memory_bytes: 100,
+            },
+            used_memory_bytes: 90,
+            free_memory_bytes: 10,
+            reserved_memory_bytes: 0,
+            compute_processes: vec![
+                GpuProcess {
+                    pid: 101,
+                    used_memory_bytes: Some(80),
+                },
+                GpuProcess {
+                    pid: 999,
+                    used_memory_bytes: Some(10),
+                },
+            ],
+        };
+        let snapshot = GpuSnapshot {
+            available: true,
+            unavailable_reason: None,
+            devices: [(uuid.clone(), observed)].into(),
+            drift: vec![
+                GpuDrift::MemoryReservationExceeded {
+                    uuid: uuid.clone(),
+                    observed_bytes: 90,
+                    maximum_bytes: 80,
+                },
+                GpuDrift::UnexpectedComputeProcess {
+                    uuid: uuid.clone(),
+                    pid: 999,
+                },
+                GpuDrift::MissingGpu {
+                    uuid: "GPU-missing".into(),
+                },
+            ],
+        };
+
+        let statuses = gpu_statuses(&definition, &snapshot);
+        let present = statuses.iter().find(|status| status.uuid == uuid).unwrap();
+        assert_eq!(present.process_ids, [101, 999]);
+        assert!(!present.healthy);
+        assert_eq!(present.drift.len(), 2);
+        let missing = statuses
+            .iter()
+            .find(|status| status.uuid == "GPU-missing")
+            .unwrap();
+        assert_eq!(
+            missing.drift,
+            vec![GpuDrift::MissingGpu {
+                uuid: "GPU-missing".into()
+            }]
+        );
+        assert!(!missing.healthy);
     }
 }
