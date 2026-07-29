@@ -20,7 +20,16 @@ graph LR
     RUN --> MH
 ```
 
-## 1. Additional runners (llama.cpp first)
+## 1. Additional runners (llama.cpp first — priority under review)
+
+> **Priority note (2026-07-29):** the operator's first *concrete* non-vLLM need is a
+> diffusers/DiT image-generation runner — `Qwen/Qwen-Image` (`QwenImagePipeline`,
+> 54 GB) is downloaded and cannot be served by vLLM, so it has no v1 service
+> definition at all. A diffusers-style runner may deserve to jump ahead of
+> llama.cpp; conveniently it is also the runner class with native per-GPU
+> `max_memory` splits (§4). Until then, image generation runs outside the router as
+> an unmanaged unit — which contends with router-owned GPUs and shows up as
+> (advisory) drift, so it should get a carved-out GPU or wait for the runner.
 
 The v1 architecture already isolates runner specifics behind the `Runner` adapter
 (commands, readiness probes, API capabilities, sleep/wake behavior); the pool manager
