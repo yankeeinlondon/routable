@@ -123,6 +123,13 @@ US7); v2 extends it with the occupancy-aware ledger and planner below.
 | **US9 — GPU power stewardship** | a GPU has no residents | let it reach deep idle / lower its power limit; restore before the next placement | v2 (verify NVML write perms in the LXC) |
 | **US10 — predictive warm-up** | recurring demand patterns (e.g. weekday mornings) | optionally pre-wake models on schedule so the first request isn't cold | speculative, uncommitted |
 
+Each catalog row is deliberately shaped as an acceptance criterion ("given this
+scenario, this behavior") so the v2 plan's test matrix derives mechanically from this
+table. Per-profile VRAM truth, cold-start cost, and throughput measured during v1
+on-box acceptance (and recorded per the `docs/{model-id}.md` convention) are the
+planner's input data — keep those measurements, they are v2 inputs, not throwaway
+validation.
+
 ### Mechanics
 
 - **Budget ledger:** at placement time compute per-GPU free budget = capacity − awake
@@ -201,6 +208,10 @@ Eligible for a v1.x patch rather than v2 if convenient:
   become a demand-eviction candidate only after an agreed idle period; `idle_for`
   stays the LRU tie-breaker. Small change (one eligibility condition + config field),
   meaningful protection.
+- **Shape the review-2 CO1 allowlist fix as a per-service capability lookup**, not
+  another global list: the same code becomes the per-service endpoint capability set
+  that heterogeneous runners require (§1), so v2 inherits the right structure for
+  free.
 - **Dialect-aware router error envelopes** (review-2 CO2): router-generated errors on
   `/v1/messages` should use Anthropic's error shape; Cohere-style endpoints likewise.
 - **Multipart model extraction** so audio transcription/translation endpoints become
