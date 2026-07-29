@@ -78,16 +78,19 @@ Then lay down the runtime files:
 | `/run/secrets/vllm-router-token` | management bearer token, root-owned, mode `0600` |
 | `/etc/systemd/system/vllm@.service` | model unit template — from `deploy/vllm@.service` |
 | `/etc/systemd/system/vllm-router.service` | the router itself — from `deploy/vllm-router.service` |
-| `/etc/vllm/<name>.env` | per-model environment file consumed by `vllm@<name>.service` |
+| `/etc/vllm/<name>.env` | generated per-model environment file consumed by `vllm@<name>.service` |
 
-Each model's `.env` file supplies what the unit template runs
-(`vllm serve ${MODEL_PATH} $VLLM_ARGS`):
+The router regenerates each model unit and its mode-`0600` environment file at
+startup. Global `environment:` defaults in `router.yaml` are inherited by every
+service; a service-level `environment:` map overrides individual values. The schema
+allowlists `PATH`, `HF_HOME`, and `VLLM_CACHE_ROOT`. GPU placement variables are
+owned by the generator: UUID assignments are translated through NVML to numeric
+`CUDA_VISIBLE_DEVICES`, with `CUDA_DEVICE_ORDER=PCI_BUS_ID`.
 
-```bash
-# /etc/vllm/example-30b.env  (mode 0600)
-MODEL_PATH=/srv/models/example-30b
-VLLM_ARGS=--port 8100 --served-model-name example/model-30b --gpu-memory-utilization 0.9
-```
+Tool and reasoning parsers are chat-template-specific, not merely model-family
+defaults. Configure `runner_args.tool-call-parser` and
+`runner_args.reasoning-parser` using names registered by the installed vLLM version;
+the example Qwen template uses `qwen3_xml` and `qwen3`.
 
 Validate everything, then start:
 
@@ -132,7 +135,8 @@ complete, commented service:
 - **`services`** — one entry per model server: served model name + aliases, GPU
   assignment and parallelism, absolute `runner_executable` path, backend loopback port,
   systemd unit, readiness probes, deadlines, idle tiers (`sleep_l1_after_ms` →
-  `sleep_l2_after_ms` → `stop_after_ms`), parking policy, priority/evictability, and
+  `sleep_l2_after_ms` → `stop_after_ms`), short-parking policy,
+  priority/evictability, and
   sleep settings. Sleep stays off unless the service is explicitly marked
   `hardware_validated: true`. If omitted, `runner_executable` defaults to
   `/opt/vllm-venv/bin/vllm` for compatibility with existing deployments.
@@ -176,8 +180,11 @@ shape.
 
 Notable statuses: `400` malformed JSON / missing model, `404` unknown model, `413` body
 over the configured limit, `503` + `Retry-After` when parking capacity or the parking
-deadline is exhausted. A cold model does **not** error by default — the request parks
-until the model is ready or the service's `parking.deadline_ms` expires.
+deadline is exhausted. The default parking window is about 20 seconds: fast wakes
+complete transparently, while a true cold start returns a progress-bearing 503 and
+continues warming in the background so a later retry lands warm. Configure
+`parking.deadline_ms` per service for longer scripted waits, and set
+`retry_after_seconds` to an honest typical startup estimate.
 
 ### Control (management listener, default `127.0.0.1:6970`)
 
@@ -245,6 +252,10 @@ vllm-router -c <pingora.yaml> [--router-config <router.yaml>] [-t] [-u]
   point and let it start once before starting any model service. Do not independently
   enable generated model units for boot; they do not exist until router initialization
   regenerates them and completes the systemd reload.
+- **Environment drop-ins are the escape hatch.** If the allowlisted config schema
+  does not model a required host variable, use a narrowly scoped systemd drop-in
+  under `/etc/systemd/system/<unit>.d/` (or a template drop-in for every instance).
+  Keep GPU placement variables out of drop-ins; the generator owns them.
 - **Router restart/upgrade never stops healthy models.** For zero-downtime binary
   upgrades, start the new binary with `-u` (after it passes `-t`) and send `SIGQUIT` to
   the old one; listeners hand over via the upgrade socket and in-flight streams drain

@@ -18,6 +18,11 @@ policies:
   inter_chunk_timeout_ms: 120000
   max_awake_owners_per_gpu: 1
 
+environment:
+  PATH: /opt/vllm-venv/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+  HF_HOME: /srv/huggingface
+  VLLM_CACHE_ROOT: /srv/vllm-cache
+
 services:
   - name: example-30b
     enabled: true
@@ -32,8 +37,11 @@ services:
       trust_remote_code: false
     quantization: modelopt
     runner_args:
+      enable-auto-tool-choice: true
       enable-prefix-caching: true
       max-num-seqs: 32
+      reasoning-parser: qwen3
+      tool-call-parser: qwen3_xml
     placement:
       gpu_uuids: [GPU-00000000-0000-0000-0000-000000000001]
       tensor_parallelism: 1
@@ -81,9 +89,9 @@ services:
     idle:
       stop_after_ms: 3600000
     parking:
-      deadline_ms: 300000
+      deadline_ms: 20000
       queue_limit: 64
-      retry_after_seconds: 30
+      retry_after_seconds: 120
     priority: 0
     evictable: true
     automatic_start: true

@@ -20,6 +20,7 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tokio::runtime::Handle;
 use tokio::sync::{Mutex, watch};
 use uuid::Uuid;
 
@@ -275,6 +276,9 @@ pub struct RunnerObservation {
     pub systemd: SystemdStatus,
     pub probe: ProbeStatus,
     pub gpus: Vec<GpuStatus>,
+    /// Set once HTTP readiness is reached but NVML shows the unit MainPID on
+    /// GPUs other than exactly those assigned to the service.
+    pub placement_error: Option<String>,
 }
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
@@ -395,6 +399,10 @@ impl<R> Clone for Pool<R> {
 
 struct PoolInner<R> {
     runner: Arc<R>,
+    /// Detached lifecycle work stays on the runtime where the pool was
+    /// constructed. In production that runtime lives for the whole process,
+    /// independent of Pingora's service runtimes and their shutdown.
+    task_runtime: Option<Handle>,
     state: StateStore,
     services: HashMap<String, Arc<ServiceEntry>>,
     /// Arrival-ordered demands. Only overlapping GPU sets constrain one another.
@@ -413,6 +421,8 @@ struct ServiceEntry {
     admission: Mutex<()>,
     flight: Mutex<Option<Flight>>,
     failures: AtomicU32,
+    /// Generation whose failure cleanup is currently armed, or zero.
+    backoff_generation: AtomicU64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -474,12 +484,14 @@ impl<R: Runner + 'static> Pool<R> {
                     admission: Mutex::new(()),
                     flight: Mutex::new(None),
                     failures: AtomicU32::new(0),
+                    backoff_generation: AtomicU64::new(0),
                 }),
             );
         }
         Ok(Self {
             inner: Arc::new(PoolInner {
                 runner: Arc::new(runner),
+                task_runtime: Handle::try_current().ok(),
                 state,
                 services,
                 placement_queue: Mutex::new(VecDeque::new()),
@@ -639,6 +651,9 @@ impl<R: Runner + 'static> Pool<R> {
                 }
             };
             let activity = entry.activity.snapshot();
+            let recovery_is_pending =
+                entry.backoff_generation.load(Ordering::Acquire) == current.generation;
+            let observed_inactive = observation.systemd.state == SystemdState::Inactive;
             self.inner.state.update_if_current(
                 service,
                 current.generation,
@@ -651,6 +666,11 @@ impl<R: Runner + 'static> Pool<R> {
                         status.active_requests = activity.active;
                         status.parked_requests = activity.parked;
                         status.idle_for = activity.idle_for;
+                        if observed_inactive && !recovery_is_pending {
+                            status.lifecycle = Lifecycle::Stopped;
+                            status.probe.ready = false;
+                            status.probe.healthy = false;
+                        }
                     }
                 },
             );
@@ -689,6 +709,7 @@ impl<R: Runner + 'static> Pool<R> {
             }
         };
         let activity = entry.activity.snapshot();
+        let placement_error = observation.placement_error.clone();
         self.inner
             .state
             .update_if_current(service, generation, Some(operation_id), |status| {
@@ -703,7 +724,7 @@ impl<R: Runner + 'static> Pool<R> {
                 status.active_requests = activity.active;
                 status.parked_requests = activity.parked;
                 status.idle_for = activity.idle_for;
-                status.last_error = None;
+                status.last_error = placement_error;
             });
         self.current_status(service)
     }
@@ -901,7 +922,7 @@ impl<R: Runner + 'static> Pool<R> {
         let pool = self.clone();
         let service_name = service.to_string();
         let task_affected_requests = affected_requests.clone();
-        tokio::spawn(async move {
+        let task = async move {
             let outcome = task(pool.clone(), operation_id, task_affected_requests).await;
             let entry = pool
                 .inner
@@ -917,7 +938,12 @@ impl<R: Runner + 'static> Pool<R> {
             }
             drop(slot);
             sender.send_replace(FlightResult::Complete(Box::new(outcome)));
-        });
+        };
+        if let Some(runtime) = &self.inner.task_runtime {
+            runtime.spawn(task);
+        } else {
+            tokio::spawn(task);
+        }
         Ok(TransitionHandle {
             operation_id,
             service: service.to_string(),
@@ -1000,8 +1026,7 @@ impl<R: Runner + 'static> Pool<R> {
         let runner_result = runner_result
             .and_then(|result| result.map_err(|error| self.runner_error(service, error)));
         if let Err(error) = runner_result {
-            self.record_failure(service, generation, operation_id, &error);
-            self.schedule_backoff(service, operation_id);
+            self.record_failure_and_schedule_backoff(service, generation, operation_id, &error);
             return Err(error);
         }
 
@@ -1011,8 +1036,7 @@ impl<R: Runner + 'static> Pool<R> {
         {
             Ok(observation) => observation,
             Err(error) => {
-                self.record_failure(service, generation, operation_id, &error);
-                self.schedule_backoff(service, operation_id);
+                self.record_failure_and_schedule_backoff(service, generation, operation_id, &error);
                 return Err(error);
             }
         };
@@ -1025,8 +1049,7 @@ impl<R: Runner + 'static> Pool<R> {
         .await
         .and_then(|result| result.map_err(|error| self.runner_error(service, error)));
         if let Err(error) = warmup_result {
-            self.record_failure(service, generation, operation_id, &error);
-            self.schedule_backoff(service, operation_id);
+            self.record_failure_and_schedule_backoff(service, generation, operation_id, &error);
             return Err(error);
         }
 
@@ -1267,6 +1290,12 @@ impl<R: Runner + 'static> Pool<R> {
                 && observation.probe.healthy
                 && observation.probe.served_model_matches
             {
+                if let Some(message) = &observation.placement_error {
+                    return Err(PoolError::Runner {
+                        service: service.to_string(),
+                        message: message.clone(),
+                    });
+                }
                 return Ok(observation);
             }
             tokio::time::sleep(
@@ -1448,8 +1477,7 @@ impl<R: Runner + 'static> Pool<R> {
                     },
                 );
             } else {
-                self.record_failure(service, generation, operation_id, &error);
-                self.schedule_backoff(service, operation_id);
+                self.record_failure_and_schedule_backoff(service, generation, operation_id, &error);
             }
             return Err(error);
         }
@@ -1536,8 +1564,7 @@ impl<R: Runner + 'static> Pool<R> {
                     },
                 );
             } else {
-                self.record_failure(service, generation, operation_id, &error);
-                self.schedule_backoff(service, operation_id);
+                self.record_failure_and_schedule_backoff(service, generation, operation_id, &error);
             }
             return Err(error);
         }
@@ -1557,25 +1584,43 @@ impl<R: Runner + 'static> Pool<R> {
         self.current_status(service)
     }
 
-    fn record_failure(
+    fn record_failure_and_schedule_backoff(
         &self,
         service: &str,
         generation: u64,
         operation_id: Uuid,
         error: &PoolError,
     ) {
-        if let Some(entry) = self.inner.services.get(service) {
-            entry.failures.fetch_add(1, Ordering::AcqRel);
+        let Some(entry) = self.inner.services.get(service) else {
+            return;
+        };
+        // Publish the recovery intent before Failed becomes observable so
+        // reconciliation cannot mistake the handoff to the backoff task for an
+        // orphaned failure.
+        entry
+            .backoff_generation
+            .store(generation, Ordering::Release);
+        let recorded =
+            self.inner
+                .state
+                .update_if_current(service, generation, Some(operation_id), |status| {
+                    status.lifecycle = Lifecycle::Failed;
+                    status.last_error = Some(error.to_string());
+                });
+        if !recorded {
+            let _ = entry.backoff_generation.compare_exchange(
+                generation,
+                0,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+            return;
         }
-        self.inner
-            .state
-            .update_if_current(service, generation, Some(operation_id), |status| {
-                status.lifecycle = Lifecycle::Failed;
-                status.last_error = Some(error.to_string());
-            });
+        entry.failures.fetch_add(1, Ordering::AcqRel);
+        self.schedule_backoff(service, generation, operation_id);
     }
 
-    fn schedule_backoff(&self, service: &str, failed_operation: Uuid) {
+    fn schedule_backoff(&self, service: &str, generation: u64, failed_operation: Uuid) {
         let Some(entry) = self.inner.services.get(service).cloned() else {
             return;
         };
@@ -1592,16 +1637,34 @@ impl<R: Runner + 'static> Pool<R> {
         let backoff = backoff.mul_f64(0.8 + rand::random::<f64>() * 0.4);
         let pool = self.clone();
         let service = service.to_string();
-        tokio::spawn(async move {
+        let task = async move {
+            struct PendingBackoff {
+                generation: u64,
+                marker: Arc<ServiceEntry>,
+            }
+            impl Drop for PendingBackoff {
+                fn drop(&mut self) {
+                    let _ = self.marker.backoff_generation.compare_exchange(
+                        self.generation,
+                        0,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    );
+                }
+            }
+            let _pending = PendingBackoff {
+                generation,
+                marker: entry.clone(),
+            };
             let Some(failed) = pool.inner.state.status(&service) else {
                 return;
             };
             if failed.operation_id != Some(failed_operation)
+                || failed.generation != generation
                 || failed.lifecycle != Lifecycle::Failed
             {
                 return;
             }
-            let generation = failed.generation;
             pool.inner.state.update_if_current(
                 &service,
                 generation,
@@ -1609,6 +1672,15 @@ impl<R: Runner + 'static> Pool<R> {
                 |status| status.lifecycle = Lifecycle::Backoff,
             );
             tokio::time::sleep(backoff).await;
+            let Some(backoff_status) = pool.inner.state.status(&service) else {
+                return;
+            };
+            if backoff_status.generation != generation
+                || backoff_status.operation_id != Some(failed_operation)
+                || backoff_status.lifecycle != Lifecycle::Backoff
+            {
+                return;
+            }
             let stopped = tokio::time::timeout(
                 entry.definition.stop_deadline,
                 pool.inner.runner.stop(&entry.definition, true),
@@ -1653,7 +1725,12 @@ impl<R: Runner + 'static> Pool<R> {
                     );
                 }
             }
-        });
+        };
+        if let Some(runtime) = &self.inner.task_runtime {
+            runtime.spawn(task);
+        } else {
+            tokio::spawn(task);
+        }
     }
 }
 
@@ -1833,6 +1910,7 @@ fn lifecycle_from_observation(observation: &RunnerObservation) -> Lifecycle {
         SystemdState::Active => match observation.probe.sleeping_level {
             Some(1) => Lifecycle::AsleepL1,
             Some(2) => Lifecycle::AsleepL2,
+            _ if observation.placement_error.is_some() => Lifecycle::Failed,
             _ if observation.probe.ready
                 && observation.probe.healthy
                 && observation.probe.served_model_matches =>
@@ -2036,6 +2114,7 @@ mod tests {
                         drift: Vec::new(),
                     })
                     .collect(),
+                placement_error: None,
             })
         }
 
@@ -3324,6 +3403,60 @@ mod tests {
         assert_eq!(stopped.generation, failure.generation);
         assert_eq!(stopped.operation_id, failure.operation_id);
         assert_eq!(stops.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn overlapping_failure_generations_converge_to_stopped() {
+        let runner = MockRunner::new(&["a"], &[]);
+        let stops = runner.stops.clone();
+        let mut service = definition("a", "gpu-0");
+        service.backoff_initial = Duration::from_millis(40);
+        service.backoff_max = Duration::from_millis(40);
+        let pool = reconciled_pool(vec![service], runner).await;
+        let first_operation = Uuid::new_v4();
+        let first_generation = pool
+            .inner
+            .state
+            .begin_transition("a", Lifecycle::Starting, first_operation)
+            .unwrap();
+        pool.record_failure_and_schedule_backoff(
+            "a",
+            first_generation,
+            first_operation,
+            &PoolError::Runner {
+                service: "a".into(),
+                message: "first failure".into(),
+            },
+        );
+
+        let second_operation = Uuid::new_v4();
+        let second_generation = pool
+            .inner
+            .state
+            .begin_transition("a", Lifecycle::Starting, second_operation)
+            .unwrap();
+        pool.record_failure_and_schedule_backoff(
+            "a",
+            second_generation,
+            second_operation,
+            &PoolError::Runner {
+                service: "a".into(),
+                message: "second failure".into(),
+            },
+        );
+
+        let stopped =
+            wait_for_status(&pool, "a", |status| status.lifecycle == Lifecycle::Stopped).await;
+        assert_eq!(stopped.generation, second_generation);
+        assert_eq!(stopped.operation_id, Some(second_operation));
+        assert_eq!(stops.load(Ordering::Acquire), 1);
+        assert_eq!(
+            pool.entry("a")
+                .unwrap()
+                .backoff_generation
+                .load(Ordering::Acquire),
+            0
+        );
     }
 
     #[tokio::test]

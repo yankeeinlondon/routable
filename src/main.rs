@@ -104,25 +104,43 @@ impl BackgroundService for PoolBackground {
                     }
                 }
                 _ = ticker.tick() => {
-                    for result in self.pool.reconcile_all().await {
-                        if let Err(error) = result {
-                            if should_warn_reconciliation_error(&error) {
-                                warn!(error = %error, "service reconciliation failed");
-                            } else {
-                                debug!(
-                                    error = %error,
-                                    "service reconciliation deferred during lifecycle transition"
-                                );
+                    // A managed observation can be inside D-Bus, NVML, or a
+                    // readiness probe when shutdown begins. Keep the entire
+                    // tick cancellable so Pingora never has to wait for that
+                    // external I/O before its background runtime can exit.
+                    tokio::select! {
+                        biased;
+                        changed = shutdown.changed() => {
+                            if changed.is_err() || *shutdown.borrow() {
+                                break;
                             }
                         }
-                    }
-                    self.pool.reap_idle_once().await;
-                    match self.pool.status(Default::default()).await {
-                        Ok(status) => publish_state_metrics(&status.services),
-                        Err(error) => error!(error = %error, "pool status collection failed"),
+                        _ = self.tick() => {}
                     }
                 }
             }
+        }
+    }
+}
+
+impl PoolBackground {
+    async fn tick(&self) {
+        for result in self.pool.reconcile_all().await {
+            if let Err(error) = result {
+                if should_warn_reconciliation_error(&error) {
+                    warn!(error = %error, "service reconciliation failed");
+                } else {
+                    debug!(
+                        error = %error,
+                        "service reconciliation deferred during lifecycle transition"
+                    );
+                }
+            }
+        }
+        self.pool.reap_idle_once().await;
+        match self.pool.status(Default::default()).await {
+            Ok(status) => publish_state_metrics(&status.services),
+            Err(error) => error!(error = %error, "pool status collection failed"),
         }
     }
 }

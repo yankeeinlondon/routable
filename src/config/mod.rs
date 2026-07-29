@@ -22,6 +22,9 @@ pub struct RouterConfig {
     pub inventory: Inventory,
     #[serde(default)]
     pub policies: RouterPolicies,
+    /// Host environment defaults inherited by every generated runner service.
+    #[serde(default)]
+    pub environment: BTreeMap<String, String>,
     pub services: Vec<ServiceDefinition>,
 }
 
@@ -183,6 +186,9 @@ pub struct ServiceDefinition {
     pub quantization: Option<String>,
     #[serde(default)]
     pub runner_args: BTreeMap<String, RunnerArgValue>,
+    /// Service-specific runner environment. Values override global defaults.
+    #[serde(default)]
+    pub environment: BTreeMap<String, String>,
     pub placement: Placement,
     pub backend: Backend,
     pub systemd: SystemdConfig,
@@ -386,9 +392,9 @@ pub struct ParkingConfig {
 impl Default for ParkingConfig {
     fn default() -> Self {
         Self {
-            deadline_ms: 300_000,
+            deadline_ms: 20_000,
             queue_limit: 64,
-            retry_after_seconds: 30,
+            retry_after_seconds: 120,
         }
     }
 }
@@ -536,6 +542,7 @@ fn validate_policies(policies: &RouterPolicies, errors: &mut Vec<String>) {
 }
 
 fn validate_services(config: &RouterConfig, errors: &mut Vec<String>) {
+    validate_environment(&config.environment, "environment", errors);
     if config.services.is_empty() {
         errors.push("services must contain at least one service definition".into());
         return;
@@ -617,6 +624,11 @@ fn validate_services(config: &RouterConfig, errors: &mut Vec<String>) {
             ));
         }
         validate_runner_args(service, &location, errors);
+        validate_environment(
+            &service.environment,
+            &format!("{location}.environment"),
+            errors,
+        );
         validate_readiness(service, &location, errors);
         validate_timing(service, &location, config, errors);
         validate_sleep(service, &location, errors);
@@ -802,6 +814,21 @@ fn validate_systemd(service: &ServiceDefinition, location: &str, errors: &mut Ve
         &format!("{location}.systemd.environment_file"),
         errors,
     );
+    match service.systemd.environment_file.to_str() {
+        Some(path)
+            if path
+                .bytes()
+                .any(|byte| byte.is_ascii_whitespace() || b"\\\"'%".contains(&byte)) =>
+        {
+            errors.push(format!(
+                "{location}.systemd.environment_file must be safe for a bare EnvironmentFile= directive"
+            ));
+        }
+        Some(_) => {}
+        None => errors.push(format!(
+            "{location}.systemd.environment_file must be valid UTF-8"
+        )),
+    }
 }
 
 fn validate_runner_args(service: &ServiceDefinition, location: &str, errors: &mut Vec<String>) {
@@ -831,7 +858,9 @@ fn validate_runner_args(service: &ServiceDefinition, location: &str, errors: &mu
         "seed",
         "speculative-config",
         "swap-space",
+        "tool-call-parser",
         "tokenizer-revision",
+        "reasoning-parser",
     ];
     const BOOL_ARGS: &[&str] = &[
         "disable-log-requests",
@@ -892,6 +921,143 @@ fn validate_runner_args(service: &ServiceDefinition, location: &str, errors: &mu
                     errors,
                 );
             }
+        }
+        if name == "tool-call-parser" {
+            validate_parser_value(
+                value,
+                TOOL_CALL_PARSERS,
+                &format!("{location}.runner_args.tool-call-parser"),
+                errors,
+            );
+        }
+        if name == "reasoning-parser" {
+            validate_parser_value(
+                value,
+                REASONING_PARSERS,
+                &format!("{location}.runner_args.reasoning-parser"),
+                errors,
+            );
+        }
+    }
+}
+
+// Keep these synchronized with ToolParserManager.list_registered(), which is
+// surfaced by `vllm serve --help=all` for --tool-call-parser.
+const TOOL_CALL_PARSERS: &[&str] = &[
+    "apertus",
+    "cohere_command3",
+    "cohere_command4",
+    "deepseek_v3",
+    "deepseek_v31",
+    "deepseek_v32",
+    "deepseek_v4",
+    "ernie45",
+    "functiongemma",
+    "gemma4",
+    "gigachat3",
+    "glm45",
+    "glm47",
+    "granite",
+    "granite-20b-fc",
+    "granite4",
+    "hermes",
+    "hunyuan_a13b",
+    "hy_v3",
+    "inkling",
+    "internlm",
+    "jamba",
+    "kimi_k2",
+    "lfm2",
+    "llama3_json",
+    "llama4_json",
+    "llama4_pythonic",
+    "longcat",
+    "mimo",
+    "minicpm5",
+    "minimax_m2",
+    "minimax_m3",
+    "mistral",
+    "olmo3",
+    "openai",
+    "phi4_mini_json",
+    "poolside_v1",
+    "pythonic",
+    "qwen3_coder",
+    "qwen3_xml",
+    "seed_oss",
+    "step3",
+    "step3p5",
+    "xlam",
+];
+
+// Keep these synchronized with ReasoningParserManager.list_registered() in
+// `vllm.reasoning`.
+const REASONING_PARSERS: &[&str] = &[
+    "cohere_command3",
+    "cohere_command4",
+    "deepseek_r1",
+    "deepseek_v3",
+    "deepseek_v4",
+    "ernie45",
+    "gemma4",
+    "glm45",
+    "glm47",
+    "granite",
+    "holo2",
+    "hunyuan_a13b",
+    "hy_v3",
+    "inkling",
+    "kimi_k2",
+    "mimo",
+    "minimax_m2",
+    "minimax_m2_append_think",
+    "minimax_m3",
+    "mistral",
+    "nemotron_v3",
+    "olmo3",
+    "openai_gptoss",
+    "poolside_v1",
+    "qwen3",
+    "seed_oss",
+    "step3",
+    "step3p5",
+];
+
+fn validate_parser_value(
+    value: &RunnerArgValue,
+    registry: &[&str],
+    location: &str,
+    errors: &mut Vec<String>,
+) {
+    match value {
+        RunnerArgValue::String(value) if registry.contains(&value.as_str()) => {}
+        RunnerArgValue::String(value) => errors.push(format!(
+            "{location} value {value:?} is not registered by this vLLM version"
+        )),
+        _ => errors.push(format!(
+            "{location} must be a string naming a registered vLLM parser"
+        )),
+    }
+}
+
+fn validate_environment(
+    environment: &BTreeMap<String, String>,
+    location: &str,
+    errors: &mut Vec<String>,
+) {
+    const ALLOWED: &[&str] = &["HF_HOME", "PATH", "VLLM_CACHE_ROOT"];
+
+    for (name, value) in environment {
+        if !ALLOWED.contains(&name.as_str()) {
+            errors.push(format!(
+                "{location}.{name} is not allowlisted; allowed variables are {}",
+                ALLOWED.join(", ")
+            ));
+        }
+        if value.chars().any(char::is_control) {
+            errors.push(format!(
+                "{location}.{name} contains a forbidden control character"
+            ));
         }
     }
 }

@@ -51,10 +51,9 @@ openssl rand -hex 32 > /run/secrets/vllm-router-token
 vllm-router -t -c deploy/pingora.yaml --router-config /etc/vllm-router/router.yaml
 ```
 
-Note while configuring: check whether the generated environment can carry
-`VLLM_CACHE_ROOT` so services reuse `/models/vllm/torch_compile_cache` — if the
-generator's env is fully fixed, cold starts pay full compile each time (candidate
-small gap; record what you find).
+Set global `environment:` defaults for the CUDA toolchain `PATH`, `HF_HOME`, and
+`VLLM_CACHE_ROOT`; inspect the generated service env to confirm the values and numeric
+`CUDA_VISIBLE_DEVICES` are present.
 
 ## Tier 3 — single-model smoke (first real end-to-end)
 
@@ -63,9 +62,12 @@ Run the router in the foreground first (`RUST_LOG=info`), systemd unit later.
 1. `curl :6970/livez` and `/readyz` — ready via automatic-start reachability.
 2. `curl -H "Authorization: Bearer $TOKEN" :6970/pool/v1/services | jq` — service
    `stopped`, real GPU observations, probe ages.
-3. **Cold start + parking:** `time curl :6969/v1/chat/completions -d '{"model":…}'` —
-   request parks, unit starts (`journalctl -u vllm@<name> -f`), answer arrives after
-   readiness + warmup. Second request is warm and fast.
+3. **Cold start + short parking:** `time curl :6969/v1/chat/completions -d
+   '{"model":…}'` — the request parks briefly while the unit starts
+   (`journalctl -u vllm@<name> -f`). Fast wakes return the answer directly; a true
+   cold start returns a progress-reporting 503 with `Retry-After` when the short
+   parking deadline expires. The detached start must continue, and a retry after
+   readiness is warm and fast.
 4. **Streaming:** `curl -N … "stream": true` — tokens arrive incrementally; check
    `vllm_router_active_streams` on `:6971/metrics` during the stream.
 5. `/v1/models` lists **exactly one entry per unique served model** (canonical `id`,
@@ -74,6 +76,10 @@ Run the router in the foreground first (`RUST_LOG=info`), systemd unit later.
    a generated answer end-to-end** (exercises `--served-model-name` alias rendering
    — review-3 F1); unknown model → OpenAI-shaped 404;
    `/v1/messages` bad request → Anthropic-shaped error.
+   Then run `just tool-smoke <canonical-or-alias>`: it must produce at least one
+   structured `tool_calls` entry, non-empty separated `reasoning` (or the older
+   `reasoning_content` spelling), and no leaked `<think>` tag in `content`
+   (review-3 F9).
 6. **Idle tier:** set `idle.stop_after_ms` low (e.g. 120000), watch the reaper drain
    and stop via `/pool/v1/services` + `vllm_router_transitions_total`.
 7. Admin surface: `POST /pool/v1/services/<name>/stop` with deadline; operation ID

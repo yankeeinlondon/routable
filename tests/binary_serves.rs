@@ -11,10 +11,13 @@ use std::{
 
 use tempfile::TempDir;
 use uuid::Uuid;
-use vllm_router::config::RouterConfig;
+use vllm_router::{
+    config::{GpuDefinition, RouterConfig},
+    gpu::GpuInventory,
+};
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 
 struct HostFixture {
     child: Option<Child>,
@@ -162,9 +165,14 @@ fn binary_actually_serves() {
         thread::sleep(Duration::from_millis(50));
     }
 
+    let shutdown_started = Instant::now();
     let status = fixture
         .stop_with_sigterm()
         .expect("router should stop after SIGTERM");
+    assert!(
+        shutdown_started.elapsed() < SHUTDOWN_TIMEOUT,
+        "router exceeded the bounded SIGTERM shutdown window"
+    );
     assert!(status.success(), "router exited unsuccessfully: {status}");
     fixture
         .cleanup_generated_unit()
@@ -186,6 +194,16 @@ fn write_configs(directory: &Path, unit_name: &str, ports: &[u16]) -> (PathBuf, 
 
     let mut config: RouterConfig =
         serde_yaml::from_str(include_str!("../src/config/example.yaml")).unwrap();
+    let gpu = GpuInventory::initialize()
+        .inventory()
+        .expect("host test requires a live NVML inventory")
+        .into_values()
+        .next()
+        .expect("host test requires at least one GPU");
+    config.inventory.gpus = vec![GpuDefinition {
+        uuid: gpu.uuid.clone(),
+        vram_capacity_bytes: gpu.total_memory_bytes,
+    }];
     config.listeners.data_plane = SocketAddr::from(([127, 0, 0, 1], ports[0]));
     config.listeners.management = SocketAddr::from(([127, 0, 0, 1], ports[1]));
     config.listeners.metrics = SocketAddr::from(([127, 0, 0, 1], ports[2]));
@@ -196,6 +214,8 @@ fn write_configs(directory: &Path, unit_name: &str, ports: &[u16]) -> (PathBuf, 
     service.runner_executable = "/bin/true".into();
     service.model_path = "/tmp".into();
     service.tokenizer.path = None;
+    service.placement.gpu_uuids = vec![gpu.uuid];
+    service.placement.vram_reservation_bytes_per_gpu = gpu.total_memory_bytes;
     service.backend.port = ports[3];
     service.systemd.unit = unit_name.into();
     service.systemd.environment_file = directory.join("host-test.env");
@@ -219,7 +239,7 @@ fn write_configs(directory: &Path, unit_name: &str, ports: &[u16]) -> (PathBuf, 
              pid_file: {}\n\
              upgrade_sock: {}\n\
              grace_period_seconds: 0\n\
-             graceful_shutdown_timeout_seconds: 1\n",
+             graceful_shutdown_timeout_seconds: 0\n",
             directory.join("pingora.pid").display(),
             directory.join("pingora-upgrade.sock").display(),
         ),

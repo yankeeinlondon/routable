@@ -170,6 +170,25 @@ stream model prompt='Count slowly from one to twenty.': _need-router
         -H 'content-type: application/json' \
         -d '{"model":"{{model}}","messages":[{"role":"user","content":"{{prompt}}"}],"max_tokens":128,"stream":true}'
 
+# Assert tool parsing and reasoning separation for a thinking chat template.
+tool-smoke model: _need-router
+    #!/usr/bin/env bash
+    set -euo pipefail
+    response="$(curl -sS -X POST {{data}}/v1/chat/completions \
+        -H 'content-type: application/json' \
+        -d '{"model":"{{model}}","messages":[{"role":"user","content":"Use get_weather to check Paris, France. Do not answer without calling the tool."}],"tools":[{"type":"function","function":{"name":"get_weather","description":"Get the weather for a city","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}],"tool_choice":"auto","max_tokens":512}')"
+    jq . <<<"$response"
+    jq -e '
+        .choices[0].message as $message
+        | ($message.tool_calls | type == "array" and length > 0)
+          and ($message.tool_calls[0].function.name == "get_weather")
+          and (($message.tool_calls[0].function.arguments | fromjson | .city)
+            | type == "string" and length > 0)
+          and (($message.reasoning // $message.reasoning_content) | type == "string" and length > 0)
+          and (($message.content // "") | contains("<think>") | not)
+    ' <<<"$response" >/dev/null
+    echo "tool call parsed and reasoning separated"
+
 # Fire n concurrent requests at a model and tally status codes (stampede drill).
 stampede model n='20': _need-router
     seq {{n}} | xargs -P {{n}} -I_ curl -s -o /dev/null -w "%{http_code}\n" \
@@ -185,4 +204,3 @@ metrics: _need-router
 # Follow a managed model unit's journal.
 unit-logs service:
     journalctl -u vllm@{{service}}.service -f
-

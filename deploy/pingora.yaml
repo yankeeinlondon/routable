@@ -9,4 +9,6 @@ upstream_keepalive_pool_size: 128
 daemon_wait_for_ready: true
 daemon_ready_timeout_seconds: 30
 grace_period_seconds: 10
-graceful_shutdown_timeout_seconds: 900
+# Pingora 0.8 waits this entire duration after the grace period, even when all
+# service tasks have exited. Active requests already receive the grace period.
+graceful_shutdown_timeout_seconds: 0

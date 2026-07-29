@@ -31,6 +31,7 @@ fn valid_config() -> RouterConfig {
             ],
         },
         policies: RouterPolicies::default(),
+        environment: BTreeMap::new(),
         services: vec![valid_service("alpha", "model-a", 8100, "GPU-a")],
     }
 }
@@ -47,6 +48,7 @@ fn valid_service(name: &str, served_model: &str, port: u16, gpu_uuid: &str) -> S
         tokenizer: TokenizerConfig::default(),
         quantization: Some("fp8".into()),
         runner_args: BTreeMap::new(),
+        environment: BTreeMap::new(),
         placement: Placement {
             gpu_uuids: vec![gpu_uuid.into()],
             tensor_parallelism: 1,
@@ -203,6 +205,58 @@ fn checked_in_example_parses_and_validates() {
     let config: RouterConfig =
         serde_yaml::from_str(include_str!("example.yaml")).expect("example YAML should parse");
     config.validate().expect("example YAML should validate");
+}
+
+#[test]
+fn validates_allowlisted_environment_at_global_and_service_scope() {
+    let mut config = valid_config();
+    config
+        .environment
+        .insert("PATH".into(), "/opt/cuda/bin:/usr/bin".into());
+    config.services[0]
+        .environment
+        .insert("HF_HOME".into(), "/models/hf".into());
+    config.services[0]
+        .environment
+        .insert("VLLM_CACHE_ROOT".into(), "/models/vllm".into());
+    config.validate().unwrap();
+
+    config
+        .environment
+        .insert("CUDA_VISIBLE_DEVICES".into(), "1".into());
+    config.services[0]
+        .environment
+        .insert("PATH".into(), "/bin\nEnvironment=oops".into());
+    let errors = messages(&config);
+    assert!(errors.contains("environment.CUDA_VISIBLE_DEVICES is not allowlisted"));
+    assert!(errors.contains("environment.PATH contains a forbidden control character"));
+}
+
+#[test]
+fn validates_tool_and_reasoning_parsers_against_vllm_registries() {
+    let mut config = valid_config();
+    config.services[0].runner_args.extend([
+        (
+            "tool-call-parser".into(),
+            RunnerArgValue::String("qwen3_xml".into()),
+        ),
+        (
+            "reasoning-parser".into(),
+            RunnerArgValue::String("qwen3".into()),
+        ),
+    ]);
+    config.validate().unwrap();
+
+    config.services[0].runner_args.insert(
+        "tool-call-parser".into(),
+        RunnerArgValue::String("not-a-parser".into()),
+    );
+    config.services[0]
+        .runner_args
+        .insert("reasoning-parser".into(), RunnerArgValue::Bool(true));
+    let errors = messages(&config);
+    assert!(errors.contains("tool-call-parser value \"not-a-parser\" is not registered"));
+    assert!(errors.contains("reasoning-parser must be a string"));
 }
 
 #[test]
@@ -421,6 +475,13 @@ fn rejects_paths_topology_and_unsafe_fields_table() {
             "relative environment",
             |config| config.services[0].systemd.environment_file = "service.env".into(),
             "environment_file must be an absolute",
+        ),
+        (
+            "unsafe bare environment",
+            |config| {
+                config.services[0].systemd.environment_file = "/etc/vllm/bad path.env".into();
+            },
+            "safe for a bare EnvironmentFile= directive",
         ),
         (
             "unknown GPU",

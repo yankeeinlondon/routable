@@ -582,6 +582,7 @@ mod tests {
                     age: Some(Duration::ZERO),
                 },
                 gpus: Vec::new(),
+                placement_error: None,
             })
         }
 

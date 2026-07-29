@@ -345,3 +345,61 @@ Not a defect — a decided policy change (2026-07-29, spec amended). With the ba
 - Test: parked request against a slow-starting mock exceeds the short deadline →
   503 with `Retry-After` and progress fields; the start continues; a follow-up
   request after readiness succeeds warm.
+
+## F5–F10 implementation and verification (2026-07-29)
+
+Implemented and landed in the working tree:
+
+- **F5:** detached lifecycle and backoff work is spawned on the process-lifetime
+  pool runtime, and the background observation tick is cancellation-safe while it
+  is awaiting external I/O. Live testing exposed one additional shutdown cause:
+  Pingora 0.8 waits the entire `graceful_shutdown_timeout_seconds` value after the
+  grace period even when its tasks have exited. The deployed setting is therefore
+  zero-after-grace (the existing 10-second grace remains available to active
+  requests). A fixed-binary live `systemctl restart` completed in **10.00 s**;
+  the host-only `binary_serves` SIGTERM regression completed in **0.28 s** with a
+  zero-second test grace and a three-second bound.
+- **F6:** each service retains its previous degraded reason and drift set. New,
+  changed, cleared, and recovered conditions log at WARN; identical observations
+  on later ticks log only at DEBUG. Metrics continue to expose the steady state.
+- **F7/F8:** global and per-service allowlisted environment maps merge into the
+  generated env files. Units use a bare `EnvironmentFile=` path; env files contain
+  `CUDA_DEVICE_ORDER=PCI_BUS_ID`, numeric NVML UUID-to-index
+  `CUDA_VISIBLE_DEVICES`, `PATH`, `HF_HOME`, and `VLLM_CACHE_ROOT`. A rendered-unit
+  test passes `systemd-analyze verify`. Post-readiness placement checks all
+  processes in the unit's MainPID-rooted process tree because vLLM's NVML-visible
+  worker is a child of the API server, then requires its observed GPU UUID set to
+  equal the assignment exactly.
+- **F9:** `tool-call-parser` and `reasoning-parser` are string-valued runner
+  arguments validated against the installed vLLM registry names. Both live
+  services and the example use `qwen3_xml` + `qwen3` with automatic tool choice.
+  The Tier-3 assertion checks a parsed `get_weather` call with a non-empty city,
+  separated reasoning (`reasoning` in vLLM 0.26, with compatibility for
+  `reasoning_content`), and no `<think>` leakage.
+- **F10:** failure recovery is keyed by generation and re-armed for each failure;
+  stale cleanup cannot clear newer intent. Reconciliation converges a fully
+  inactive failed/backoff service with no current recovery to `stopped`. The
+  two-overlapping-failures regression reaches `stopped` automatically.
+- **Short parking:** the default/example deadline is 20 seconds. Live qwen27b and
+  qwen35b use 20 seconds with honest `Retry-After` estimates of 150 and 120
+  seconds, respectively. Expiry returns a 503 with service, elapsed seconds, and
+  typical duration while the detached start continues. The regression verifies
+  that a later request succeeds warm without launching a second start.
+
+Acceptance outcomes:
+
+- `just lint` — clean.
+- `just test` — **143 passed, 2 host-only ignored** in the library target and
+  **4 passed** in the binary target; no failures.
+- `cargo test --test binary_serves -- --ignored --exact --nocapture` — passed.
+- The ignored live generator comparison confirmed both rendered units are
+  byte-equivalent to the hand-corrected `/run/systemd/system/` references, and
+  live `systemd-analyze verify` completed without diagnostics.
+- The generated env files map qwen27b to GPU index 0 and qwen35b to index 1.
+  Both units are active; NVML reports each worker only on its assigned UUID; router
+  readiness reports two routable services.
+- Tier 3 passed model discovery, alias-routed completions for both services, and
+  the strengthened tool-call/reasoning assertion on both services.
+- The obsolete `10-toolchain.conf` hand-patch was removed from systemd and retained
+  recoverably as `/tmp/10-toolchain.conf.review3-backup`. The router supervisor is
+  enabled for boot.

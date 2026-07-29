@@ -73,6 +73,20 @@ struct RouterOwnedResponse {
     body: Value,
 }
 
+#[derive(Debug, Serialize)]
+struct StartupProgress {
+    service: String,
+    elapsed_seconds: u64,
+    typical_duration_seconds: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct StartupProgressEnvelope {
+    #[serde(flatten)]
+    error: RouterErrorEnvelope,
+    progress: StartupProgress,
+}
+
 struct ActiveStreamGuard {
     gauge: prometheus::IntGauge,
 }
@@ -319,6 +333,8 @@ impl DataPlane {
                 }
             })?;
         let parking_deadline = started + Duration::from_millis(service.parking.deadline_ms);
+        let lifecycle_deadline = started
+            + Duration::from_millis(service.deadlines.startup_ms.max(service.deadlines.wake_ms));
         let permits = self.acquire_parking(model, &service)?;
         let parked = self
             .pool
@@ -330,13 +346,24 @@ impl DataPlane {
 
         let ensure = self.pool.ensure_ready(EnsureReadyRequest {
             service: service.name.clone(),
-            deadline: parking_deadline,
+            deadline: lifecycle_deadline,
             evict: true,
             reactivate_drained: false,
         });
         tokio::pin!(ensure);
         let outcome = tokio::select! {
-            result = &mut ensure => result.map_err(IngressError::Pool),
+            result = tokio::time::timeout_at(parking_deadline.into(), &mut ensure) => {
+                match result {
+                    Ok(result) => result.map_err(IngressError::Pool),
+                    Err(_) => Err(IngressError::ParkingExpired {
+                        model: model.to_string(),
+                        service: service.name.clone(),
+                        elapsed_seconds: parking_started.elapsed().as_secs(),
+                        typical_duration_seconds: service.parking.retry_after_seconds,
+                        retry_after: service.parking.retry_after_seconds,
+                    }),
+                }
+            },
             disconnected = http.read_body_or_idle(true) => {
                 match disconnected {
                     Err(_) | Ok(None) => Err(IngressError::ClientDisconnected),
@@ -558,6 +585,38 @@ impl DataPlane {
                 self.write_error(http, 503, code, &message, retry_after)
                     .await
             }
+            IngressError::ParkingExpired {
+                model,
+                service,
+                elapsed_seconds,
+                typical_duration_seconds,
+                retry_after,
+            } => {
+                let message = format!(
+                    "model `{model}` is starting on service `{service}`: {elapsed_seconds} s elapsed, typically ~{typical_duration_seconds} s"
+                );
+                let error = RouterErrorEnvelope::new(
+                    ErrorDialect::for_path(http.req_header().uri.path()),
+                    503,
+                    "model_starting",
+                    message,
+                    "router_error",
+                );
+                self.write_json(
+                    http,
+                    503,
+                    &StartupProgressEnvelope {
+                        error,
+                        progress: StartupProgress {
+                            service,
+                            elapsed_seconds,
+                            typical_duration_seconds,
+                        },
+                    },
+                    Some(retry_after),
+                )
+                .await
+            }
             other => Err(other),
         }
     }
@@ -720,6 +779,16 @@ enum IngressError {
         code: &'static str,
         message: String,
         retry_after: Option<u64>,
+    },
+    #[error(
+        "model `{model}` is starting on service `{service}`: {elapsed_seconds} s elapsed, typically ~{typical_duration_seconds} s"
+    )]
+    ParkingExpired {
+        model: String,
+        service: String,
+        elapsed_seconds: u64,
+        typical_duration_seconds: u64,
+        retry_after: u64,
     },
     #[error("downstream disconnected while parked")]
     ClientDisconnected,
@@ -896,12 +965,13 @@ mod tests {
     enum EnsureBehavior {
         Ready,
         Pending,
+        SlowReady(Duration),
         Error(PoolError),
     }
 
     struct FakePool {
         service_names: Vec<String>,
-        lifecycles: Mutex<HashMap<String, Lifecycle>>,
+        lifecycles: Arc<Mutex<HashMap<String, Lifecycle>>>,
         activities: HashMap<String, Activity>,
         ensure_behavior: EnsureBehavior,
         ensure_calls: AtomicUsize,
@@ -926,13 +996,13 @@ mod tests {
                 .map(|service| service.name.clone())
                 .collect();
             Self {
-                lifecycles: Mutex::new(
+                lifecycles: Arc::new(Mutex::new(
                     service_names
                         .iter()
                         .cloned()
                         .map(|name| (name, lifecycle))
                         .collect(),
-                ),
+                )),
                 activities: service_names
                     .iter()
                     .cloned()
@@ -1036,6 +1106,30 @@ mod tests {
                 EnsureBehavior::Pending => {
                     let _cancelled = CancellationFlag(self.ensure_cancelled.clone());
                     std::future::pending::<Result<TransitionResponse, PoolError>>().await
+                }
+                EnsureBehavior::SlowReady(delay) => {
+                    let lifecycles = self.lifecycles.clone();
+                    let service = request.service.clone();
+                    let delay = *delay;
+                    tokio::spawn(async move {
+                        tokio::time::sleep(delay).await;
+                        *lifecycles
+                            .lock()
+                            .unwrap()
+                            .get_mut(&service)
+                            .expect("slow-start service should remain configured") =
+                            Lifecycle::Running;
+                    });
+                    loop {
+                        if self.status_for(&request.service)?.lifecycle == Lifecycle::Running {
+                            return Ok(TransitionResponse {
+                                operation_id: None,
+                                affected_requests: 0,
+                                status: self.status_for(&request.service)?,
+                            });
+                        }
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
                 }
             }
         }
@@ -1564,6 +1658,77 @@ mod tests {
                 .get(),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn short_park_expiry_reports_progress_while_start_continues_and_retry_is_warm() {
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend = upstream.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let (mut stream, _) = upstream.accept().await.unwrap();
+            let _ = read_upstream_request(&mut stream).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\n\
+                      Content-Length: 4\r\n\
+                      Connection: close\r\n\r\n\
+                      warm",
+                )
+                .await
+                .unwrap();
+        });
+
+        let mut config = test_router_config_named(&[backend], "slow-start");
+        config.services[0].parking.deadline_ms = 30;
+        config.services[0].parking.retry_after_seconds = 7;
+        let pool = Arc::new(FakePool::new(
+            &config,
+            Lifecycle::Stopped,
+            EnsureBehavior::SlowReady(Duration::from_millis(80)),
+        ));
+        let config = Arc::new(ConfigStore::new(config).unwrap());
+        let plane = Arc::new(DataPlane::new(config, pool.clone()).unwrap());
+
+        let (mut first_client, first_ingress) = ingress_connection(plane.clone()).await;
+        write_inference_request(
+            &mut first_client,
+            br#"{"model":"example/model-30b","messages":[]}"#,
+        )
+        .await;
+        let first_response = read_response(first_client).await;
+        first_ingress.await.unwrap();
+        let first_response = String::from_utf8(first_response).unwrap();
+        assert!(first_response.starts_with("HTTP/1.1 503"));
+        assert!(
+            first_response
+                .to_ascii_lowercase()
+                .contains("retry-after: 7")
+        );
+        assert!(first_response.contains(r#""code":"model_starting""#));
+        assert!(first_response.contains(r#""service":"slow-start-0""#));
+        assert!(first_response.contains(r#""elapsed_seconds":"#));
+        assert!(first_response.contains(r#""typical_duration_seconds":7"#));
+        assert!(first_response.contains("is starting"));
+
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert_eq!(pool.ensure_calls.load(Ordering::Acquire), 1);
+        assert_eq!(
+            pool.status_for("slow-start-0").unwrap().lifecycle,
+            Lifecycle::Running
+        );
+
+        let (mut retry_client, retry_ingress) = ingress_connection(plane).await;
+        write_inference_request(
+            &mut retry_client,
+            br#"{"model":"example/model-30b","messages":[]}"#,
+        )
+        .await;
+        let retry_response = read_response(retry_client).await;
+        retry_ingress.await.unwrap();
+        upstream_task.await.unwrap();
+        assert!(retry_response.starts_with(b"HTTP/1.1 200"));
+        assert!(retry_response.ends_with(b"warm"));
+        assert_eq!(pool.ensure_calls.load(Ordering::Acquire), 1);
     }
 
     #[tokio::test]

@@ -1,6 +1,7 @@
 //! Production composition of the generic pool runner seam.
 
 use std::collections::{BTreeSet, HashMap};
+use std::fs;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -12,7 +13,9 @@ use super::{
     ServiceDefinition, SleepLevel, SystemdState, SystemdStatus,
 };
 use crate::config::{self, RouterConfig};
-use crate::gpu::{ExpectedGpuState, ExpectedGpuUsage, GpuInventory, GpuSnapshot};
+use crate::gpu::{
+    ExpectedGpuState, ExpectedGpuUsage, GpuDrift, GpuError, GpuInventory, GpuSnapshot,
+};
 use crate::metrics;
 use crate::runner::{
     Runner as VllmApi, SleepLevel as VllmSleepLevel, VllmRunner, VllmRunnerConfig, VllmTimeouts,
@@ -29,6 +32,13 @@ struct ManagedService {
     probe: Mutex<ProbeDebounce>,
     observed_systemd: Mutex<Option<SystemdStatus>>,
     sleep: Mutex<SleepObservationState>,
+    gpu_warning: Mutex<GpuWarningState>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct GpuWarningState {
+    degraded_reason: Option<String>,
+    drift: Vec<GpuDrift>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -131,6 +141,8 @@ pub enum ManagedBuildError {
     GeneratedSystemd(#[from] GeneratedSystemdError),
     #[error(transparent)]
     Systemd(#[from] SystemdError),
+    #[error(transparent)]
+    Gpu(#[from] GpuError),
     #[error("could not construct vLLM adapter for `{service}`: {source}")]
     Vllm {
         service: String,
@@ -144,7 +156,13 @@ pub enum ManagedBuildError {
 impl ManagedVllmRunner {
     /// Connect to the system bus and construct one bounded HTTP adapter per service.
     pub async fn connect(config: &RouterConfig) -> Result<Self, ManagedBuildError> {
-        install_generated_inputs(config)?;
+        let gpu = GpuInventory::initialize();
+        let gpu_indices = gpu
+            .inventory()?
+            .into_iter()
+            .map(|(uuid, device)| (uuid, device.index))
+            .collect();
+        install_generated_inputs(config, &gpu_indices)?;
         let systemd_timeout = config
             .services
             .iter()
@@ -153,7 +171,7 @@ impl ManagedVllmRunner {
             .unwrap_or(Duration::from_secs(30));
         let systemd = SystemdManager::connect_system(systemd_timeout).await?;
         systemd.reload().await?;
-        Self::from_parts(config, systemd, GpuInventory::initialize())
+        Self::from_parts(config, systemd, gpu)
     }
 
     /// Dependency-injected constructor useful for host integration tests.
@@ -181,6 +199,7 @@ impl ManagedVllmRunner {
                     probe: Mutex::new(ProbeDebounce::default()),
                     observed_systemd: Mutex::new(None),
                     sleep: Mutex::new(SleepObservationState::default()),
+                    gpu_warning: Mutex::new(GpuWarningState::default()),
                 },
             );
         }
@@ -261,7 +280,9 @@ fn expected_gpu_state<'a>(
                     _ => None,
                 };
             if let Some(main_pid) = main_pid {
-                usage.allowed_compute_pids.insert(main_pid);
+                usage
+                    .allowed_compute_pids
+                    .extend(process_tree_pids(main_pid));
             }
             if !process_facts_known {
                 usage.allow_unexpected_compute_pids = true;
@@ -307,6 +328,26 @@ fn expected_process_facts_known(systemd: Option<&SystemdStatus>) -> bool {
             ..
         })
     )
+}
+
+fn process_tree_pids(main_pid: u32) -> BTreeSet<u32> {
+    let mut discovered = BTreeSet::from([main_pid]);
+    let mut pending = vec![main_pid];
+    while let Some(pid) = pending.pop() {
+        let path = format!("/proc/{pid}/task/{pid}/children");
+        let Ok(children) = fs::read_to_string(path) else {
+            continue;
+        };
+        for child in children
+            .split_whitespace()
+            .filter_map(|child| child.parse::<u32>().ok())
+        {
+            if discovered.insert(child) {
+                pending.push(child);
+            }
+        }
+    }
+    discovered
 }
 
 fn gpu_statuses(definition: &ServiceDefinition, snapshot: &GpuSnapshot) -> Vec<GpuStatus> {
@@ -480,40 +521,95 @@ impl Runner for ManagedVllmRunner {
                 .iter()
                 .all(|uuid| gpu_snapshot.devices.contains_key(uuid))
             && assigned_drift.is_empty();
-        if !gpu_observation_healthy {
+        let degraded_reason = (!gpu_observation_healthy).then(|| {
+            gpu_snapshot
+                .unavailable_reason
+                .clone()
+                .unwrap_or_else(|| "one or more assigned GPUs are missing or have drift".into())
+        });
+        let warning_state = GpuWarningState {
+            degraded_reason,
+            drift: assigned_drift
+                .iter()
+                .map(|drift| (*drift).clone())
+                .collect(),
+        };
+        let previous_warning_state = {
+            let mut previous = service
+                .gpu_warning
+                .lock()
+                .expect("GPU-warning lock poisoned");
+            std::mem::replace(&mut *previous, warning_state.clone())
+        };
+        if warning_state == previous_warning_state {
+            if warning_state.degraded_reason.is_some() {
+                tracing::debug!(
+                    service = %definition.name,
+                    reason = warning_state.degraded_reason.as_deref(),
+                    drift = ?warning_state.drift,
+                    "GPU observation remains degraded"
+                );
+            }
+        } else if let Some(reason) = warning_state.degraded_reason.as_deref() {
             metrics::global()
                 .probe_failures
                 .with_label_values(&[&definition.name, "nvml"])
                 .inc();
             tracing::warn!(
                 service = %definition.name,
-                reason = gpu_snapshot
-                    .unavailable_reason
-                    .as_deref()
-                    .unwrap_or("one or more assigned GPUs are missing or have drift"),
-                "GPU observation degraded; lifecycle readiness remains probe-driven"
+                reason,
+                "GPU observation degraded"
+            );
+        } else if previous_warning_state.degraded_reason.is_some() {
+            tracing::warn!(
+                service = %definition.name,
+                "GPU observation recovered"
             );
         }
-        for drift in assigned_drift {
+        for drift in &warning_state.drift {
             metrics::global()
                 .probe_failures
                 .with_label_values(&[&definition.name, "nvml_drift"])
                 .inc();
-            tracing::warn!(
-                service = %definition.name,
-                gpu_uuid = drift.uuid(),
-                drift_kind = drift.kind(),
-                drift = ?drift,
-                advisory = true,
-                "NVML drift detected"
-            );
+            if !previous_warning_state.drift.contains(drift) {
+                tracing::warn!(
+                    service = %definition.name,
+                    gpu_uuid = drift.uuid(),
+                    drift_kind = drift.kind(),
+                    drift = ?drift,
+                    advisory = true,
+                    "NVML drift detected"
+                );
+            }
+        }
+        for drift in &previous_warning_state.drift {
+            if !warning_state.drift.contains(drift) {
+                tracing::warn!(
+                    service = %definition.name,
+                    gpu_uuid = drift.uuid(),
+                    drift_kind = drift.kind(),
+                    drift = ?drift,
+                    advisory = true,
+                    "NVML drift cleared"
+                );
+            }
         }
         let gpus = gpu_statuses(definition, &gpu_snapshot);
+        let placement_error = if probe.ready
+            && probe.healthy
+            && probe.served_model_matches
+            && systemd.state == SystemdState::Active
+        {
+            verify_main_pid_placement(definition, &systemd, &gpu_snapshot).err()
+        } else {
+            None
+        };
 
         Ok(RunnerObservation {
             systemd,
             probe,
             gpus,
+            placement_error,
         })
     }
 
@@ -669,6 +765,53 @@ fn runner_systemd_status(unit: UnitStatus) -> SystemdStatus {
         state: systemd_state(&unit.active_state),
         sub_state: Some(unit.sub_state),
         main_pid: unit.main_pid,
+    }
+}
+
+fn verify_main_pid_placement(
+    definition: &ServiceDefinition,
+    systemd: &SystemdStatus,
+    snapshot: &GpuSnapshot,
+) -> Result<(), String> {
+    if !snapshot.available {
+        return Err(format!(
+            "cannot verify GPU placement after readiness: {}",
+            snapshot
+                .unavailable_reason
+                .as_deref()
+                .unwrap_or("NVML observation unavailable")
+        ));
+    }
+    let main_pid = systemd.main_pid.ok_or_else(|| {
+        "cannot verify GPU placement after readiness: MainPID is absent".to_string()
+    })?;
+    let unit_processes = process_tree_pids(main_pid);
+    verify_unit_process_placement(definition, main_pid, &unit_processes, snapshot)
+}
+
+fn verify_unit_process_placement(
+    definition: &ServiceDefinition,
+    main_pid: u32,
+    unit_processes: &BTreeSet<u32>,
+    snapshot: &GpuSnapshot,
+) -> Result<(), String> {
+    let assigned: BTreeSet<_> = definition.gpu_ids.iter().cloned().collect();
+    let observed: BTreeSet<_> = snapshot
+        .devices
+        .iter()
+        .filter(|(_, gpu)| {
+            gpu.compute_processes
+                .iter()
+                .any(|process| unit_processes.contains(&process.pid))
+        })
+        .map(|(uuid, _)| uuid.clone())
+        .collect();
+    if observed == assigned {
+        Ok(())
+    } else {
+        Err(format!(
+            "unit process tree rooted at MainPID {main_pid} has a GPU placement mismatch: assigned {assigned:?}, observed {observed:?}"
+        ))
     }
 }
 
@@ -832,6 +975,61 @@ mod tests {
         assert_eq!(status.state, SystemdState::Active);
         assert_eq!(status.sub_state.as_deref(), Some("running"));
         assert_eq!(status.main_pid, Some(4242));
+    }
+
+    #[test]
+    fn post_readiness_unit_process_tree_must_use_exactly_assigned_gpus() {
+        let config: RouterConfig =
+            serde_yaml::from_str(include_str!("../config/example.yaml")).unwrap();
+        let service = pool_definition(&config.services[0]);
+        let assigned_uuid = service.gpu_ids[0].clone();
+        let other_uuid = "GPU-other".to_string();
+        let observation = |uuid: &str, pids: &[u32]| GpuObservation {
+            device: GpuDevice {
+                uuid: uuid.into(),
+                index: 0,
+                name: "GPU".into(),
+                total_memory_bytes: 100,
+            },
+            used_memory_bytes: 1,
+            free_memory_bytes: 99,
+            reserved_memory_bytes: 0,
+            compute_processes: pids
+                .iter()
+                .map(|pid| GpuProcess {
+                    pid: *pid,
+                    used_memory_bytes: None,
+                })
+                .collect(),
+        };
+
+        let correct = GpuSnapshot {
+            available: true,
+            unavailable_reason: None,
+            devices: [
+                (assigned_uuid.clone(), observation(&assigned_uuid, &[5000])),
+                (other_uuid.clone(), observation(&other_uuid, &[])),
+            ]
+            .into(),
+            drift: Vec::new(),
+        };
+        let unit_processes = BTreeSet::from([4242, 5000]);
+        verify_unit_process_placement(&service, 4242, &unit_processes, &correct).unwrap();
+
+        let wrong = GpuSnapshot {
+            available: true,
+            unavailable_reason: None,
+            devices: [
+                (assigned_uuid.clone(), observation(&assigned_uuid, &[])),
+                (other_uuid.clone(), observation(&other_uuid, &[5000])),
+            ]
+            .into(),
+            drift: Vec::new(),
+        };
+        let error =
+            verify_unit_process_placement(&service, 4242, &unit_processes, &wrong).unwrap_err();
+        assert!(error.contains("placement mismatch"));
+        assert!(error.contains("GPU-other"));
     }
 
     #[test]
