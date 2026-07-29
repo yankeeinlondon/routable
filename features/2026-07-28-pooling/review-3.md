@@ -241,3 +241,43 @@ default block — validated with the existing control-character/newline rules an
 rendered into the generated env file, so host toolchain requirements are declared
 configuration rather than out-of-band drop-ins. Document the drop-in pattern in the
 README as the escape hatch for env the schema doesn't model.
+
+## F8 — UUID-based `CUDA_VISIBLE_DEVICES` is discarded by vLLM: models land on the wrong GPU
+
+**Severity: critical (placement is silently not enforced).**
+
+Observed live: `vllm@qwen35b` with generated `CUDA_VISIBLE_DEVICES="GPU-06645389-…"`
+allocated 27 GB on **GPU-d751861a** (the other card), starving `qwen27b`
+(`Free memory on device cuda:0 (3.86/31.36 GiB)…`) into a crash loop. The worker
+process env contained **no** `CUDA_VISIBLE_DEVICES` at all: vLLM's multiprocess
+executor manages device assignment itself and only understands *numeric* CVD values —
+a UUID string is dropped, workers see all GPUs, and rank 0 takes physical GPU 0.
+
+**Fix:** the generator must translate GPU UUIDs to *indices* at render time (NVML
+lookup, stable within a boot) and emit numeric `CUDA_VISIBLE_DEVICES` plus
+`CUDA_DEVICE_ORDER=PCI_BUS_ID` so index order matches NVML/nvidia-smi order. The
+ledger/config stay UUID-based (spec Decision 6); only the rendered env translates.
+Regenerate env on every router start (already the case) so indices refresh per boot.
+Add a drift check: after readiness, verify via NVML that the unit's MainPID compute
+process appears on exactly the assigned UUIDs — this turns wrong-GPU placement from
+silent into `Failed` (would have caught this immediately).
+**Interim (deployed):** hand-edited numeric CVD in both env files +
+`CUDA_DEVICE_ORDER=PCI_BUS_ID` in the shared drop-in — NOTE: overwritten at every
+router restart until the generator fix lands.
+
+## F9 — Tool-calling flags half-allowlisted: agentic clients get 400s
+
+**Severity: medium-high (breaks OpenAI-SDK agentic clients).**
+
+`enable-auto-tool-choice` is in the generator's BOOL_ARGS allowlist but
+`tool-call-parser` (VALUE_ARGS) is not — so tool calling cannot be enabled via
+configuration at all, and any client sending `tool_choice: "auto"` receives vLLM's
+400 (`"auto" tool choice requires --enable-auto-tool-choice and --tool-call-parser`).
+Observed live from the operator's chat client.
+
+**Fix:** allowlist `tool-call-parser` and `reasoning-parser` (value-validated against
+vLLM's known parser names or safe-charset), document that parsers are model-family
+specific (hermes for Qwen; gpt-oss and Gemma need their own), and consider surfacing
+tool-capability in the `/v1/models` entry (contract rule, F2). **Interim (deployed):**
+`--enable-auto-tool-choice --tool-call-parser hermes` appended to both generated
+units by hand — overwritten at every router restart.
