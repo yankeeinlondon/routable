@@ -7,8 +7,11 @@ being exercised are `spec.md` §Acceptance criteria; results belong in `acceptan
 Most commands below have `just` shortcuts (see `just --list`): `gpus`, `host-test`,
 `token`, `validate`, `run`, `ready`, `pool`/`pool-raw`, `pool-op <svc> <action>
 ['{json}']`, `operation <id>`, `models`, `chat <model>`, `stream <model>`,
-`stampede <model> [n]`, `metrics`, `unit-logs <svc>`. Endpoints/paths override via
-`DATA`/`MGMT`/`METRICS`/`ROUTER_CONFIG`/`PINGORA_CONFIG`/`TOKEN_FILE` env vars.
+`stampede <model> [n]`, `metrics`, `unit-logs <svc>`. Ports default to 8000/8001/8002
+and override per call (`DATA_PORT=9000 just run`) — `just run` patches a temp config
+copy so the router and every client recipe agree; production uses the config file's
+ports as-is. Full URLs/paths override via `DATA`/`MGMT`/`METRICS`/`ROUTER_CONFIG`/
+`PINGORA_CONFIG`/`TOKEN_FILE`.
 
 Environment facts (verified 2026-07-29): both RTX 5090s visible via NVML
 (`GPU-d751861a…`, `GPU-06645389…`); systemd + system D-Bus reachable from the
