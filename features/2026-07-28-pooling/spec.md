@@ -94,6 +94,20 @@ as the v1 acceptance contract.
    returns an OpenAI-shaped error with HTTP 503 and `Retry-After` on expiry. The start/wake
    operation is single-flight per service. Disconnecting clients release their parked slot,
    but do not cancel a shared start needed by other waiters.
+
+   **Short-park amendment (decided 2026-07-29, after live testing):** the parking
+   deadline is sized to the expected *wake* time, not the worst-case cold start —
+   default ~20 s per service. Requests that can be satisfied quickly (sleep wakes,
+   replica races, fast models) succeed transparently; a true cold start fails fast
+   with an *informative* 503 whose body reports startup progress ("`<model>` is
+   starting: N s elapsed, typically ~M s") plus an honest `Retry-After`, while the
+   detached single-flight start continues warming the model — the retry lands warm.
+   Rationale: live testing showed multi-minute holds are strictly worse than
+   informative fast failure for interactive clients (silent hang, then a client-side
+   timeout carrying no information), while short holds preserve fire-and-wait
+   semantics for scripted callers and become the transparently-correct behavior once
+   sleep-mode wakes reach seconds. Long holds remain available per service via
+   `parking.deadline_ms` for callers that want them.
 4. **Eviction: idle-timeout AND on-demand, both in v1.** Idle timer per service definition
    shuts down (or sleeps) unused models; when a request needs a GPU and none is free, the
    scheduler evicts the least-recently-used *eligible* model to make room. Eligibility

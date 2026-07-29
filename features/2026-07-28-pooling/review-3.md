@@ -330,3 +330,18 @@ and `reasoning-parser` with values validated against vLLM's registries (`--help=
 enumerates tool parsers; `vllm.reasoning` registry for reasoning parsers), and the
 runbook's Tier-3 smoke needs a tool-call + reasoning-separation assertion, which would
 have caught both the wrong-parser and missing-parser variants.
+
+## Bundled with the F5–F10 batch: short-park policy (spec Decision 3 amendment)
+
+Not a defect — a decided policy change (2026-07-29, spec amended). With the batch:
+
+- Config: `parking.deadline_ms` → ~20000 and `retry_after_seconds` → honest per-model
+  startup estimates, in both live `/etc/vllm-router/router.yaml` services and
+  `src/config/example.yaml`.
+- Enhancement: the parking-expiry 503 body includes startup progress — service name,
+  elapsed seconds, and a typical-duration estimate (from config or a rolling
+  observation of recent start durations). Interactive clients display 503 message
+  text, so this turns cold starts into visible progress instead of silent hangs.
+- Test: parked request against a slow-starting mock exceeds the short deadline →
+  503 with `Retry-After` and progress fields; the start continues; a follow-up
+  request after readiness succeeds warm.
