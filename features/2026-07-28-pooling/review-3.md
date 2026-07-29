@@ -296,3 +296,26 @@ keep the post-readiness NVML placement check from the original F8 write-up — i
 have converted both variants of this failure from silent to loud. Interim: quotes
 stripped by hand in both generated units (overwritten at router restart, as with the
 other interim fixes).
+
+## F10 — Overlapping failures orphan backoff recovery: service wedges in `failed` forever
+
+**Severity: high (no automatic recovery; observed live).**
+
+When multiple flights fail in close succession (here: a parked-demand flight and an
+admin start, during the F8 chaos), each `record_failure` bumps the generation, and the
+*earlier* `schedule_backoff` task's terminal `Failed → Stopped` update loses the
+`update_if_current` race — by design for stale writers. But the *latest* failure's
+backoff task can also be preempted the same way, leaving no pending recovery at all.
+End state observed: unit `inactive`/`success`, no flight, no backoff task — and
+lifecycle permanently `failed`, which `ensure_ready` rejects (`terminal_failure`) and
+reconcile deliberately preserves (the H8 fix). The service is unreachable until an
+operator issues an explicit `stop` (which does transition `failed → stopped`) and then
+`start` — the escape hatch used live.
+
+**Fix:** make failure recovery convergent rather than task-bound: reconcile should
+transition `failed → stopped` when it observes systemd `inactive` **and** no flight
+**and** no pending backoff for the current generation (that combination means the
+failure is fully drained — preserving `failed` there serves nobody); alternatively,
+`record_failure` re-arms a single keyed backoff task on every failure. Regression
+test: two concurrent failing flights → the service reaches `stopped` automatically
+within backoff-max.
