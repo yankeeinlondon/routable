@@ -79,14 +79,26 @@ token:
         (mkdir -p "$(dirname {{token_file}})" && umask 077 && \
          openssl rand -hex 32 > {{token_file}} && echo "token written: {{token_file}}")
 
+# Fail fast with bootstrap instructions when the config files are missing.
+_need-config:
+    @test -f {{router_config}} || { \
+        echo "router config not found: {{router_config}}"; \
+        echo "bootstrap:  mkdir -p /etc/vllm-router && cp src/config/example.yaml {{router_config}} && cp deploy/pingora.yaml {{pingora_config}}"; \
+        echo "then edit the GPU UUIDs (just gpus), model paths, and runner_executable —"; \
+        echo "or point elsewhere: ROUTER_CONFIG=path/to/router.yaml just run"; \
+        exit 1; }
+    @test -f {{pingora_config}} || { \
+        echo "pingora config not found: {{pingora_config}} (cp deploy/pingora.yaml {{pingora_config}})"; \
+        exit 1; }
+
 # Validate the full configuration without starting anything (-t mode).
-validate:
+validate: _need-config
     cargo run --locked --release --all-features -- -t -c {{pingora_config}} --router-config {{router_config}}
 
 # Run the router in the foreground (info logs) on DATA_PORT/MGMT_PORT/METRICS_PORT
 # (defaults 6969/6970/6971), patching a temp copy of the config to those ports.
 # Production/systemd uses the config file's ports as-is — this override is dev-only.
-run:
+run: _need-config
     #!/usr/bin/env bash
     set -euo pipefail
     tmp="$(mktemp --suffix=.router.yaml)"
