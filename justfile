@@ -101,6 +101,11 @@ validate: _need-config
 run: _need-config
     #!/usr/bin/env bash
     set -euo pipefail
+    if curl -s -o /dev/null --max-time 2 {{mgmt}}/livez; then
+        echo "a router is already serving at {{mgmt}} (PID $(pgrep -f 'vllm-router -c' | head -1))."
+        echo "stop it first, or run on other ports: DATA_PORT=7969 MGMT_PORT=7970 METRICS_PORT=7971 just run"
+        exit 1
+    fi
     tmp="$(mktemp --suffix=.router.yaml)"
     trap 'rm -f "$tmp"' EXIT
     sed -E \
