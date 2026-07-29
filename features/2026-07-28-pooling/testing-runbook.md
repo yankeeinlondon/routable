@@ -54,7 +54,9 @@ Run the router in the foreground first (`RUST_LOG=info`), systemd unit later.
    readiness + warmup. Second request is warm and fast.
 4. **Streaming:** `curl -N … "stream": true` — tokens arrive incrementally; check
    `vllm_router_active_streams` on `:8002/metrics` during the stream.
-5. `/v1/models` lists the model + aliases; unknown model → OpenAI-shaped 404;
+5. `/v1/models` lists the model + aliases; **an alias-named completion request must
+   succeed end-to-end** (exercises `--served-model-name` alias rendering — review-3
+   F1); unknown model → OpenAI-shaped 404;
    `/v1/messages` bad request → Anthropic-shaped error.
 6. **Idle tier:** set `idle.stop_after_ms` low (e.g. 120000), watch the reaper drain
    and stop via `/pool/v1/services` + `vllm_router_transitions_total`.
