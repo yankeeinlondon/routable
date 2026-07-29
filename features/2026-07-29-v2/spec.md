@@ -232,3 +232,56 @@ Eligible for a v1.x patch rather than v2 if convenient:
   upstream.
 - **Multi-LoRA**, if ever added, is modeled separately from base-model lifecycle and
   GPU placement (carried from the v1 scope note).
+
+## 7. Pre-v2 spikes (identified 2026-07-29)
+
+De-risking work to run before v2 planning, in the v1 Phase-0 style: each answers one
+question the design depends on, with written findings (spec updates, `docs/{model-id}.md`
+per convention, skill updates for durable facts). Prerequisite for most: the v1 Tier-5
+sleep matrix, since Dynamic Scheduling's economics change completely if wakes are
+seconds instead of minutes.
+
+**V2-S1 — Placement-profile ground truth.** For the four configured models, measure
+per-profile reality on sm_120: actual VRAM at the utilization target, cold-start phase
+timings (load / compile / warmup separately), and throughput/latency under fixed load —
+for TP=1 and for *asymmetric* PP=2 via `VLLM_PP_LAYER_PARTITION` (e.g. 25/75). The PP
+question is load-bearing for §4: does uneven pipeline split work at all on vLLM 0.26 +
+sm_120 over PCIe, and what is its latency tax? *Exit:* profile tables recorded as
+planner input data; §4's profile model confirmed or downgraded to symmetric-only for
+the vLLM runner. *Prerequisite tooling:* per-start phase instrumentation in the router
+(systemd→active, active→ready, warmup duration) — a small v1.x metrics change that
+generates this data continuously instead of via one-off stopwatching.
+
+**V2-S2 — Co-residency interference curves.** Two awake models sized to share one
+32 GB card (e.g. gpt-oss-20b at low utilization + qwen27b), each measured solo vs
+co-resident under load; repeat with CUDA MPS if it works in the unprivileged LXC (a
+question in itself). *Exit:* latency/throughput degradation curves and an MPS verdict —
+the data §4's isolation caveat and latency-priority signal are waiting on, and the
+gate for ever relaxing `max_awake_owners_per_gpu`.
+
+**V2-S3 — Diffusers runner prototype (Qwen-Image).** Stand the downloaded
+`QwenImagePipeline` up behind a minimal HTTP server + systemd unit; map it onto the
+`Runner` trait (observe/start/stop; no sleep — evaluate CPU offload as pseudo-sleep);
+verify the per-GPU `max_memory` asymmetric split that §4 credits this runner class
+with; measure load time, VRAM, and generation latency. Also scopes the data-plane
+question the complexity register predicts: image endpoints (`/v1/images/generations`)
+make per-service endpoint capability routing mandatory, not theoretical. *Exit:*
+go/no-go on diffusers as runner #2 (currently prioritized over llama.cpp in §1), plus
+the enumerated `Runner`-trait gaps.
+
+**V2-S4 — Add-only registration seam probe (code spike).** Enumerate exactly which
+boot-frozen structures must become swappable for *additive* registration (data-plane
+alias map and parking semaphores, pool service map, placement participants); prototype
+the additive path behind a test using the existing validation on a merged config.
+*Exit:* a diff-size estimate and design note that confirms (or refutes) §2's "additive
+is easy" claim before it hardens into a plan.
+
+**V2-S5 — GPU power stewardship feasibility (US9).** Can the unprivileged LXC set
+power limits via NVML at all? Measure actual idle draw per lifecycle state
+(model-resident idle vs stopped) on the 5090s. *Exit:* a watts-per-state table and a
+permission verdict — US9 either gets a mechanism or gets cut.
+
+**V2-S6 — llama.cpp capability sheet (deferred-optional).** Small GGUF download,
+`llama-server` bring-up: health/slots endpoints, `--tensor-split` behavior, warm-mmap
+restart timing. Runs whenever runner #2 priority is settled; the diffusers spike
+(V2-S3) likely matters first per §1's priority note.
