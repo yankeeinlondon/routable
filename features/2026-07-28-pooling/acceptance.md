@@ -6,8 +6,15 @@ batch; the previous 2026-07-28 record predates it):
 - `cargo fmt --all -- --check`: pass
 - `cargo clippy --all-targets --all-features -- -D warnings`: pass
 - `cargo test --all-targets --all-features`: 168 pass, 3 ignored, 0 fail
-- two-file `-t` configuration check: pass, against the live
-  `/etc/vllm-router/router.yaml` as well as the in-repo example
+- two-file `-t` configuration check: pass against a host-valid configuration
+
+`-t` became a host check in review 5 (F23), so what it accepts changed. It now
+resolves every inventory UUID through live NVML, renders the generated units, and
+opens both bearer-token files. `src/config/example.yaml` therefore **fails** `-t`
+by design — its placeholder `GPU-00000000-...` exists on no host — and a
+deployment config must be migrated for the new required inference token before it
+passes. Both are intended: the previous record's claim that the shipped example
+passed `-t` was only true because the check could not see the host.
 
 The three ignored tests each require host resources a CI-style run does not
 have: a live system bus and systemd, and the generated units on `/run`.

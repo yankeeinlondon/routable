@@ -100,7 +100,9 @@ pub struct ProbeStatus {
     pub sleeping_level: Option<u8>,
     pub consecutive_successes: u32,
     pub consecutive_failures: u32,
-    /// Age of the newest probe at the time this status was produced.
+    /// Age of the newest authoritative observation the runner still stands behind, at
+    /// the time this status was produced. `None` means no such observation describes
+    /// the process currently behind the endpoint, which fails admission closed.
     pub age: Option<Duration>,
 }
 
@@ -150,6 +152,19 @@ impl ObservedState {
             idle_for: Duration::ZERO,
             last_error: None,
         }
+    }
+
+    /// Probe age extrapolated to `now`.
+    ///
+    /// The stored age only advances when the state store is written, so a reader that
+    /// must not mutate the store — a readiness probe, for instance — has to extrapolate
+    /// for itself instead of trusting the recorded value.
+    pub fn probe_age_at(&self, now: SystemTime) -> Option<Duration> {
+        let age = self.probe.age?;
+        let elapsed = now
+            .duration_since(self.observed_at)
+            .unwrap_or(Duration::ZERO);
+        Some(age.saturating_add(elapsed))
     }
 }
 
@@ -298,10 +313,8 @@ impl StateStore {
 }
 
 fn age_probe(status: &mut ObservedState, now: SystemTime) {
-    if let Some(age) = status.probe.age.as_mut() {
-        if let Ok(elapsed) = now.duration_since(status.observed_at) {
-            *age = age.saturating_add(elapsed);
-        }
+    if let Some(aged) = status.probe_age_at(now) {
+        status.probe.age = Some(aged);
     }
 }
 

@@ -192,6 +192,10 @@ fn write_configs(directory: &Path, unit_name: &str, ports: &[u16]) -> (PathBuf, 
     fs::write(&token_path, b"host-test-token\n").unwrap();
     fs::set_permissions(&token_path, fs::Permissions::from_mode(0o600)).unwrap();
 
+    let inference_token_path = directory.join("inference-token");
+    fs::write(&inference_token_path, b"host-test-inference-token\n").unwrap();
+    fs::set_permissions(&inference_token_path, fs::Permissions::from_mode(0o600)).unwrap();
+
     let mut config: RouterConfig =
         serde_yaml::from_str(include_str!("../src/config/example.yaml")).unwrap();
     let gpu = GpuInventory::initialize()
@@ -208,6 +212,7 @@ fn write_configs(directory: &Path, unit_name: &str, ports: &[u16]) -> (PathBuf, 
     config.listeners.management = SocketAddr::from(([127, 0, 0, 1], ports[1]));
     config.listeners.metrics = SocketAddr::from(([127, 0, 0, 1], ports[2]));
     config.listeners.management_bearer_token_file = token_path;
+    config.listeners.inference_bearer_token_file = inference_token_path;
 
     let service = config.services.first_mut().unwrap();
     service.name = "host-test".into();

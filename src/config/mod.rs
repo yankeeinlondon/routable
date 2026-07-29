@@ -172,6 +172,13 @@ pub struct Listeners {
     pub management: SocketAddr,
     pub metrics: SocketAddr,
     pub management_bearer_token_file: PathBuf,
+    /// Bearer token accepted on the public inference listener.
+    ///
+    /// Required and distinct from the management token: the data plane binds a
+    /// client-reachable address and can start, wake, and evict GPU residents, so
+    /// there is no safe "unset means open" reading, and an inference client must
+    /// never hold a credential that also authorizes lifecycle mutations.
+    pub inference_bearer_token_file: PathBuf,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -549,6 +556,19 @@ fn validate_listeners(config: &RouterConfig, errors: &mut Vec<String>) {
         "listeners.management_bearer_token_file",
         errors,
     );
+    require_absolute(
+        &config.listeners.inference_bearer_token_file,
+        "listeners.inference_bearer_token_file",
+        errors,
+    );
+    if config.listeners.inference_bearer_token_file == config.listeners.management_bearer_token_file
+    {
+        errors.push(
+            "listeners.inference_bearer_token_file must differ from \
+             listeners.management_bearer_token_file so an inference client cannot mutate the pool"
+                .into(),
+        );
+    }
 }
 
 fn validate_inventory(inventory: &Inventory, errors: &mut Vec<String>) {

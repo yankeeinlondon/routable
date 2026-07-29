@@ -49,15 +49,48 @@ pub fn install_generated_inputs(
     install_generated_inputs_in(config, gpu_indices, Path::new(GENERATED_UNIT_DIRECTORY))
 }
 
+/// Render every generated input without writing anything to the host.
+///
+/// The only place a placement UUID meets the live NVML inventory is rendering,
+/// so config-check mode runs the identical renderer to decide whether the units
+/// this configuration would install can be produced at all.
+pub fn dry_run_generated_inputs(
+    config: &RouterConfig,
+    gpu_indices: &BTreeMap<String, u32>,
+) -> Result<(), GeneratedSystemdError> {
+    render_all(config, gpu_indices, Path::new(GENERATED_UNIT_DIRECTORY)).map(|_| ())
+}
+
 fn install_generated_inputs_in(
     config: &RouterConfig,
     gpu_indices: &BTreeMap<String, u32>,
     unit_directory: &Path,
 ) -> Result<(), GeneratedSystemdError> {
+    let rendered = render_all(config, gpu_indices, unit_directory)?;
+
+    ensure_directory(unit_directory, 0o755)?;
+    for service in rendered {
+        ensure_parent_directory(&service.environment_path)?;
+        atomic_write(
+            &service.environment_path,
+            service.environment.as_bytes(),
+            0o600,
+        )?;
+        atomic_write(&service.unit_path, service.unit.as_bytes(), 0o644)?;
+    }
+    Ok(())
+}
+
+/// Render all services, completely, before any destination is touched.
+fn render_all(
+    config: &RouterConfig,
+    gpu_indices: &BTreeMap<String, u32>,
+    unit_directory: &Path,
+) -> Result<Vec<RenderedService>, GeneratedSystemdError> {
     config.validate()?;
 
     let mut destinations = HashSet::new();
-    let rendered = config
+    config
         .services
         .iter()
         .map(|service| {
@@ -76,19 +109,7 @@ fn install_generated_inputs_in(
             }
             Ok(rendered)
         })
-        .collect::<Result<Vec<_>, _>>()?;
-
-    ensure_directory(unit_directory, 0o755)?;
-    for service in rendered {
-        ensure_parent_directory(&service.environment_path)?;
-        atomic_write(
-            &service.environment_path,
-            service.environment.as_bytes(),
-            0o600,
-        )?;
-        atomic_write(&service.unit_path, service.unit.as_bytes(), 0o644)?;
-    }
-    Ok(())
+        .collect()
 }
 
 #[cfg(test)]

@@ -75,23 +75,31 @@ and copy response chunks downstream as they arrive.
 
 Request handling, in order (`proxy/ingress.rs`):
 
-1. **Endpoint allowlist.** Only known model-bearing `POST` endpoints proceed — the
+1. **Authentication.** The first statement in `process`: a constant-time bearer-token
+   check against `listeners.inference_bearer_token_file`, a root-owned mode-`0600` file
+   distinct from the management token. It runs before the endpoint allowlist, before the
+   body is read, and before any admission or lifecycle call, so an unauthenticated caller
+   can neither enumerate models via `GET /v1/models` nor cause a park, eviction, or cold
+   start. Rejections are `401` in the endpoint's own error dialect. The credential is not
+   forwarded upstream — backends are loopback-bound and hold no matching key. `/livez` and
+   `/readyz` are unaffected: they live on the management listener, not here.
+2. **Endpoint allowlist.** Only known model-bearing `POST` endpoints proceed — the
    OpenAI-compatible family, Anthropic's `/v1/messages`, and the Cohere/Jina-style
    score/rerank/classify endpoints (`MODEL_ENDPOINTS` in `proxy/ingress.rs`). vLLM
    admin/dev endpoints and `/pool` are refused on this listener regardless of upstream
    support. Multipart endpoints (audio transcription) are not routable today because
    model extraction assumes a JSON body.
-2. **Bounded body read.** `Content-Length` is checked first, then the body is read with
+3. **Bounded body read.** `Content-Length` is checked first, then the body is read with
    a running cap; overflow drains the connection and returns 413 before any parsing.
-3. **Model routing.** `serde_json` extracts only the `model` field (bytes are never
+4. **Model routing.** `serde_json` extracts only the `model` field (bytes are never
    modified); aliases resolve to a canonical served-model name; unknown → OpenAI-shaped
    404. Invalid requests fail here — before any lifecycle machinery can be triggered.
-4. **Admission.** Fast path: among `Running` replicas of the model, pick least-inflight
+5. **Admission.** Fast path: among `Running` replicas of the model, pick least-inflight
    and atomically acquire an exact active-request guard. Under the same per-service
    admission lock, require a fresh cached observation showing systemd active, healthy
    and ready with the expected served model, and no sleep level. Stale, incomplete,
    or sleeping observations fail closed; a drain or reconcile racing admission wins.
-5. **Parking (cold path).** If nothing is running: acquire global and per-model parking
+6. **Parking (cold path).** If nothing is running: acquire global and per-model parking
    permits (semaphores — exhaustion returns 503 + `Retry-After`), then a parked-slot
    guard, then call `ensure_ready` with the service's parking deadline. The deadline is
    deliberately *short* (~20 s default — the short-park amendment to spec Decision 3):
@@ -101,7 +109,7 @@ Request handling, in order (`proxy/ingress.rs`):
    downstream-disconnect detection (`read_body_or_idle` on the already-consumed
    request), so a hung-up client frees its slot immediately — but the underlying start
    continues, because other waiters may need it (single-flight, detached).
-6. **Forwarding.** Hop-by-hop and `Connection`-nominated headers are stripped both
+7. **Forwarding.** Hop-by-hop and `Connection`-nominated headers are stripped both
    directions, `Host` is set to the backend, `x-request-id`/`traceparent` are added.
    Response chunks stream through one at a time; nothing aggregates SSE, and
    compression is never enabled. The reqwest client's read timeout is the **inter-chunk**
@@ -109,7 +117,7 @@ Request handling, in order (`proxy/ingress.rs`):
    survive while a stalled stream fails. Reqwest timeout sources are classified before
    logging, producing a bounded `upstream response idle timeout` diagnostic instead of
    its generic response-body decode wrapper.
-7. **Failover.** Only a *connect* failure (no bytes sent) may retry on a different
+8. **Failover.** Only a *connect* failure (no bytes sent) may retry on a different
    replica, once. After the request may have reached an upstream — and certainly after
    response headers or SSE data reach the client — no retry occurs.
 
@@ -259,9 +267,16 @@ CI rather than silently not loading at runtime.
 ## Security model
 
 - **Three listeners, three policies.** Public data plane (endpoint-allowlisted, no admin
-  surface), management (bearer token required before any routing or body read; token
-  file must be root-owned mode `0600`; comparison is constant-time), metrics (scrape
-  only).
+  surface, inference bearer token required before any routing or body read), management
+  (management bearer token required before any routing or body read), metrics (scrape
+  only). Both token files must be root-owned mode `0600`, both comparisons are
+  constant-time, and the two files must be distinct — validation rejects a config that
+  points them at the same secret, because an inference client must never hold a
+  credential that authorizes lifecycle mutations.
+- **Neither token has a default.** Both paths are required config, so a config that omits
+  one fails at `-t` time instead of silently exposing a listener that can spend GPU time.
+  `GET /livez` and `GET /readyz` on the loopback management bind are the only
+  unauthenticated endpoints; health checking therefore never needs a credential.
 - vLLM backends bind loopback and are enforced loopback by config validation; the
   router is the only client-facing entry. vLLM's unauthenticated dev-mode endpoints are
   reachable only from the host.

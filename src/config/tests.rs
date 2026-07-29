@@ -16,6 +16,7 @@ fn valid_config() -> RouterConfig {
             management: SocketAddr::from(([127, 0, 0, 1], 8001)),
             metrics: SocketAddr::from(([127, 0, 0, 1], 8002)),
             management_bearer_token_file: PathBuf::from("/run/secrets/vllm-router-token"),
+            inference_bearer_token_file: PathBuf::from("/run/secrets/vllm-router-inference-token"),
         },
         inventory: Inventory {
             host_ram_capacity_bytes: 128 * GIB,
@@ -448,6 +449,21 @@ fn rejects_paths_topology_and_unsafe_fields_table() {
                 config.listeners.management_bearer_token_file = "token".into();
             },
             "management_bearer_token_file must be an absolute",
+        ),
+        (
+            "relative inference token file",
+            |config| {
+                config.listeners.inference_bearer_token_file = "inference-token".into();
+            },
+            "inference_bearer_token_file must be an absolute",
+        ),
+        (
+            "shared management and inference token file",
+            |config| {
+                config.listeners.inference_bearer_token_file =
+                    config.listeners.management_bearer_token_file.clone();
+            },
+            "must differ from listeners.management_bearer_token_file",
         ),
         (
             "relative runner executable",
@@ -1114,6 +1130,22 @@ fn additive_registration_validates_the_merged_config_before_publication() {
     assert_eq!(
         store.snapshot().canonical_model("friendly-b"),
         Some("model-b")
+    );
+}
+
+#[test]
+fn omitted_inference_token_file_fails_to_parse_rather_than_serving_unauthenticated() {
+    let yaml = include_str!("example.yaml").replace(
+        "  inference_bearer_token_file: /run/secrets/vllm-router-inference-token\n",
+        "",
+    );
+    let error = serde_yaml::from_str::<RouterConfig>(&yaml)
+        .expect_err("a config without an inference token must not load")
+        .to_string();
+
+    assert!(
+        error.contains("inference_bearer_token_file"),
+        "unexpected parse error: {error}"
     );
 }
 

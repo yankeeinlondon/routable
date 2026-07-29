@@ -3,6 +3,7 @@ listeners:
   management: "127.0.0.1:6970"
   metrics: "127.0.0.1:6971"
   management_bearer_token_file: /run/secrets/vllm-router-token
+  inference_bearer_token_file: /run/secrets/vllm-router-inference-token
 
 inventory:
   host_ram_capacity_bytes: 200000000000

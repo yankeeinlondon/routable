@@ -54,6 +54,7 @@ _colors:
 router_config := env_var_or_default('ROUTER_CONFIG', '/etc/vllm-router/router.yaml')
 pingora_config := env_var_or_default('PINGORA_CONFIG', '/etc/vllm-router/pingora.yaml')
 token_file := env_var_or_default('TOKEN_FILE', '/run/secrets/vllm-router-token')
+inference_token_file := env_var_or_default('INFERENCE_TOKEN_FILE', '/run/secrets/vllm-router-inference-token')
 
 # Ports `just run` binds and every client recipe targets (override per call,
 # e.g. `DATA_PORT=9000 just run`). The example-config conventions:
@@ -73,11 +74,22 @@ gpus:
 host-test:
     cargo test --lib -- --ignored
 
-# Create the management bearer token file (0600) unless it already exists.
+# Create both bearer token files (root-owned, 0600) unless they already exist.
+# The router requires two distinct secrets: the management token authorizes
+# lifecycle mutations, the inference token authorizes data-plane requests. Run as
+# root — the router refuses a token file it does not own.
 token:
-    @test -s {{token_file}} && echo "token already present: {{token_file}}" || \
-        (mkdir -p "$(dirname {{token_file}})" && umask 077 && \
-         openssl rand -hex 32 > {{token_file}} && echo "token written: {{token_file}}")
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for file in {{token_file}} {{inference_token_file}}; do
+        if [[ -s "$file" ]]; then
+            echo "token already present: $file"
+            continue
+        fi
+        mkdir -p "$(dirname "$file")"
+        (umask 077 && openssl rand -hex 32 > "$file")
+        echo "token written: $file"
+    done
 
 # Fail fast with bootstrap instructions when the config files are missing.
 _need-config:
@@ -156,17 +168,20 @@ operation id: _need-router
 
 # The router's synthesized model list (what clients see).
 models: _need-router
-    @curl -sS {{data}}/v1/models | jq .
+    @curl -sS -H "Authorization: Bearer $(cat {{inference_token_file}})" \
+        {{data}}/v1/models | jq .
 
 # One timed non-streaming completion; a cold model exercises parking.
 chat model prompt='Say hello in five words.': _need-router
     time curl -sS -X POST {{data}}/v1/chat/completions \
+        -H "Authorization: Bearer $(cat {{inference_token_file}})" \
         -H 'content-type: application/json' \
         -d '{"model":"{{model}}","messages":[{"role":"user","content":"{{prompt}}"}],"max_tokens":64}' | jq -r '.choices[0].message.content // .'
 
 # A streaming completion; tokens should render incrementally.
 stream model prompt='Count slowly from one to twenty.': _need-router
     curl -sN -X POST {{data}}/v1/chat/completions \
+        -H "Authorization: Bearer $(cat {{inference_token_file}})" \
         -H 'content-type: application/json' \
         -d '{"model":"{{model}}","messages":[{"role":"user","content":"{{prompt}}"}],"max_tokens":128,"stream":true}'
 
@@ -175,6 +190,7 @@ tool-smoke model: _need-router
     #!/usr/bin/env bash
     set -euo pipefail
     response="$(curl -sS -X POST {{data}}/v1/chat/completions \
+        -H "Authorization: Bearer $(cat {{inference_token_file}})" \
         -H 'content-type: application/json' \
         -d '{"model":"{{model}}","messages":[{"role":"user","content":"Use get_weather to check Paris, France. Do not answer without calling the tool."}],"tools":[{"type":"function","function":{"name":"get_weather","description":"Get the weather for a city","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}],"tool_choice":"auto","max_tokens":512}')"
     jq . <<<"$response"
@@ -193,6 +209,7 @@ tool-smoke model: _need-router
 stampede model n='20': _need-router
     seq {{n}} | xargs -P {{n}} -I__REQUEST__ curl -s -o /dev/null -w "%{http_code}\n" \
         -X POST {{data}}/v1/chat/completions \
+        -H "Authorization: Bearer $(cat {{inference_token_file}})" \
         -H 'content-type: application/json' \
         -d '{"model":"{{model}}","messages":[{"role":"user","content":"hi"}],"max_tokens":8}' \
         | sort | uniq -c

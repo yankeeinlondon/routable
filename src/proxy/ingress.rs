@@ -13,7 +13,7 @@ use pingora::{
     protocols::http::ServerSession,
     server::ShutdownWatch,
 };
-use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE, HOST};
+use reqwest::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HOST};
 use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -21,6 +21,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::{
+    api::TokenAuth,
     config::{ConfigStore, RouterConfig, ServiceDefinition},
     metrics,
     pool::{EnsureReadyRequest, PoolError, PoolManager, StatusRequest},
@@ -116,6 +117,7 @@ impl Drop for ActiveStreamGuard {
 pub struct DataPlane {
     config: Arc<ConfigStore>,
     pool: Arc<dyn PoolManager>,
+    auth: TokenAuth,
     client: reqwest::Client,
     inter_chunk_timeout: Duration,
     global_parked: Arc<Semaphore>,
@@ -126,6 +128,7 @@ impl DataPlane {
     pub fn new(
         config: Arc<ConfigStore>,
         pool: Arc<dyn PoolManager>,
+        auth: TokenAuth,
     ) -> Result<Self, reqwest::Error> {
         let snapshot = config.snapshot();
         let client = build_upstream_client(&snapshot)?;
@@ -143,6 +146,7 @@ impl DataPlane {
         Ok(Self {
             config,
             pool,
+            auth,
             client,
             inter_chunk_timeout,
             global_parked: Arc::new(Semaphore::new(
@@ -153,6 +157,26 @@ impl DataPlane {
     }
 
     async fn process(&self, http: &mut ServerSession) -> Result<(), IngressError> {
+        // First statement in the request path on purpose. Everything below it —
+        // model discovery, the body read, parking, eviction, and cold starts —
+        // spends router state or GPU capacity, so an unauthenticated caller must
+        // not reach any of it. Liveness and readiness live on the management
+        // listener and stay credential-free there.
+        if !self.auth.authorize(
+            http.get_header(AUTHORIZATION)
+                .map(http::HeaderValue::as_bytes),
+        ) {
+            return self
+                .write_error(
+                    http,
+                    401,
+                    "unauthorized",
+                    "a valid bearer token is required",
+                    None,
+                )
+                .await;
+        }
+
         let method = http.req_header().method.clone();
         let path = http.req_header().uri.path().to_owned();
         if let Some(response) =
@@ -270,6 +294,15 @@ impl DataPlane {
                     .inc();
                 Ok(())
             }
+            // No error envelope can reach a socket the client already closed, and
+            // writing one would only surface as a second, misleading failure.
+            Err(IngressError::ClientDisconnected) => {
+                metrics::global()
+                    .requests
+                    .with_label_values(&[&route.canonical, "client_disconnected"])
+                    .inc();
+                Err(IngressError::ClientDisconnected)
+            }
             Err(error) => {
                 metrics::global()
                     .requests
@@ -367,12 +400,7 @@ impl DataPlane {
                     }),
                 }
             },
-            disconnected = http.read_body_or_idle(true) => {
-                match disconnected {
-                    Err(_) | Ok(None) => Err(IngressError::ClientDisconnected),
-                    Ok(Some(_)) => Err(IngressError::ClientDisconnected),
-                }
-            }
+            cancelled = downstream_cancelled(http) => Err(cancelled),
         };
 
         metrics::global()
@@ -506,12 +534,16 @@ impl DataPlane {
             .body(body);
         let connection_headers = connection_tokens(&http.req_header().headers);
         for (name, value) in &http.req_header().headers {
+            // The inference token authenticates the client to the router and
+            // nothing else. Backends are loopback-bound and hold no matching key,
+            // so forwarding it would only widen where the credential is observable.
             if !is_hop_by_hop(name.as_str())
                 && !connection_headers
                     .iter()
                     .any(|token| token.eq_ignore_ascii_case(name.as_str()))
                 && name != HOST
                 && name != CONTENT_LENGTH
+                && name != AUTHORIZATION
                 && name.as_str() != "x-request-id"
             {
                 request = request.header(name, value);
@@ -523,17 +555,25 @@ impl DataPlane {
         if http.get_header_bytes("traceparent").is_empty() {
             request = request.header("traceparent", traceparent);
         }
-        let mut response = request.send().await.map_err(|error| {
-            if error.is_connect() {
-                IngressError::ConnectFailure(error)
-            } else {
-                classify_upstream_error(
-                    error,
-                    self.inter_chunk_timeout,
-                    "waiting for response headers",
-                )
-            }
-        })?;
+        // The window between forwarding and the first response byte is the longest
+        // part of a cold generation, and nothing else in this function touches the
+        // downstream socket until headers exist. Losing this race drops the
+        // in-flight `send()` future, which closes the upstream connection and lets
+        // the exact active guard go instead of holding it for an abandoned answer.
+        let mut response = tokio::select! {
+            result = request.send() => result.map_err(|error| {
+                if error.is_connect() {
+                    IngressError::ConnectFailure(error)
+                } else {
+                    classify_upstream_error(
+                        error,
+                        self.inter_chunk_timeout,
+                        "waiting for response headers",
+                    )
+                }
+            })?,
+            cancelled = downstream_cancelled(http) => return Err(cancelled),
+        };
         let status = response.status().as_u16();
         let _active_stream = ActiveStreamGuard::for_response(&service.name, response.headers());
         let mut downstream = ResponseHeader::build(status, Some(response.headers().len()))
@@ -563,9 +603,21 @@ impl DataPlane {
         http.write_response_header(Box::new(downstream))
             .await
             .map_err(IngressError::Pingora)?;
-        while let Some(chunk) = response.chunk().await.map_err(|error| {
-            classify_upstream_error(error, self.inter_chunk_timeout, "reading the response body")
-        })? {
+        loop {
+            // A stalled backend still yields the bounded idle-timeout classification
+            // from the upstream arm; this select only adds the case where the client
+            // leaves between chunks, which a write alone cannot reveal.
+            let chunk = tokio::select! {
+                chunk = response.chunk() => chunk.map_err(|error| {
+                    classify_upstream_error(
+                        error,
+                        self.inter_chunk_timeout,
+                        "reading the response body",
+                    )
+                })?,
+                cancelled = downstream_cancelled(http) => return Err(cancelled),
+            };
+            let Some(chunk) = chunk else { break };
             http.write_response_body(chunk, false)
                 .await
                 .map_err(IngressError::Pingora)?;
@@ -708,6 +760,21 @@ fn build_upstream_client(config: &RouterConfig) -> Result<reqwest::Client, reqwe
         .build()
 }
 
+/// Resolves only once the downstream connection can no longer carry this
+/// response, so it is safe to race against any upstream progress.
+///
+/// The request body is fully buffered before admission, so `no_body_expected`
+/// is unconditionally true here and this read never steals bytes the router
+/// still needs. In that mode every outcome is terminal for this exchange — a
+/// FIN, a read error, or bytes arriving after a complete body, which pingora
+/// has already consumed by the time it reports them. Detection is purely
+/// event-driven: a backend that takes minutes to emit its first token leaves
+/// this future pending, so only the inter-chunk timeout bounds a slow answer.
+async fn downstream_cancelled(http: &mut ServerSession) -> IngressError {
+    let _ = http.read_body_or_idle(true).await;
+    IngressError::ClientDisconnected
+}
+
 fn classify_upstream_error(
     error: reqwest::Error,
     idle_timeout: Duration,
@@ -837,7 +904,7 @@ enum IngressError {
         typical_duration_seconds: u64,
         retry_after: u64,
     },
-    #[error("downstream disconnected while parked")]
+    #[error("downstream disconnected before the response completed")]
     ClientDisconnected,
 }
 
@@ -991,7 +1058,11 @@ mod tests {
         },
     };
 
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
     use pingora::protocols::l4::stream::Stream as PingoraStream;
+    use tempfile::NamedTempFile;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
@@ -1248,6 +1319,16 @@ mod tests {
         }
     }
 
+    const TEST_TOKEN: &str = "inference-secret";
+
+    fn test_auth() -> TokenAuth {
+        let file = NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), format!("{TEST_TOKEN}\n")).unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(file.path(), std::fs::Permissions::from_mode(0o600)).unwrap();
+        TokenAuth::load(file.path()).unwrap()
+    }
+
     fn test_config(backends: &[SocketAddr]) -> Arc<ConfigStore> {
         test_config_named(backends, "replica")
     }
@@ -1308,9 +1389,22 @@ mod tests {
         path: &str,
         body: &[u8],
     ) {
+        write_credentialed_request(client, path, Some(&format!("Bearer {TEST_TOKEN}")), body).await;
+    }
+
+    async fn write_credentialed_request(
+        client: &mut tokio::net::TcpStream,
+        path: &str,
+        authorization: Option<&str>,
+        body: &[u8],
+    ) {
+        let authorization = authorization
+            .map(|value| format!("Authorization: {value}\r\n"))
+            .unwrap_or_default();
         let header = format!(
             "POST {path} HTTP/1.1\r\n\
              Host: router.test\r\n\
+             {authorization}\
              Content-Type: application/json\r\n\
              Content-Length: {}\r\n\
              Connection: close\r\n\r\n",
@@ -1592,7 +1686,7 @@ mod tests {
             Lifecycle::Stopped,
             EnsureBehavior::Ready,
         ));
-        let plane = DataPlane::new(config.clone(), pool).unwrap();
+        let plane = DataPlane::new(config.clone(), pool, test_auth()).unwrap();
         let mut candidate = config.snapshot().services[0].clone();
         candidate.name = "registered".into();
         candidate.served_model = "example/registered".into();
@@ -1638,14 +1732,18 @@ mod tests {
             Lifecycle::Running,
             EnsureBehavior::Ready,
         ));
-        let plane = Arc::new(DataPlane::new(config, pool).unwrap());
+        let plane = Arc::new(DataPlane::new(config, pool, test_auth()).unwrap());
 
         let (mut get_client, get_task) = ingress_connection(Arc::clone(&plane)).await;
         get_client
             .write_all(
-                b"GET /v1/models HTTP/1.1\r\n\
-                  Host: router.test\r\n\
-                  Connection: close\r\n\r\n",
+                format!(
+                    "GET /v1/models HTTP/1.1\r\n\
+                     Host: router.test\r\n\
+                     Authorization: Bearer {TEST_TOKEN}\r\n\
+                     Connection: close\r\n\r\n"
+                )
+                .as_bytes(),
             )
             .await
             .unwrap();
@@ -1695,6 +1793,200 @@ mod tests {
             + 4;
         let post_body: Value = serde_json::from_slice(&post_response[post_body_start..]).unwrap();
         assert_eq!(post_body["error"]["code"], "method_not_allowed");
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_valid_model_request_does_no_lifecycle_work() {
+        let backend = closed_loopback_address().await;
+        let config = test_config(&[backend]);
+        let pool = Arc::new(FakePool::new(
+            config.snapshot().as_ref(),
+            Lifecycle::Stopped,
+            EnsureBehavior::Ready,
+        ));
+        let plane = Arc::new(DataPlane::new(config, pool.clone(), test_auth()).unwrap());
+        let (mut client, ingress_task) = ingress_connection(plane).await;
+        write_credentialed_request(
+            &mut client,
+            "/v1/chat/completions",
+            None,
+            br#"{"model":"example/model-30b","messages":[]}"#,
+        )
+        .await;
+
+        let response = read_response(client).await;
+        ingress_task.await.unwrap();
+        assert!(
+            response.starts_with(b"HTTP/1.1 401"),
+            "unexpected response: {}",
+            String::from_utf8_lossy(&response)
+        );
+        let body_start = response
+            .windows(4)
+            .position(|bytes| bytes == b"\r\n\r\n")
+            .unwrap()
+            + 4;
+        let body: Value = serde_json::from_slice(&response[body_start..]).unwrap();
+        assert_eq!(body["error"]["code"], "unauthorized");
+        assert_eq!(body["error"]["type"], "router_error");
+
+        assert_eq!(pool.ensure_calls.load(Ordering::Acquire), 0);
+        assert!(pool.active_attempts.lock().unwrap().is_empty());
+        assert_eq!(pool.activity("replica-0").parked(), 0);
+        assert_eq!(pool.activity("replica-0").active(), 0);
+        assert_eq!(
+            pool.status_for("replica-0").unwrap().lifecycle,
+            Lifecycle::Stopped
+        );
+    }
+
+    #[tokio::test]
+    async fn unauthorized_response_is_written_without_reading_the_request_body() {
+        let backend = closed_loopback_address().await;
+        let config = test_config(&[backend]);
+        let pool = Arc::new(FakePool::new(
+            config.snapshot().as_ref(),
+            Lifecycle::Running,
+            EnsureBehavior::Ready,
+        ));
+        let plane = Arc::new(DataPlane::new(config, pool.clone(), test_auth()).unwrap());
+        let (mut client, ingress_task) = ingress_connection(plane).await;
+        // A promised body that is never sent: any read of it would block until the
+        // test's own timeout, so an answered request proves the rejection precedes it.
+        client
+            .write_all(
+                b"POST /v1/chat/completions HTTP/1.1\r\n\
+                  Host: router.test\r\n\
+                  Content-Type: application/json\r\n\
+                  Content-Length: 1048576\r\n\r\n",
+            )
+            .await
+            .unwrap();
+
+        let response = read_until(&mut client, b"\r\n\r\n").await;
+        assert!(
+            response.starts_with(b"HTTP/1.1 401"),
+            "unexpected response: {}",
+            String::from_utf8_lossy(&response)
+        );
+        drop(client);
+        ingress_task.await.unwrap();
+        assert_eq!(pool.ensure_calls.load(Ordering::Acquire), 0);
+        assert!(pool.active_attempts.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_model_discovery_is_refused() {
+        let backend = closed_loopback_address().await;
+        let config = test_config(&[backend]);
+        let pool = Arc::new(FakePool::new(
+            config.snapshot().as_ref(),
+            Lifecycle::Running,
+            EnsureBehavior::Ready,
+        ));
+        let plane = Arc::new(DataPlane::new(config, pool, test_auth()).unwrap());
+        let (mut client, ingress_task) = ingress_connection(plane).await;
+        client
+            .write_all(
+                b"GET /v1/models HTTP/1.1\r\n\
+                  Host: router.test\r\n\
+                  Connection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+
+        let response = read_response(client).await;
+        ingress_task.await.unwrap();
+        let response = String::from_utf8(response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 401"), "{response}");
+        assert!(!response.contains("example/model-30b"));
+    }
+
+    #[tokio::test]
+    async fn wrong_token_is_refused_and_the_accepted_credential_never_reaches_the_backend() {
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend = upstream.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let (mut stream, _) = upstream.accept().await.unwrap();
+            let request = read_upstream_request(&mut stream).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\n\
+                      Content-Length: 2\r\n\
+                      Connection: close\r\n\r\n\
+                      ok",
+                )
+                .await
+                .unwrap();
+            request
+        });
+
+        let config = test_config(&[backend]);
+        let pool = Arc::new(FakePool::new(
+            config.snapshot().as_ref(),
+            Lifecycle::Running,
+            EnsureBehavior::Ready,
+        ));
+        let plane = Arc::new(DataPlane::new(config, pool.clone(), test_auth()).unwrap());
+        let body = br#"{"model":"example/model-30b","messages":[]}"#;
+
+        let (mut wrong_client, wrong_ingress) = ingress_connection(Arc::clone(&plane)).await;
+        write_credentialed_request(
+            &mut wrong_client,
+            "/v1/chat/completions",
+            Some("Bearer inference-secre"),
+            body,
+        )
+        .await;
+        let wrong_response = read_response(wrong_client).await;
+        wrong_ingress.await.unwrap();
+        assert!(
+            wrong_response.starts_with(b"HTTP/1.1 401"),
+            "unexpected response: {}",
+            String::from_utf8_lossy(&wrong_response)
+        );
+        assert!(pool.active_attempts.lock().unwrap().is_empty());
+
+        let (mut client, ingress_task) = ingress_connection(plane).await;
+        write_inference_request(&mut client, body).await;
+        let response = read_response(client).await;
+        ingress_task.await.unwrap();
+        let upstream_request = upstream_task.await.unwrap();
+
+        assert!(
+            response.starts_with(b"HTTP/1.1 200"),
+            "unexpected response: {}",
+            String::from_utf8_lossy(&response)
+        );
+        assert_eq!(*pool.active_attempts.lock().unwrap(), vec!["replica-0"]);
+        let forwarded = String::from_utf8_lossy(&upstream_request).to_ascii_lowercase();
+        assert!(!forwarded.contains("authorization"), "{forwarded}");
+        assert!(!forwarded.contains(TEST_TOKEN), "{forwarded}");
+    }
+
+    #[tokio::test]
+    async fn anthropic_endpoints_shape_the_unauthorized_error_in_their_own_dialect() {
+        let backend = closed_loopback_address().await;
+        let config = test_config(&[backend]);
+        let pool = Arc::new(FakePool::new(
+            config.snapshot().as_ref(),
+            Lifecycle::Running,
+            EnsureBehavior::Ready,
+        ));
+        let plane = Arc::new(DataPlane::new(config, pool.clone(), test_auth()).unwrap());
+        let (mut client, ingress_task) = ingress_connection(plane).await;
+        write_credentialed_request(
+            &mut client,
+            "/v1/messages",
+            None,
+            br#"{"model":"example/model-30b","messages":[]}"#,
+        )
+        .await;
+
+        let response = read_response(client).await;
+        ingress_task.await.unwrap();
+        assert_anthropic_error(&response, 401, "authentication_error", "unauthorized");
+        assert_eq!(pool.ensure_calls.load(Ordering::Acquire), 0);
     }
 
     #[tokio::test]
@@ -1792,7 +2084,7 @@ mod tests {
             }),
         ));
         pool.sleep_on_next_acquire.store(true, Ordering::Release);
-        let plane = Arc::new(DataPlane::new(config, pool.clone()).unwrap());
+        let plane = Arc::new(DataPlane::new(config, pool.clone(), test_auth()).unwrap());
         let (mut client, ingress_task) = ingress_connection(plane).await;
         write_inference_request(
             &mut client,
@@ -1869,7 +2161,7 @@ mod tests {
             Lifecycle::Stopped,
             EnsureBehavior::Ready,
         ));
-        let plane = Arc::new(DataPlane::new(config, pool.clone()).unwrap());
+        let plane = Arc::new(DataPlane::new(config, pool.clone(), test_auth()).unwrap());
         let (mut client, ingress_task) = ingress_connection(plane).await;
         let body = br#"{"model":"example/model-30b","stream":true}"#;
         write_inference_request(&mut client, body).await;
@@ -1936,7 +2228,7 @@ mod tests {
             EnsureBehavior::SlowReady(Duration::from_millis(80)),
         ));
         let config = Arc::new(ConfigStore::new(config).unwrap());
-        let plane = Arc::new(DataPlane::new(config, pool.clone()).unwrap());
+        let plane = Arc::new(DataPlane::new(config, pool.clone(), test_auth()).unwrap());
 
         let (mut first_client, first_ingress) = ingress_connection(plane.clone()).await;
         write_inference_request(
@@ -2013,7 +2305,7 @@ mod tests {
             Lifecycle::Running,
             EnsureBehavior::Ready,
         ));
-        let plane = Arc::new(DataPlane::new(config, pool.clone()).unwrap());
+        let plane = Arc::new(DataPlane::new(config, pool.clone(), test_auth()).unwrap());
         let (mut client, ingress_task) = ingress_connection(plane).await;
         write_inference_request(
             &mut client,
@@ -2084,7 +2376,7 @@ mod tests {
             Lifecycle::Running,
             EnsureBehavior::Ready,
         ));
-        let plane = Arc::new(DataPlane::new(config, pool.clone()).unwrap());
+        let plane = Arc::new(DataPlane::new(config, pool.clone(), test_auth()).unwrap());
         let (mut client, ingress_task) = ingress_connection(plane).await;
         write_inference_request(
             &mut client,
@@ -2124,6 +2416,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn downstream_disconnect_before_upstream_headers_cancels_the_inference() {
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend = upstream.local_addr().unwrap();
+        let (forwarded_tx, forwarded_rx) = tokio::sync::oneshot::channel();
+        // Accepts and reads the whole request but never writes a status line, the
+        // shape of a backend still assembling its first token.
+        let upstream_task = tokio::spawn(async move {
+            let (mut stream, _) = upstream.accept().await.unwrap();
+            let _ = read_upstream_request(&mut stream).await;
+            forwarded_tx.send(()).unwrap();
+            let mut trailing = [0; 64];
+            stream.read(&mut trailing).await.unwrap()
+        });
+
+        let service = "headerless-upstream-0";
+        let mut config = test_router_config_named(&[backend], "headerless-upstream");
+        // Far longer than anything this test waits for, so a release can only come
+        // from observing the client leave. Production runs 120 s here precisely
+        // because a cold first token is legitimately slow.
+        config.policies.inter_chunk_timeout_ms = 30_000;
+        let pool = Arc::new(FakePool::new(
+            &config,
+            Lifecycle::Running,
+            EnsureBehavior::Ready,
+        ));
+        let config = Arc::new(ConfigStore::new(config).expect("test config should validate"));
+        let plane = Arc::new(DataPlane::new(config, pool.clone(), test_auth()).unwrap());
+        let (mut client, ingress_task) = ingress_connection(plane).await;
+        write_inference_request(
+            &mut client,
+            br#"{"model":"example/model-30b","messages":[]}"#,
+        )
+        .await;
+
+        forwarded_rx.await.unwrap();
+        assert_eq!(pool.activity(service).active(), 1);
+        drop(client);
+
+        tokio::time::timeout(Duration::from_secs(2), ingress_task)
+            .await
+            .expect("ingress kept waiting on headers after the client left")
+            .unwrap();
+        let trailing = tokio::time::timeout(Duration::from_secs(2), upstream_task)
+            .await
+            .expect("upstream request was not cancelled")
+            .unwrap();
+        assert_eq!(
+            trailing, 0,
+            "upstream connection should be closed, not idle"
+        );
+        assert_eq!(pool.activity(service).active(), 0);
+    }
+
+    #[tokio::test]
     async fn downstream_disconnect_cancels_parking_and_releases_every_guard() {
         let backend = closed_loopback_address().await;
         let config = test_config(&[backend]);
@@ -2132,7 +2478,7 @@ mod tests {
             Lifecycle::Stopped,
             EnsureBehavior::Pending,
         ));
-        let plane = Arc::new(DataPlane::new(config, pool.clone()).unwrap());
+        let plane = Arc::new(DataPlane::new(config, pool.clone(), test_auth()).unwrap());
         let (mut client, ingress_task) = ingress_connection(plane).await;
         write_inference_request(
             &mut client,
@@ -2179,7 +2525,7 @@ mod tests {
             Lifecycle::Running,
             EnsureBehavior::Ready,
         ));
-        let plane = Arc::new(DataPlane::new(config, pool.clone()).unwrap());
+        let plane = Arc::new(DataPlane::new(config, pool.clone(), test_auth()).unwrap());
         let (mut client, ingress_task) = ingress_connection(plane).await;
         let body = br#"{"model":"example/model-30b","messages":[{"role":"user","content":"hi"}]}"#;
         write_inference_request(&mut client, body).await;
@@ -2207,7 +2553,7 @@ mod tests {
             Lifecycle::Running,
             EnsureBehavior::Ready,
         ));
-        let plane = Arc::new(DataPlane::new(config, pool).unwrap());
+        let plane = Arc::new(DataPlane::new(config, pool, test_auth()).unwrap());
         let (mut client, ingress_task) = ingress_connection(plane).await;
         write_inference_request_to(&mut client, "/v1/messages", b"not JSON").await;
         let response = read_response(client).await;
@@ -2221,7 +2567,7 @@ mod tests {
             Lifecycle::Running,
             EnsureBehavior::Ready,
         ));
-        let plane = Arc::new(DataPlane::new(config, pool).unwrap());
+        let plane = Arc::new(DataPlane::new(config, pool, test_auth()).unwrap());
         let (mut client, ingress_task) = ingress_connection(plane).await;
         write_inference_request_to(&mut client, "/v1/messages/count_tokens", b"not JSON").await;
         let response = read_response(client).await;
@@ -2235,7 +2581,7 @@ mod tests {
             Lifecycle::Running,
             EnsureBehavior::Ready,
         ));
-        let plane = Arc::new(DataPlane::new(config, pool).unwrap());
+        let plane = Arc::new(DataPlane::new(config, pool, test_auth()).unwrap());
         let (mut client, ingress_task) = ingress_connection(plane).await;
         write_inference_request_to(
             &mut client,
@@ -2257,7 +2603,7 @@ mod tests {
         ));
         let config =
             Arc::new(ConfigStore::new(config).expect("small test body limit should validate"));
-        let plane = Arc::new(DataPlane::new(config, pool).unwrap());
+        let plane = Arc::new(DataPlane::new(config, pool, test_auth()).unwrap());
         let (mut client, ingress_task) = ingress_connection(plane).await;
         write_inference_request_to(
             &mut client,
@@ -2279,7 +2625,7 @@ mod tests {
                 operation: "readiness",
             }),
         ));
-        let plane = Arc::new(DataPlane::new(config, pool).unwrap());
+        let plane = Arc::new(DataPlane::new(config, pool, test_auth()).unwrap());
         let (mut client, ingress_task) = ingress_connection(plane).await;
         write_inference_request_to(
             &mut client,
@@ -2309,7 +2655,7 @@ mod tests {
                 operation: "readiness",
             }),
         ));
-        let plane = Arc::new(DataPlane::new(config, pool).unwrap());
+        let plane = Arc::new(DataPlane::new(config, pool, test_auth()).unwrap());
         let (mut client, ingress_task) = ingress_connection(plane).await;
         write_inference_request(
             &mut client,
@@ -2330,7 +2676,7 @@ mod tests {
             Lifecycle::Running,
             EnsureBehavior::Ready,
         ));
-        let plane = Arc::new(DataPlane::new(config, pool).unwrap());
+        let plane = Arc::new(DataPlane::new(config, pool, test_auth()).unwrap());
         let (mut client, ingress_task) = ingress_connection(plane).await;
         write_inference_request(
             &mut client,

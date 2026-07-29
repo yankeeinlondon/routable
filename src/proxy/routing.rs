@@ -103,6 +103,7 @@ impl RouterErrorEnvelope {
 
 fn anthropic_error_type(status: u16) -> &'static str {
     match status {
+        401 => "authentication_error",
         404 => "not_found_error",
         413 => "request_too_large",
         429 => "rate_limit_error",
@@ -277,6 +278,7 @@ mod tests {
     fn anthropic_envelopes_cover_router_error_statuses() {
         let cases = [
             (400, "invalid_request_error"),
+            (401, "authentication_error"),
             (404, "not_found_error"),
             (405, "invalid_request_error"),
             (413, "request_too_large"),

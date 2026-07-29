@@ -48,16 +48,17 @@ struct SleepObservationState {
 }
 
 impl SleepObservationState {
-    /// Apply an authoritative `/is_sleeping` response, or retain the last
-    /// authoritative state when the endpoint itself could not be observed.
-    fn update(&mut self, observed: Option<bool>) -> Option<u8> {
-        match observed {
-            Some(true) => self.observed_sleeping = true,
-            Some(false) => {
-                self.observed_sleeping = false;
-                self.commanded = None;
-            }
-            None => {}
+    /// Apply an authoritative `/is_sleeping` response.
+    ///
+    /// A failed probe proves nothing and therefore never reaches this state: the last
+    /// authoritative fact is retained by `SleepProof` together with the timestamp that
+    /// proved it.
+    fn observe(&mut self, sleeping: bool) -> Option<u8> {
+        if sleeping {
+            self.observed_sleeping = true;
+        } else {
+            self.observed_sleeping = false;
+            self.commanded = None;
         }
 
         self.observed_sleeping
@@ -76,25 +77,85 @@ impl SleepObservationState {
 /// place that decides whether the observation may be stamped as freshly proven.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SleepFact {
-    /// Sleep is disabled for this service, so there is nothing to observe.
+    /// Sleep is disabled for this service, so there is nothing to observe and the
+    /// configuration itself is the authority.
     NotApplicable,
     /// `/is_sleeping` answered authoritatively.
     Observed(Option<u8>),
-    /// `/is_sleeping` could not be observed. The level is the retained last
-    /// authoritative value and is unproven as of this observation.
-    Unobserved(Option<u8>),
+    /// `/is_sleeping` could not be observed, so this observation proves nothing and
+    /// carries no value of its own.
+    Unobserved,
 }
 
-impl SleepFact {
-    fn level(self) -> Option<u8> {
-        match self {
-            Self::NotApplicable => None,
-            Self::Observed(level) | Self::Unobserved(level) => level,
-        }
+/// One probe cycle's sleep reading: what `/is_sleeping` said, which vLLM process
+/// generation was asked, and when. These travel together so a fact can never be
+/// recorded against another cycle's generation or timestamp.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SleepReading {
+    fact: SleepFact,
+    generation: u64,
+    observed_at: Instant,
+}
+
+/// One authoritative sleep observation: the value, and the instant that proved it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ProvenSleep {
+    level: Option<u8>,
+    observed_at: Instant,
+}
+
+/// The sleep fact this runner currently stands behind, bound to the vLLM process
+/// generation it describes.
+///
+/// Value, timestamp, and generation move as one unit: `prove` is the only way to
+/// install any of them, so a fact can never be published under a timestamp that proved
+/// a different fact. Start, stop, sleep, and wake begin a new generation, which retires
+/// the previous proof until `/is_sleeping` speaks for the process now behind the
+/// endpoint — an old "the previous process is absent or asleep" observation must never
+/// be presented as a fresh "this process is awake".
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct SleepProof {
+    generation: u64,
+    proven: Option<ProvenSleep>,
+}
+
+impl SleepProof {
+    /// Retire the current proof because a new process (or a commanded sleep
+    /// transition) means the previous observation no longer describes the backend.
+    fn begin_generation(&mut self) -> u64 {
+        self.generation = self.generation.saturating_add(1);
+        self.proven = None;
+        self.generation
     }
 
-    fn is_current(self) -> bool {
-        !matches!(self, Self::Unobserved(_))
+    /// Install an authoritative observation of `generation`.
+    ///
+    /// An observation of a superseded generation is dropped rather than published: it
+    /// was taken against a process that has since been started, stopped, slept, or
+    /// woken, so it proves nothing about the current one.
+    fn prove(&mut self, generation: u64, level: Option<u8>, observed_at: Instant) {
+        if generation < self.generation {
+            return;
+        }
+        self.proven = Some(ProvenSleep { level, observed_at });
+    }
+
+    /// Prove a fact the runner itself just established, such as a successful sleep
+    /// command, for the generation that command begins.
+    fn prove_new_generation(&mut self, level: Option<u8>, observed_at: Instant) {
+        let generation = self.begin_generation();
+        self.prove(generation, level, observed_at);
+    }
+
+    fn level(self) -> Option<u8> {
+        self.proven.and_then(|proven| proven.level)
+    }
+
+    /// How long ago the standing proof was taken, or `None` while no proof describes
+    /// the current generation.
+    fn age_at(self, now: Instant) -> Option<Duration> {
+        self.proven
+            .map(|proven| now.saturating_duration_since(proven.observed_at))
     }
 }
 
@@ -105,8 +166,7 @@ struct ProbeDebounce {
     ready: bool,
     healthy: bool,
     served_model_matches: bool,
-    sleeping_level: Option<u8>,
-    observed_at: Option<Instant>,
+    sleep: SleepProof,
 }
 
 impl ProbeDebounce {
@@ -114,24 +174,28 @@ impl ProbeDebounce {
         &mut self,
         healthy: bool,
         served_model_matches: bool,
-        sleep: SleepFact,
+        sleep: SleepReading,
         consecutive_successes: u32,
         consecutive_failures: u32,
-        observed_at: Instant,
     ) -> ProbeStatus {
-        let sleeping_level = sleep.level();
         self.healthy = healthy;
         self.served_model_matches = served_model_matches;
-        self.sleeping_level = sleeping_level;
         // Only a proven sleep fact may refresh the observation timestamp. Admission's
         // freshness gate is the sole barrier between a sleeping backend and a request
         // that hangs until the inter-chunk timeout, so stamping a retained-but-unproven
-        // "awake" here would defeat it. Leaving the timestamp alone ages the fact out
-        // instead: a single failed probe is absorbed, and sustained failure closes
+        // "awake" here would defeat it. Leaving the standing proof alone ages the fact
+        // out instead: a single failed probe is absorbed, and sustained failure closes
         // admission once the age passes `readiness.maximum_probe_age_ms`.
-        if sleep.is_current() {
-            self.observed_at = Some(observed_at);
+        match sleep.fact {
+            // Sleep is disabled, so the configuration itself proves there is nothing to
+            // be asleep in and every observation is authoritative.
+            SleepFact::NotApplicable => self.sleep.prove(sleep.generation, None, sleep.observed_at),
+            SleepFact::Observed(level) => {
+                self.sleep.prove(sleep.generation, level, sleep.observed_at)
+            }
+            SleepFact::Unobserved => {}
         }
+        let sleeping_level = self.sleep.level();
         if sleeping_level.is_some() {
             self.successes = 0;
             self.failures = 0;
@@ -157,12 +221,10 @@ impl ProbeDebounce {
             healthy: self.healthy,
             ready: self.ready,
             served_model_matches: self.served_model_matches,
-            sleeping_level: self.sleeping_level,
+            sleeping_level: self.sleep.level(),
             consecutive_successes: self.successes,
             consecutive_failures: self.failures,
-            age: self
-                .observed_at
-                .map(|observed_at| now.saturating_duration_since(observed_at)),
+            age: self.sleep.age_at(now),
         }
     }
 }
@@ -259,8 +321,7 @@ impl ManagedVllmRunner {
         service: &ManagedService,
         healthy: bool,
         served_model_matches: bool,
-        sleep: SleepFact,
-        observed_at: Instant,
+        sleep: SleepReading,
     ) -> ProbeStatus {
         service.probe.lock().expect("probe lock poisoned").record(
             healthy,
@@ -268,8 +329,51 @@ impl ManagedVllmRunner {
             sleep,
             service.config.readiness.consecutive_successes,
             service.config.readiness.consecutive_failures,
-            observed_at,
         )
+    }
+
+    /// The generation an observation that starts now is allowed to speak for.
+    ///
+    /// Read before any probing so a lifecycle command that lands mid-observation
+    /// supersedes it: the probe answered for a process that is no longer there.
+    fn sleep_generation(service: &ManagedService) -> u64 {
+        service
+            .probe
+            .lock()
+            .expect("probe lock poisoned")
+            .sleep
+            .generation
+    }
+
+    /// Retire the standing sleep proof after a lifecycle command changed which process
+    /// (or which sleep state) is behind the endpoint.
+    fn begin_sleep_generation(service: &ManagedService) {
+        service
+            .probe
+            .lock()
+            .expect("probe lock poisoned")
+            .sleep
+            .begin_generation();
+    }
+
+    /// Record the sleep state a successful sleep command just established.
+    ///
+    /// The command is itself authoritative, so the new generation starts proven rather
+    /// than waiting for `/is_sleeping` — and it starts proven asleep, which admission
+    /// rejects outright.
+    fn prove_commanded_sleep(service: &ManagedService, level: SleepLevel) {
+        service
+            .probe
+            .lock()
+            .expect("probe lock poisoned")
+            .sleep
+            .prove_new_generation(
+                Some(match level {
+                    SleepLevel::L1 => 1,
+                    SleepLevel::L2 => 2,
+                }),
+                Instant::now(),
+            );
     }
 
     fn expected_gpu_state(&self) -> ExpectedGpuState {
@@ -283,7 +387,8 @@ impl ManagedVllmRunner {
                 .probe
                 .lock()
                 .expect("probe lock poisoned")
-                .sleeping_level;
+                .sleep
+                .level();
             (&service.config, systemd, sleeping_level)
         }))
     }
@@ -478,6 +583,7 @@ impl Runner for ManagedVllmRunner {
         definition: &ServiceDefinition,
     ) -> Result<RunnerObservation, RunnerError> {
         let service = self.service(&definition.name)?;
+        let generation = Self::sleep_generation(service);
         let unit = self
             .systemd
             .unit_status(&service.config.systemd.unit)
@@ -500,13 +606,22 @@ impl Runner for ManagedVllmRunner {
                 service,
                 false,
                 false,
-                SleepFact::Observed(None),
-                Instant::now(),
+                SleepReading {
+                    fact: SleepFact::Observed(None),
+                    generation,
+                    observed_at: Instant::now(),
+                },
             )
         } else {
-            let sleep = if service.config.sleep.enabled {
-                let sleeping = match VllmApi::is_sleeping(&service.vllm).await {
-                    Ok(sleeping) => Some(sleeping),
+            let fact = if service.config.sleep.enabled {
+                match VllmApi::is_sleeping(&service.vllm).await {
+                    Ok(sleeping) => SleepFact::Observed(
+                        service
+                            .sleep
+                            .lock()
+                            .expect("sleep-observation lock poisoned")
+                            .observe(sleeping),
+                    ),
                     Err(error) => {
                         metrics::global()
                             .probe_failures
@@ -517,23 +632,24 @@ impl Runner for ManagedVllmRunner {
                             error = %error,
                             "sleep observation failed; retaining last authoritative state, which will age out of admission"
                         );
-                        None
+                        SleepFact::Unobserved
                     }
-                };
-                let level = service
-                    .sleep
-                    .lock()
-                    .expect("sleep-observation lock poisoned")
-                    .update(sleeping);
-                if sleeping.is_some() {
-                    SleepFact::Observed(level)
-                } else {
-                    SleepFact::Unobserved(level)
                 }
             } else {
                 SleepFact::NotApplicable
             };
-            let sleeping_level = sleep.level();
+            let sleeping_level = match fact {
+                SleepFact::NotApplicable => None,
+                SleepFact::Observed(level) => level,
+                // Nothing new was proved, so the standing proof still describes this
+                // process: do not probe a backend the runner believes is asleep.
+                SleepFact::Unobserved => service
+                    .probe
+                    .lock()
+                    .expect("probe lock poisoned")
+                    .sleep
+                    .level(),
+            };
             let (healthy, served_model_matches) = if sleeping_level.is_some() {
                 (false, false)
             } else {
@@ -554,8 +670,11 @@ impl Runner for ManagedVllmRunner {
                 service,
                 healthy,
                 served_model_matches,
-                sleep,
-                Instant::now(),
+                SleepReading {
+                    fact,
+                    generation,
+                    observed_at: Instant::now(),
+                },
             )
         };
         *service
@@ -677,6 +796,10 @@ impl Runner for ManagedVllmRunner {
             .sleep
             .lock()
             .expect("sleep-observation lock poisoned") = SleepObservationState::default();
+        // Retire after the command, never before: a proof taken between the command and
+        // this point described the previous process, and only an observation that starts
+        // after this point can speak for the new one.
+        Self::begin_sleep_generation(service);
         Ok(())
     }
 
@@ -694,6 +817,7 @@ impl Runner for ManagedVllmRunner {
             .sleep
             .lock()
             .expect("sleep-observation lock poisoned") = SleepObservationState::default();
+        Self::begin_sleep_generation(service);
         Ok(())
     }
 
@@ -723,6 +847,7 @@ impl Runner for ManagedVllmRunner {
             commanded: Some(level),
             observed_sleeping: true,
         };
+        Self::prove_commanded_sleep(service, level);
         Ok(())
     }
 
@@ -746,6 +871,10 @@ impl Runner for ManagedVllmRunner {
             .sleep
             .lock()
             .expect("sleep-observation lock poisoned") = SleepObservationState::default();
+        // A successful wake command is not the specified sleep proof: the endpoint must
+        // answer `/is_sleeping` for this generation before readiness or admission may
+        // treat the backend as awake.
+        Self::begin_sleep_generation(service);
         Ok(())
     }
 
@@ -878,6 +1007,14 @@ mod tests {
     use super::*;
     use crate::gpu::{GpuDevice, GpuDrift, GpuObservation, GpuProcess};
 
+    fn reading(fact: SleepFact, generation: u64, observed_at: Instant) -> SleepReading {
+        SleepReading {
+            fact,
+            generation,
+            observed_at,
+        }
+    }
+
     #[test]
     fn maps_validated_service_policy_to_generic_definition() {
         let yaml = include_str!("../config/example.yaml");
@@ -943,19 +1080,36 @@ mod tests {
     }
 
     #[test]
-    fn failed_sleep_observation_preserves_authoritative_sleep_state() {
-        let mut state = SleepObservationState {
-            commanded: Some(SleepLevel::L2),
-            observed_sleeping: true,
-        };
+    fn failed_sleep_observation_preserves_the_authoritative_proof_it_could_not_refresh() {
+        let started = Instant::now();
+        let mut probe = ProbeDebounce::default();
+        let generation = probe.sleep.generation;
 
-        assert_eq!(state.update(None), Some(2));
+        probe.record(
+            false,
+            false,
+            reading(SleepFact::Observed(Some(2)), generation, started),
+            1,
+            1,
+        );
+        let unproven = probe.record(
+            false,
+            false,
+            reading(
+                SleepFact::Unobserved,
+                generation,
+                started + Duration::from_secs(5),
+            ),
+            1,
+            1,
+        );
+
+        // Both halves of the proof are retained: the level it established, and the
+        // timestamp that established it.
+        assert_eq!(unproven.sleeping_level, Some(2));
         assert_eq!(
-            state,
-            SleepObservationState {
-                commanded: Some(SleepLevel::L2),
-                observed_sleeping: true,
-            }
+            probe.status_at(started + Duration::from_secs(5)).age,
+            Some(Duration::from_secs(5))
         );
     }
 
@@ -966,16 +1120,7 @@ mod tests {
             observed_sleeping: true,
         };
 
-        assert_eq!(state.update(Some(false)), None);
-        assert_eq!(state, SleepObservationState::default());
-        assert_eq!(state.update(None), None);
-    }
-
-    #[test]
-    fn failed_sleep_observation_without_history_remains_unknown() {
-        let mut state = SleepObservationState::default();
-
-        assert_eq!(state.update(None), None);
+        assert_eq!(state.observe(false), None);
         assert_eq!(state, SleepObservationState::default());
     }
 
@@ -983,19 +1128,24 @@ mod tests {
     fn restart_discovered_sleeper_keeps_unknown_command_provenance() {
         let mut state = SleepObservationState::default();
 
-        assert_eq!(state.update(Some(true)), Some(1));
+        assert_eq!(state.observe(true), Some(1));
         assert_eq!(state.commanded, None);
         assert!(state.observed_sleeping);
-        assert_eq!(state.update(None), Some(1));
-        assert_eq!(state.commanded, None);
     }
 
     #[test]
     fn healthy_wrong_model_is_distinct_and_probe_age_uses_observation_time() {
         let observed_at = Instant::now();
         let mut probe = ProbeDebounce::default();
+        let generation = probe.sleep.generation;
 
-        let wrong_model = probe.record(true, false, SleepFact::NotApplicable, 1, 1, observed_at);
+        let wrong_model = probe.record(
+            true,
+            false,
+            reading(SleepFact::NotApplicable, generation, observed_at),
+            1,
+            1,
+        );
 
         assert!(wrong_model.healthy);
         assert!(!wrong_model.served_model_matches);
@@ -1010,23 +1160,33 @@ mod tests {
     fn an_unobserved_sleep_fact_ages_out_instead_of_looking_freshly_proven() {
         let started = Instant::now();
         let mut probe = ProbeDebounce::default();
+        let generation = probe.sleep.generation;
 
         // A proven awake observation is admissible and freshly stamped.
-        let proven = probe.record(true, true, SleepFact::Observed(None), 1, 1, started);
+        let proven = probe.record(
+            true,
+            true,
+            reading(SleepFact::Observed(None), generation, started),
+            1,
+            1,
+        );
         assert_eq!(proven.sleeping_level, None);
         assert!(proven.ready);
         assert_eq!(probe.status_at(started).age, Some(Duration::ZERO));
 
-        // `/is_sleeping` then fails. The retained level is still reported, but the
-        // observation timestamp must not move: the backend may have slept out of band,
-        // and a fresh-looking "awake" would pass admission's only sleep barrier.
+        // `/is_sleeping` then fails. The proof from the same process still stands, but
+        // its timestamp must not move: the backend may have slept out of band, and a
+        // fresh-looking "awake" would pass admission's only sleep barrier.
         let unproven = probe.record(
             true,
             true,
-            SleepFact::Unobserved(None),
+            reading(
+                SleepFact::Unobserved,
+                generation,
+                started + Duration::from_secs(30),
+            ),
             1,
             1,
-            started + Duration::from_secs(30),
         );
         assert_eq!(unproven.sleeping_level, None);
         assert_eq!(
@@ -1039,10 +1199,13 @@ mod tests {
         probe.record(
             true,
             true,
-            SleepFact::Observed(None),
+            reading(
+                SleepFact::Observed(None),
+                generation,
+                started + Duration::from_secs(60),
+            ),
             1,
             1,
-            started + Duration::from_secs(60),
         );
         assert_eq!(
             probe.status_at(started + Duration::from_secs(60)).age,
@@ -1055,12 +1218,191 @@ mod tests {
     fn a_service_without_sleep_enabled_keeps_a_fresh_observation() {
         let started = Instant::now();
         let mut probe = ProbeDebounce::default();
+        let generation = probe.sleep.generation;
 
         // `NotApplicable` and `Unobserved` both carry `sleeping_level: None`; only the
         // latter is unproven, so sleep-disabled services must not age out.
-        probe.record(true, true, SleepFact::NotApplicable, 1, 1, started);
-
+        probe.record(
+            true,
+            true,
+            reading(SleepFact::NotApplicable, generation, started),
+            1,
+            1,
+        );
         assert_eq!(probe.status_at(started).age, Some(Duration::ZERO));
+
+        // A service with no `/is_sleeping` to consult must also re-prove itself on the
+        // first observation after a restart, rather than waiting out a deadline.
+        let restarted = probe.sleep.begin_generation();
+        assert_eq!(probe.status_at(started).age, None);
+        probe.record(
+            true,
+            true,
+            reading(
+                SleepFact::NotApplicable,
+                restarted,
+                started + Duration::from_secs(1),
+            ),
+            1,
+            1,
+        );
+
+        assert_eq!(
+            probe.status_at(started + Duration::from_secs(1)).age,
+            Some(Duration::ZERO)
+        );
+    }
+
+    #[test]
+    fn a_started_process_cannot_inherit_the_proof_that_the_previous_one_was_absent() {
+        let started = Instant::now();
+        let mut probe = ProbeDebounce::default();
+
+        // The last authoritative probe of the previous process: systemd inactive, so
+        // nothing is asleep and the fact is stamped now.
+        probe.record(
+            false,
+            false,
+            reading(SleepFact::Observed(None), probe.sleep.generation, started),
+            1,
+            1,
+        );
+        assert_eq!(probe.status_at(started).age, Some(Duration::ZERO));
+
+        // `start` retires that proof; `/is_sleeping` then fails against the new process
+        // while `/health` and `/v1/models` both succeed.
+        let generation = probe.sleep.begin_generation();
+        let unproven = probe.record(
+            true,
+            true,
+            reading(
+                SleepFact::Unobserved,
+                generation,
+                started + Duration::from_millis(50),
+            ),
+            1,
+            1,
+        );
+
+        assert!(unproven.ready);
+        assert_eq!(unproven.sleeping_level, None);
+        assert_eq!(
+            unproven.age, None,
+            "the pre-start timestamp must not present an unproven process as freshly awake; \
+             admission rejects a missing age as stale_probe"
+        );
+
+        // Only `/is_sleeping` itself restores admissibility.
+        probe.record(
+            true,
+            true,
+            reading(
+                SleepFact::Observed(None),
+                generation,
+                started + Duration::from_millis(100),
+            ),
+            1,
+            1,
+        );
+        assert_eq!(
+            probe.status_at(started + Duration::from_millis(100)).age,
+            Some(Duration::ZERO)
+        );
+    }
+
+    #[test]
+    fn a_woken_process_cannot_inherit_the_proof_that_it_was_asleep() {
+        let started = Instant::now();
+        let mut probe = ProbeDebounce::default();
+
+        let asleep = probe.record(
+            false,
+            false,
+            reading(
+                SleepFact::Observed(Some(1)),
+                probe.sleep.generation,
+                started,
+            ),
+            1,
+            1,
+        );
+        assert_eq!(asleep.sleeping_level, Some(1));
+        assert_eq!(probe.status_at(started).age, Some(Duration::ZERO));
+
+        // `wake` retires the asleep proof. A failed `/is_sleeping` with healthy HTTP
+        // must not resolve to "awake, proved a moment ago": the awake claim would be
+        // carrying the timestamp that proved the service asleep.
+        let generation = probe.sleep.begin_generation();
+        let unproven = probe.record(
+            true,
+            true,
+            reading(
+                SleepFact::Unobserved,
+                generation,
+                started + Duration::from_millis(50),
+            ),
+            1,
+            1,
+        );
+
+        assert_eq!(unproven.sleeping_level, None);
+        assert_eq!(unproven.age, None);
+    }
+
+    #[test]
+    fn an_observation_of_a_superseded_process_is_discarded() {
+        let started = Instant::now();
+        let mut probe = ProbeDebounce::default();
+        // An observation reads the generation before it probes, so a lifecycle command
+        // that lands while `/is_sleeping` is in flight supersedes its answer.
+        let in_flight = probe.sleep.generation;
+        probe.sleep.begin_generation();
+
+        let superseded = probe.record(
+            true,
+            true,
+            reading(SleepFact::Observed(None), in_flight, started),
+            1,
+            1,
+        );
+
+        assert_eq!(
+            superseded.age, None,
+            "an answer from the previous process must not prove the current one"
+        );
+    }
+
+    #[test]
+    fn a_sleep_proof_never_moves_its_value_and_timestamp_apart() {
+        let started = Instant::now();
+        let mut proof = SleepProof::default();
+        let generation = proof.generation;
+
+        proof.prove(generation, Some(1), started);
+        assert_eq!(proof.level(), Some(1));
+        assert_eq!(proof.age_at(started), Some(Duration::ZERO));
+
+        // Every published value carries the instant that proved it, and vice versa:
+        // there is no state in which one has advanced without the other.
+        proof.prove(generation, None, started + Duration::from_secs(1));
+        assert_eq!(proof.level(), None);
+        assert_eq!(
+            proof.age_at(started + Duration::from_secs(1)),
+            Some(Duration::ZERO)
+        );
+
+        // A commanded sleep supersedes the awake proof with one of its own.
+        proof.prove_new_generation(Some(2), started + Duration::from_secs(2));
+        assert_eq!(proof.level(), Some(2));
+        assert_eq!(
+            proof.age_at(started + Duration::from_secs(2)),
+            Some(Duration::ZERO)
+        );
+
+        // Retiring a generation drops the value and its timestamp together.
+        proof.begin_generation();
+        assert_eq!(proof.level(), None);
+        assert_eq!(proof.age_at(started + Duration::from_secs(3)), None);
     }
 
     #[test]

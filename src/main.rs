@@ -1,4 +1,4 @@
-use std::{env, error::Error, sync::Arc, time::Duration};
+use std::{env, error::Error, path::Path, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use pingora::{
@@ -12,15 +12,25 @@ use vllm_router::{
     PoolManager,
     api::{ControlPlane, TokenAuth},
     config::{ConfigStore, RouterConfig},
+    gpu::GpuInventory,
     metrics,
     pool::{ManagedVllmRunner, Pool, PoolError, managed_pool_from_config},
     proxy::DataPlane,
     state::Lifecycle,
+    sysd::dry_run_generated_inputs,
 };
 
 struct Arguments {
     pingora: Opt,
     router_config: String,
+    host_gpu_check: HostGpuCheck,
+}
+
+/// Whether configuration is being checked on the host it will run on.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HostGpuCheck {
+    Required,
+    Skipped,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -32,15 +42,21 @@ fn main() -> Result<(), Box<dyn Error>> {
         .init();
 
     let arguments = parse_arguments()?;
-    // Validate application configuration before Pingora handles `-t` and
-    // exits, so config-check mode covers both files.
+    // Everything that decides whether this process can serve has to be decided
+    // above `bootstrap()`: Pingora's `-t` exits inside it, so a check placed
+    // later cannot fail a configuration that will not start. Only checks owning
+    // no runtime state belong up here — a token is bytes and NVML is a
+    // synchronous library handle dropped again immediately, while the D-Bus
+    // connection and the pool stay below because zbus binds its I/O tasks to
+    // the runtime that created the connection.
     let router_config = RouterConfig::load(&arguments.router_config)?;
+    let (management_auth, inference_auth) =
+        preflight_host_checks(&router_config, arguments.host_gpu_check)?;
     let mut server = Server::new(Some(arguments.pingora))?;
     ensure_foreground_mode(server.configuration.daemon)?;
     server.bootstrap();
 
     let config = Arc::new(ConfigStore::new(router_config.clone())?);
-    let auth = TokenAuth::load(&router_config.listeners.management_bearer_token_file)?;
     // zbus owns I/O tasks on the runtime where its connection is constructed.
     // Keep this dedicated runtime alive for the process, while allowing Pingora
     // to construct and block on its own runtimes in `run_forever`.
@@ -53,13 +69,13 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let mut data_plane = Service::new(
         "vLLM router data plane".into(),
-        DataPlane::new(Arc::clone(&config), Arc::clone(&facade))?,
+        DataPlane::new(Arc::clone(&config), Arc::clone(&facade), inference_auth)?,
     );
     data_plane.add_tcp(&router_config.listeners.data_plane.to_string());
 
     let mut management = Service::new(
         "vLLM router management".into(),
-        ControlPlane::new(Arc::clone(&config), facade, auth, 1_024),
+        ControlPlane::new(Arc::clone(&config), facade, management_auth, 1_024),
     );
     management.add_tcp(&router_config.listeners.management.to_string());
 
@@ -186,6 +202,100 @@ fn observation_interval(config: &RouterConfig) -> Duration {
     Duration::from_millis(config.observation_interval_ms())
 }
 
+/// Checks that must hold before the process can serve, run before `-t` exits.
+///
+/// Every problem found is reported, not just the first: an operator validating a
+/// replacement configuration during an upgrade window should learn about all of
+/// them in one run.
+fn preflight_host_checks(
+    config: &RouterConfig,
+    host_gpu_check: HostGpuCheck,
+) -> Result<(TokenAuth, TokenAuth), String> {
+    let mut errors = Vec::new();
+    let management = load_bearer_token(
+        "management_bearer_token_file",
+        &config.listeners.management_bearer_token_file,
+        &mut errors,
+    );
+    let inference = load_bearer_token(
+        "inference_bearer_token_file",
+        &config.listeners.inference_bearer_token_file,
+        &mut errors,
+    );
+    check_host_gpus(config, host_gpu_check, &mut errors);
+
+    if let (true, Some(management), Some(inference)) = (errors.is_empty(), management, inference) {
+        return Ok((management, inference));
+    }
+    for problem in &errors {
+        error!(problem = %problem, "configuration cannot start on this host");
+    }
+    Err(format!(
+        "configuration cannot start on this host ({} problem(s)): {}",
+        errors.len(),
+        errors.join("; ")
+    ))
+}
+
+fn load_bearer_token(setting: &str, path: &Path, errors: &mut Vec<String>) -> Option<TokenAuth> {
+    match TokenAuth::load(path) {
+        Ok(auth) => Some(auth),
+        Err(error) => {
+            errors.push(format!("listeners.{setting}: {error}"));
+            None
+        }
+    }
+}
+
+/// Confirm the configured GPUs exist on this host and that the units this
+/// configuration would generate can actually be rendered from them.
+///
+/// Static validation only proves the placement UUIDs match `inventory.gpus`, so
+/// one typo repeated in both sections passes it; only NVML can reject that.
+fn check_host_gpus(config: &RouterConfig, check: HostGpuCheck, errors: &mut Vec<String>) {
+    if check == HostGpuCheck::Skipped {
+        warn!(
+            "--skip-host-gpu-check: configured GPU UUIDs were NOT validated against this host, \
+             and this configuration may still fail to start"
+        );
+        return;
+    }
+
+    let devices = match GpuInventory::initialize().inventory() {
+        Ok(devices) => devices,
+        Err(error) => {
+            // Startup resolves every placement UUID through NVML and fails
+            // without it, so passing here would be the same false assurance
+            // this check exists to remove. Off-host validation stays possible,
+            // but only by asking for it.
+            errors.push(format!(
+                "{error}; startup resolves GPU UUIDs through NVML, so pass \
+                 --skip-host-gpu-check to validate this configuration off-host"
+            ));
+            return;
+        }
+    };
+
+    let present = devices.keys().cloned().collect::<Vec<_>>();
+    for gpu in &config.inventory.gpus {
+        if !devices.contains_key(&gpu.uuid) {
+            errors.push(format!(
+                "inventory.gpus lists GPU UUID {:?}, which this host does not have (present: {})",
+                gpu.uuid,
+                present.join(", ")
+            ));
+        }
+    }
+
+    let indices = devices
+        .into_iter()
+        .map(|(uuid, device)| (uuid, device.index))
+        .collect();
+    if let Err(error) = dry_run_generated_inputs(config, &indices) {
+        errors.push(error.to_string());
+    }
+}
+
 fn parse_arguments() -> Result<Arguments, String> {
     parse_arguments_from(
         env::args().skip(1),
@@ -198,6 +308,7 @@ fn parse_arguments_from(
     mut router_config: String,
 ) -> Result<Arguments, String> {
     let mut pingora = Opt::default();
+    let mut host_gpu_check = HostGpuCheck::Required;
     let mut arguments = arguments.into_iter();
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
@@ -216,10 +327,12 @@ fn parse_arguments_from(
             "-d" | "--daemon" => return Err(daemon_mode_error()),
             "-t" | "--test" => pingora.test = true,
             "-u" | "--upgrade" => pingora.upgrade = true,
+            "--skip-host-gpu-check" => host_gpu_check = HostGpuCheck::Skipped,
             "--nocapture" => pingora.nocapture = true,
             "-h" | "--help" => {
                 return Err(
-                    "usage: vllm-router [-tu] -c <pingora.yaml> --router-config <router.yaml>"
+                    "usage: vllm-router [-tu] [--skip-host-gpu-check] -c <pingora.yaml> \
+                     --router-config <router.yaml>"
                         .into(),
                 );
             }
@@ -232,6 +345,7 @@ fn parse_arguments_from(
     Ok(Arguments {
         pingora,
         router_config,
+        host_gpu_check,
     })
 }
 
@@ -253,7 +367,41 @@ mod tests {
     use pingora::server::configuration::ServerConf;
     use vllm_router::pool::PoolError;
 
-    use super::{ensure_foreground_mode, parse_arguments_from, should_warn_reconciliation_error};
+    use super::{
+        HostGpuCheck, check_host_gpus, ensure_foreground_mode, parse_arguments_from,
+        should_warn_reconciliation_error,
+    };
+
+    #[test]
+    fn host_gpu_validation_is_required_unless_explicitly_skipped() {
+        for (flags, expected) in [
+            (vec!["-t"], HostGpuCheck::Required),
+            (vec!["-t", "--skip-host-gpu-check"], HostGpuCheck::Skipped),
+        ] {
+            let mut command_line: Vec<String> =
+                flags.into_iter().map(ToString::to_string).collect();
+            command_line.extend(["-c".to_string(), "pingora.yaml".to_string()]);
+
+            let arguments = parse_arguments_from(command_line, "router.yaml".to_string())
+                .expect("command line should parse");
+
+            assert_eq!(arguments.host_gpu_check, expected);
+        }
+    }
+
+    /// The off-host escape hatch must stay usable where NVML cannot answer, which
+    /// is the only reason it exists.
+    #[test]
+    fn skipping_host_gpu_validation_reports_no_problems() {
+        let config: vllm_router::config::RouterConfig =
+            serde_yaml::from_str(include_str!("config/example.yaml"))
+                .expect("example configuration should parse");
+        let mut errors = Vec::new();
+
+        check_host_gpus(&config, HostGpuCheck::Skipped, &mut errors);
+
+        assert!(errors.is_empty(), "unexpected problems: {errors:?}");
+    }
 
     #[test]
     fn rejects_daemon_command_line_modes() {

@@ -8,7 +8,10 @@ use zbus::{Connection, Proxy, zvariant::OwnedObjectPath};
 
 mod generator;
 
-pub use generator::{GENERATED_UNIT_DIRECTORY, GeneratedSystemdError, install_generated_inputs};
+pub use generator::{
+    GENERATED_UNIT_DIRECTORY, GeneratedSystemdError, dry_run_generated_inputs,
+    install_generated_inputs,
+};
 
 const SYSTEMD_DESTINATION: &str = "org.freedesktop.systemd1";
 const SYSTEMD_MANAGER_PATH: &str = "/org/freedesktop/systemd1";

@@ -1,4 +1,8 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
 
 use async_trait::async_trait;
 use http::{Method, Response, StatusCode, header};
@@ -11,8 +15,9 @@ use uuid::Uuid;
 use crate::{
     config::{ConfigStore, DeadlineConfig, RouterConfig},
     pool::{
-        DrainRequest, EnsureReadyRequest, LifecycleRequest, PoolError, PoolManager, SleepLevel,
-        SleepRequest, StatusRequest, StopRequest, TransitionOutcome,
+        AdmissionVerdict, DrainRequest, EnsureReadyRequest, LifecycleRequest, PoolError,
+        PoolManager, SleepLevel, SleepRequest, StatusRequest, StopRequest, TransitionOutcome,
+        admission_verdict,
     },
     state::{Lifecycle, ServiceStatus},
 };
@@ -50,7 +55,7 @@ impl ControlPlane {
             return json_response(StatusCode::OK, json!({"status": "live"}));
         }
         if path == "/readyz" {
-            return match self.pool.status(StatusRequest::default()).await {
+            return match self.pool.status_snapshot().await {
                 Ok(status) => readiness_response(&self.config.snapshot(), &status.services),
                 Err(error) => api_error(
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -249,14 +254,19 @@ impl ControlPlane {
         // Joined flights are audited at the pool boundary so data-plane
         // stampedes and management requests share one authoritative record.
         if !joined_existing {
+            // Only the options this action actually carries are recorded, so the accepted
+            // record and the pool's joined record describe the same operation policy — the
+            // policy a later caller must match to join rather than be refused.
+            let starting = matches!(kind, OperationKind::Start | OperationKind::Wake);
             info!(
                 audit = true,
                 operation_id = %id,
                 service,
                 action,
                 joined_existing = false,
-                force,
-                evict = options.evict.unwrap_or(false),
+                force = (!starting).then_some(force),
+                evict = starting.then(|| options.evict.unwrap_or(false)),
+                reactivate_drained = starting.then_some(true),
                 "pool mutation accepted"
             );
         }
@@ -439,10 +449,29 @@ impl RoutingReadiness {
     }
 }
 
-fn routing_readiness(config: &RouterConfig, services: &[ServiceStatus]) -> RoutingReadiness {
+/// States a request can wait through rather than be rejected in.
+///
+/// Parking a request across a cold start is the router's value proposition, so a
+/// service that is merely not awake yet is still a route, not an outage.
+fn is_parkable(lifecycle: Lifecycle) -> bool {
+    matches!(
+        lifecycle,
+        Lifecycle::Stopped
+            | Lifecycle::Starting
+            | Lifecycle::AsleepL1
+            | Lifecycle::AsleepL2
+            | Lifecycle::Waking
+    )
+}
+
+fn routing_readiness(
+    config: &RouterConfig,
+    services: &[ServiceStatus],
+    now: SystemTime,
+) -> RoutingReadiness {
     let observed: HashMap<_, _> = services
         .iter()
-        .map(|status| (status.service.as_str(), status.lifecycle))
+        .map(|status| (status.service.as_str(), status))
         .collect();
     let enabled_services = config
         .services
@@ -454,20 +483,18 @@ fn routing_readiness(config: &RouterConfig, services: &[ServiceStatus]) -> Routi
         .iter()
         .filter(|service| service.enabled)
         .filter(|service| {
-            observed
-                .get(service.name.as_str())
-                .is_some_and(|lifecycle| {
-                    *lifecycle == Lifecycle::Running
-                        || (service.automatic_start
-                            && matches!(
-                                lifecycle,
-                                Lifecycle::Stopped
-                                    | Lifecycle::Starting
-                                    | Lifecycle::AsleepL1
-                                    | Lifecycle::AsleepL2
-                                    | Lifecycle::Waking
-                            ))
-                })
+            observed.get(service.name.as_str()).is_some_and(|status| {
+                // Readiness answers exactly the question admission asks, so a fleet whose
+                // running facts have all aged out reports itself unroutable instead of
+                // inviting a load balancer into a 503-only pool.
+                let verdict = admission_verdict(
+                    status,
+                    Duration::from_millis(service.readiness.maximum_probe_age_ms),
+                    now,
+                );
+                verdict == AdmissionVerdict::Admissible
+                    || (service.automatic_start && is_parkable(status.lifecycle))
+            })
         })
         .count();
     RoutingReadiness {
@@ -477,7 +504,7 @@ fn routing_readiness(config: &RouterConfig, services: &[ServiceStatus]) -> Routi
 }
 
 fn readiness_response(config: &RouterConfig, services: &[ServiceStatus]) -> Response<Vec<u8>> {
-    let readiness = routing_readiness(config, services);
+    let readiness = routing_readiness(config, services, SystemTime::now());
     if readiness.is_ready() {
         return json_response(
             StatusCode::OK,
@@ -531,8 +558,13 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
+    use pingora::protocols::l4::stream::Stream as PingoraStream;
     use tempfile::NamedTempFile;
-    use tokio::sync::Notify;
+    use tokio::{
+        io::AsyncWriteExt,
+        net::{TcpListener, TcpStream},
+        sync::Notify,
+    };
 
     use super::*;
     use crate::{
@@ -648,6 +680,26 @@ mod tests {
         status
     }
 
+    /// A running service whose cached facts active admission accepts.
+    fn admissible(service: &str) -> ServiceStatus {
+        let mut status = observed(service, Lifecycle::Running);
+        status.systemd = SystemdStatus {
+            state: SystemdState::Active,
+            sub_state: Some("running".into()),
+            main_pid: Some(42),
+        };
+        status.probe = ProbeStatus {
+            healthy: true,
+            ready: true,
+            served_model_matches: true,
+            sleeping_level: None,
+            consecutive_successes: 2,
+            consecutive_failures: 0,
+            age: Some(Duration::ZERO),
+        };
+        status
+    }
+
     fn configured_deadlines() -> DeadlineConfig {
         DeadlineConfig {
             startup_ms: 601_000,
@@ -757,8 +809,12 @@ mod tests {
     #[test]
     fn readiness_accepts_running_and_automatic_convergence_states() {
         let config = config();
+        let service = config.services[0].name.clone();
+        assert!(
+            routing_readiness(&config, &[admissible(&service)], SystemTime::now()).is_ready(),
+            "an admissible running service should accept data-plane requests"
+        );
         for lifecycle in [
-            Lifecycle::Running,
             Lifecycle::Stopped,
             Lifecycle::Starting,
             Lifecycle::AsleepL1,
@@ -766,7 +822,7 @@ mod tests {
             Lifecycle::Waking,
         ] {
             assert!(
-                routing_readiness(&config, &[observed(&config.services[0].name, lifecycle)])
+                routing_readiness(&config, &[observed(&service, lifecycle)], SystemTime::now())
                     .is_ready(),
                 "{lifecycle:?} should accept data-plane requests"
             );
@@ -790,11 +846,89 @@ mod tests {
             Lifecycle::Unknown,
         ] {
             assert!(
-                !routing_readiness(&config, &[observed(&service, lifecycle)]).is_ready(),
+                !routing_readiness(&config, &[observed(&service, lifecycle)], SystemTime::now())
+                    .is_ready(),
                 "{lifecycle:?} should not be considered routable"
             );
         }
-        assert!(!routing_readiness(&config, &[]).is_ready());
+        assert!(!routing_readiness(&config, &[], SystemTime::now()).is_ready());
+    }
+
+    #[test]
+    fn readiness_rejects_a_running_service_whose_probe_aged_out_of_admission() {
+        let config = config();
+        let service = config.services[0].name.clone();
+        let maximum_probe_age =
+            Duration::from_millis(config.services[0].readiness.maximum_probe_age_ms);
+        let now = SystemTime::now();
+
+        let mut fresh = admissible(&service);
+        fresh.probe.age = Some(maximum_probe_age);
+        assert!(
+            routing_readiness(&config, &[fresh], now).is_ready(),
+            "a probe exactly at the configured maximum is still admissible"
+        );
+
+        let mut aged = admissible(&service);
+        aged.probe.age = Some(maximum_probe_age + Duration::from_millis(1));
+        assert!(
+            !routing_readiness(&config, &[aged.clone()], now).is_ready(),
+            "a running service admission rejects as stale is not a route"
+        );
+        let response = readiness_response(&config, &[aged]);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response_json(&response)["error"]["code"],
+            "routing_not_ready"
+        );
+
+        // A never-observed probe fails closed the same way: the reconciler can publish
+        // Running with no age after a failed start.
+        let mut unobserved = admissible(&service);
+        unobserved.probe.age = None;
+        assert!(!routing_readiness(&config, &[unobserved], now).is_ready());
+    }
+
+    #[test]
+    fn readiness_ages_probes_forward_without_writing_to_the_status_it_reads() {
+        let config = config();
+        let service = config.services[0].name.clone();
+        let maximum_probe_age =
+            Duration::from_millis(config.services[0].readiness.maximum_probe_age_ms);
+        let mut status = admissible(&service);
+        status.probe.age = Some(maximum_probe_age);
+        let untouched = status.clone();
+
+        // The stored age only advances when the state store is written, so readiness has
+        // to extrapolate from `observed_at` rather than mutate the record.
+        let now = status.observed_at + maximum_probe_age + Duration::from_secs(1);
+        assert!(!routing_readiness(&config, &[status.clone()], now).is_ready());
+        assert!(routing_readiness(&config, &[status.clone()], status.observed_at).is_ready());
+        assert_eq!(status, untouched);
+    }
+
+    #[test]
+    fn a_stale_replica_does_not_hide_a_healthy_one() {
+        let mut config = config();
+        let primary = config.services[0].name.clone();
+        let mut replica = config.services[0].clone();
+        replica.name = "replica".into();
+        config.services.push(replica);
+        let mut stale = admissible(&primary);
+        stale.probe.age = Some(
+            Duration::from_millis(config.services[0].readiness.maximum_probe_age_ms)
+                + Duration::from_secs(1),
+        );
+
+        let readiness =
+            routing_readiness(&config, &[stale, admissible("replica")], SystemTime::now());
+        assert_eq!(
+            readiness,
+            RoutingReadiness {
+                enabled_services: 2,
+                routable_services: 1,
+            }
+        );
     }
 
     #[test]
@@ -808,9 +942,10 @@ mod tests {
         let readiness = routing_readiness(
             &config,
             &[
-                observed(&primary, Lifecycle::Running),
+                admissible(&primary),
                 observed("optional", Lifecycle::Failed),
             ],
+            SystemTime::now(),
         );
         assert_eq!(
             readiness,
@@ -822,7 +957,7 @@ mod tests {
         let response = readiness_response(
             &config,
             &[
-                observed(&primary, Lifecycle::Running),
+                admissible(&primary),
                 observed("optional", Lifecycle::Failed),
             ],
         );
@@ -830,6 +965,21 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(response.body()).unwrap();
         assert_eq!(body["status"], "ready");
         assert_eq!(body["routable_services"], 1);
+    }
+
+    #[test]
+    fn readiness_stays_ready_while_a_request_can_park_through_a_cold_start() {
+        let config = config();
+        let service = config.services[0].name.clone();
+        for lifecycle in [Lifecycle::Stopped, Lifecycle::Starting] {
+            let response = readiness_response(&config, &[observed(&service, lifecycle)]);
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "{lifecycle:?} is a park, not an outage"
+            );
+            assert_eq!(response_json(&response)["status"], "ready");
+        }
     }
 
     #[test]
@@ -845,6 +995,88 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(response.body()).unwrap();
         assert_eq!(body["error"]["code"], "routing_not_ready");
         assert!(body["error"]["message"].is_string());
+    }
+
+    #[tokio::test]
+    async fn health_probes_stay_credential_free_while_the_pool_api_stays_gated() {
+        let router_config = config();
+        let service = router_config.services[0].name.clone();
+        let config = Arc::new(ConfigStore::new(router_config).unwrap());
+        let pool = Pool::new(
+            vec![PoolServiceDefinition::new(
+                service.clone(),
+                service.clone(),
+                vec!["gpu-health".into()],
+            )],
+            ControlledRunner::new(false),
+        )
+        .unwrap();
+        pool.reconcile(&service).await.unwrap();
+        let facade: Arc<dyn PoolManager> = Arc::new(pool);
+        let control = ControlPlane::new(config, facade, test_auth(), 4);
+
+        let live = route_uncredentialed(&control, "GET /livez HTTP/1.1").await;
+        assert_eq!(live.status(), StatusCode::OK);
+        assert_eq!(response_json(&live)["status"], "live");
+
+        let ready = route_uncredentialed(&control, "GET /readyz HTTP/1.1").await;
+        assert_eq!(ready.status(), StatusCode::OK);
+        assert_eq!(response_json(&ready)["status"], "ready");
+
+        let services = route_uncredentialed(&control, "GET /pool/v1/services HTTP/1.1").await;
+        assert_eq!(services.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response_json(&services)["error"]["code"], "unauthorized");
+    }
+
+    #[tokio::test]
+    async fn readiness_probes_do_not_disturb_the_state_store() {
+        let router_config = config();
+        let service = router_config.services[0].name.clone();
+        let config = Arc::new(ConfigStore::new(router_config).unwrap());
+        let pool = Pool::new(
+            vec![PoolServiceDefinition::new(
+                service.clone(),
+                service.clone(),
+                vec!["gpu-readiness".into()],
+            )],
+            ControlledRunner::new(true),
+        )
+        .unwrap();
+        pool.reconcile(&service).await.unwrap();
+        let mut watcher = PoolManager::subscribe(&pool, service.clone()).unwrap();
+        watcher.mark_unchanged();
+        let facade: Arc<dyn PoolManager> = Arc::new(pool.clone());
+        let control = ControlPlane::new(config, facade, test_auth(), 4);
+
+        let ready = route_uncredentialed(&control, "GET /readyz HTTP/1.1").await;
+        assert_eq!(ready.status(), StatusCode::OK);
+        assert!(
+            !watcher.has_changed().unwrap(),
+            "a readiness probe must not publish state or wake watchers"
+        );
+
+        // The admission path deliberately does write, which is what readiness must avoid
+        // inheriting by sharing that call path.
+        let active = PoolManager::acquire_active(&pool, service).await.unwrap();
+        assert!(watcher.has_changed().unwrap());
+        drop(active);
+    }
+
+    async fn route_uncredentialed(control: &ControlPlane, request_line: &str) -> Response<Vec<u8>> {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(address).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        client
+            .write_all(
+                format!("{request_line}\r\nHost: router.test\r\nConnection: close\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut session = ServerSession::new_http1(Box::new(PingoraStream::from(server)));
+        assert!(session.read_request().await.unwrap());
+        control.route(&mut session).await
     }
 
     #[tokio::test]
