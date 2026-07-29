@@ -85,3 +85,43 @@ compatibility fields differ (`maximum_model_length`, `kv_cache_dtype`; extend as
 contract grows). Different contracts must use different `served_model` ids — which is
 exactly the F2 variant-modeling rule. Table-driven test alongside the existing
 duplicate/alias rules.
+
+**F2 wording correction (found while enumerating tests):** the invariant is **one
+entry per unique served model**, not per service — replicas share a `served_model`
+and must collapse into a single entry (well-defined precisely because F3 makes
+replica contracts homogeneous). "One entry per service" would reintroduce the
+duplication for replica sets.
+
+## Required test coverage for F1–F3
+
+**F1 — generator (unit):**
+- renders `--served-model-name <canonical> <alias…>` in declaration order;
+- no aliases → single name (pin existing behavior);
+- alias values pass `exec_argument` escaping (an alias containing a quote/space is
+  either rejected by config validation or rendered safely — pin whichever holds);
+- runner observe: `served_model_matches` true when the backend's model list contains
+  canonical **plus** extra names (multi-name listing), false when only aliases appear
+  without the canonical.
+- On-box (runbook Tier 3): alias-named completion succeeds end-to-end.
+
+**F2 — models synthesis (unit):**
+- two services, one with two aliases → exactly two entries; alias strings appear only
+  in the `aliases` field, never as `id`s;
+- **two replicas of one served model → exactly one entry** (the corrected invariant);
+  its `aliases` is the union of the replicas' aliases;
+- `max_model_len` equals `compatibility.maximum_model_length`;
+- serialized shape keeps OpenAI-required fields (`object: "list"`, `data[].id/object/
+  created/owned_by`) so standard clients parse it; extension fields present;
+- `POST /v1/models` still 405 (pin existing behavior).
+
+**F3 — config validation (table-driven):**
+- same `served_model`, differing `maximum_model_length` → rejected, message names
+  both services and the field;
+- same `served_model`, differing `kv_cache_dtype` → rejected;
+- same `served_model`, identical contract → accepted (replica set);
+- different `served_model` sharing one `model_path` (the 32k/128k variant case) →
+  accepted;
+- decision to pin while writing these: whether one alias may be declared on two
+  replicas of the same canonical (currently `alias_owners` likely rejects any
+  cross-service duplicate even when the canonical matches — either allow-when-same-
+  canonical or document declare-on-one-replica; test whichever is chosen).
