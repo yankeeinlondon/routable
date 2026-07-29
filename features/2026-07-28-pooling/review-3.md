@@ -156,3 +156,33 @@ a lazy `PoolManager` handle — larger diff, same guarantee.
 binary with a minimal valid config on ephemeral ports, polls `/livez` until 200, and
 sends SIGTERM — i.e. "the binary actually serves." Wire it into the runbook's Tier 1
 so no future refactor of `main` can regress unserved again.
+
+---
+
+## Verification (2026-07-29, on CT 107)
+
+All four findings verified against commit `8e4e955`:
+
+- **F1 ✓** — the router-generated unit renders `--served-model-name
+  "qwen3.6-27b-nvfp4" "qwen27b"` (canonical + alias, exec-quoted); generator tests
+  cover ordering, escaping, and the replica alias union.
+- **F2 ✓ (live)** — `GET /v1/models` against the running router returns exactly one
+  entry: canonical `id`, `aliases: ["qwen27b"]`, `max_model_len: 32768`, OpenAI shape
+  intact.
+- **F3 ✓** — `validate_replica_contract` in place with table-driven tests; the
+  alias-ownership decision went allow-when-same-canonical.
+- **F4 ✓ (live)** — `main` is synchronous with a dedicated process-lifetime
+  `vllm-router-pool` runtime; the new `tests/binary_serves.rs` regression passes as
+  root, and the router **served for the first time**: `/livez`, `/readyz`
+  (`routable_services: 1`), and the data plane all answered on 6969–6971.
+
+Full suite: 141 tests pass (136 lib + 4 bin + binary_serves), clippy clean.
+
+**Field note:** at first live startup the drift detector immediately flagged ~30 GB of
+unmanaged usage per GPU (an operator-launched vLLM TP=2 instance occupying both
+cards) — advisory-only, exactly as designed (C5). The Tier-3 cold-start smoke is
+blocked until a GPU is freed; a cold start attempted now would OOM against the
+unmanaged occupant, since v1 placement is declaration-based and does not treat
+unmanaged processes as placement blockers (a deliberate v1 scope line worth a
+runbook/README caveat: the router assumes it is the only GPU tenant besides declared
+services).
