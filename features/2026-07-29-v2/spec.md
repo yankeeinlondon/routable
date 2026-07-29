@@ -85,6 +85,22 @@ naive symmetric launch (50/50) would OOM GPU1. v2 must place such a model gracef
   (`--tensor-split`) and accelerate-style servers (`max_memory` per device) support
   arbitrary splits natively. The `Runner` adapter gains a planning hook ("given these
   per-GPU budgets, produce launch parameters or decline"); the pool stays generic.
+- **Variable topology via declared placement profiles:** a service that can run in more
+  than one shape (M3: ideally TP=1 on a single GPU; a two-GPU split when both GPUs are
+  partially occupied) declares an *ordered* list of pre-validated placement profiles
+  (parallelism, per-GPU VRAM requirement, compatibility limits such as maximum model
+  length against the smaller KV budget) — the planner never invents topologies. It
+  tries profiles in declared preference order, first non-destructively against the free
+  ledger, then with eligible evictions; the first feasible profile wins, and "all
+  residents stay in memory" is the existing no-overcommit invariant. Omitting profiles
+  means the single fixed shape (v1 behavior). Notes: for vLLM TP a split profile's
+  effective budget is `degree × min(free across chosen GPUs)`, not the aggregate
+  (llama.cpp `--tensor-split` and accelerate-style runners do get the aggregate);
+  per-profile cold-start cost differs (torch.compile caches per shape). A forced split
+  is a *degraded* placement: report the active profile in status/metrics, and note it
+  self-heals at the next lifecycle boundary — bindings recompute at every start, so an
+  idle-stop→cold-start cycle or an explicit drain/stop/start re-optimizes placement
+  without any configuration change.
 - **Eviction as budget reclamation:** under co-residency, evicting a service frees its
   *budget*, not a whole GPU. The victim planner must find the minimal-cost eligible set
   whose reclaimed budgets (including slept residuals) make the candidate placement
