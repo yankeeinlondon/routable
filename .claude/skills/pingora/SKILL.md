@@ -85,7 +85,7 @@ Run: `RUST_LOG=INFO cargo run -- -c conf.yaml` (flags: `-d` daemon, `-t` test co
 | Task | Read |
 |---|---|
 | Phase callbacks, CTX, HttpPeer/PeerOptions/timeouts, short-circuit responses, header/body rewriting, retries/failover, SSE/LLM token streaming | [references/proxy-lifecycle.md](references/proxy-lifecycle.md) |
-| LoadBalancer, selection algorithms, health checks, **dynamic backends / ServiceDiscovery**, background services, multi-pool routing (by path/header/model) | [references/load-balancing.md](references/load-balancing.md) |
+| LoadBalancer, selection algorithms, health checks, **dynamic backends / ServiceDiscovery**, background services, multi-pool routing, and coordinated dynamic route/service registration | [references/load-balancing.md](references/load-balancing.md) |
 | Server/Service/runtime model, YAML config + Opt/ServerConf, daemonization, signals, **zero-downtime graceful upgrade**, prometheus, sentry | [references/server-lifecycle.md](references/server-lifecycle.md) |
 | Rate limiting (Rate/Inflight/Estimator), in-memory caches (MemoryCache/TinyUFO), HTTP cache layer (pingora-cache), fast timeouts | [references/limits-and-cache.md](references/limits-and-cache.md) |
 | Full crate inventory (all 20 workspace members), feature-flag matrix, version history, ecosystem projects (River, Pingap), limitations | [references/crate-ecosystem.md](references/crate-ecosystem.md) |
@@ -95,9 +95,12 @@ Run: `RUST_LOG=INFO cargo run -- -c conf.yaml` (flags: `-d` daemon, `-t` test co
 - **TLS mismatch = 502**: `HttpPeer::new(addr, true, sni)` against a plain-HTTP upstream fails. For non-TLS upstreams pass `(addr, false, String::new())`.
 - **Forgetting the background service**: health checks and discovery only run if you `server.add_service(background_service(...))` — the LoadBalancer alone does nothing periodically.
 - **Rewriting bodies**: remove `Content-Length` (and set `Transfer-Encoding: chunked`) in `response_filter` before mutating chunks in `response_body_filter`, or clients hang.
+- **Body-based upstream choice is not ordinary `ProxyHttp` routing**: request-body filters run after `upstream_peer`, and replay is capped at 64 KiB. For bounded multimodal/LLM JSON bodies, use a custom `HttpServerApp` plus your own client, or route on a trusted header when clients are controlled.
 - **`peer.options.read_timeout` resets on every read** — it's an inter-chunk idle timeout, which is exactly right for LLM token streams (won't kill an active long stream).
 - **Retry safety**: `fail_to_connect` guarantees nothing was sent upstream (safe to retry even POSTs, via `e.set_retry(true)`); `error_while_proxy` does not — default only retries reused connections.
 - **`Backend` identity = (addr, weight)**: changing a weight makes it a "new" backend (health state resets). `ext` is ignored for equality.
+- **`ServiceDiscovery` changes members of one existing pool**: adding a new model/route/service is an application transaction across every registry and must publish its routing snapshot last.
+- **Approximate inflight is not drain safety**: `pingora_limits::Inflight` is suitable for selection and soft caps; use exact RAII counters for lifecycle drain/stop decisions.
 - **Version drift**: repo `main` docs/examples may be ahead of your pinned crates.io release (e.g. `fail_to_proxy` returns `FailToProxy` struct on main, `u16` on ≤0.5). Verify signatures on docs.rs for your version.
 - **`run_forever()` must be called from a synchronous `main`** — it does a `block_on` internally and panics ("Cannot start a runtime from within a runtime") under `#[tokio::main]`. Async setup before it needs a dedicated runtime you keep alive. See server-lifecycle.md § Runtime rules.
 - **Detached `tokio::spawn` tasks on a service's runtime block graceful shutdown** — pingora waits for each service runtime to quiesce; a lingering task hangs SIGTERM until the (long) timeout. Spawn long-lived work on your own runtime or abort it on `ShutdownWatch`.

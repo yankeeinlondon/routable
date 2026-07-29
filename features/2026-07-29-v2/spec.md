@@ -59,14 +59,17 @@ adds complexity, by layer:
   CPU-only services (`gpu_ids: []`), making host RAM a first-class scheduling
   resource. Host-RAM accounting needs classes: vLLM L1 sleep RAM is *pinned*;
   mmap'd GGUF is *reclaimable page cache* unless `--mlock` (then pinned).
-  Conversely, `--tensor-split` gives llama.cpp native asymmetric splits — it is the
-  easy runner for US4/US6.
+  Conversely, `--tensor-split` exposes a native asymmetric-split mechanism, but the
+  V2-S6 CPU probe did not validate realized CUDA placement or byte-budget adherence.
+  Treat it as a runner planning input, not an easy US4/US6 guarantee.
 - **Endpoint capability routing (data plane — the one leak outside the adapter):**
   the endpoint allowlist must become a per-service capability set intersected at
-  admission. llama.cpp serves the OpenAI core but not Anthropic `/v1/messages` or the
-  Cohere/score/rerank family; a request for an unsupported endpoint must fail with a
-  distinct "endpoint not supported by this model" error *before* any lifecycle action
-  can fire (never cold-start a model the request cannot use).
+  admission. The V2-S6 probe found that pinned llama.cpp b10176 serves the OpenAI core
+  plus Anthropic `/v1/messages` and `/v1/messages/count_tokens`; embeddings and
+  reranking depend on launch flags/model task, while several score/classify routes are
+  absent. A request for an unsupported endpoint must fail with a distinct "endpoint
+  not supported by this model" error *before* any lifecycle action can fire (never
+  cold-start a model the request cannot use).
 - **Operational:** second unit template + arg allowlist + per-runner executable path
   (supersedes the hardcoded `VLLM_EXECUTABLE`); GGUF-file validation for
   `model_path`; served-model verification via `--alias`; readiness thresholds tuned
@@ -86,6 +89,14 @@ stale-consumer invalidation class that motivated v1's immutable configuration. T
 candidate definition must pass the same full validation as boot-time configuration,
 merged against the live config, and unit generation plus `daemon-reload` must run
 before the service becomes schedulable.
+
+V2-S4 confirmed that immutable snapshot publication is tractable, but refuted
+"additive is easy": registration is a serialized prepare/commit transaction across
+generated inputs, systemd reload, the managed runner, the generic pool/state store,
+and config publication. Publication must be the final infallible step. Until ingress
+canonicalizes the forwarded `model` field, a new replica may not expand an existing
+canonical model's alias set: old running replicas do not learn the new alias from
+`daemon-reload`.
 
 **Mutating or removing an existing definition stays restart-to-apply** (validated
 restart / `-u` graceful upgrade); in-place mutation is explicitly out of scope at any
@@ -129,7 +140,7 @@ US7); v2 extends it with the occupancy-aware ledger and planner below.
 | **US6 — degraded topology** | M3 ideally fits one GPU; both are partially occupied | try declared placement profiles in preference order; accept the split profile only if all residents stay in memory; report degraded; self-heal at next start | v2 |
 | **US7 — refusal** | a model cannot be placed while current residents stay | evict-or-503 with `Retry-After`; a model that can *never* fit is rejected at registration; overcommit is never permitted | v1 rule, v2 ledger |
 | **US8 — replica scale-out/in** | one replica of M1 is saturated while a GPU sits free | start an additional replica through normal placement; least-inflight routing spreads load; the surplus replica retires later via US2 | v2 |
-| **US9 — GPU power stewardship** | a GPU has no residents | let it reach deep idle / lower its power limit; restore before the next placement | v2 (verify NVML write perms in the LXC) |
+| **US9 — GPU power stewardship** | a GPU has no residents | stop the last resident and verify deep idle; direct power-limit control is unavailable in the LXC | v2 lifecycle policy; host broker is separate/uncommitted |
 | **US10 — predictive warm-up** | recurring demand patterns (e.g. weekday mornings) | optionally pre-wake models on schedule so the first request isn't cold | speculative, uncommitted |
 
 Each catalog row is deliberately shaped as an acceptance criterion ("given this
@@ -150,10 +161,14 @@ validation.
   allocation).
 - **Runner-declared split capability:** asymmetric fitting is runner-specific — vLLM TP
   is symmetric-only (uniform `gpu_memory_utilization`; verified no per-GPU cap), vLLM
-  PP can split unevenly by layers (`VLLM_PP_LAYER_PARTITION`), llama.cpp
-  (`--tensor-split`) and accelerate-style servers (`max_memory` per device) support
-  arbitrary splits natively. The `Runner` adapter gains a planning hook ("given these
-  per-GPU budgets, produce launch parameters or decline"); the pool stays generic.
+  PP accepts uneven layer counts (`VLLM_PP_LAYER_PARTITION`) but still needs the S1
+  execution/latency matrix. llama.cpp exposes `--tensor-split`, but S6 has not yet
+  verified realized CUDA placement. Accelerate can plan a component-level asymmetric
+  Qwen-Image transformer map; pipeline-level balanced placement cannot split that
+  oversized component, and all components must share one joint budget. These are
+  candidate mechanisms, not arbitrary-split guarantees. The `Runner` adapter gains a
+  planning hook ("given these per-GPU budgets, produce pre-validated launch parameters
+  or decline"); the pool stays generic.
 - **Variable topology via declared placement profiles:** a service that can run in more
   than one shape (M3: ideally TP=1 on a single GPU; a two-GPU split when both GPUs are
   partially occupied) declares an *ordered* list of pre-validated placement profiles
@@ -164,7 +179,8 @@ validation.
   residents stay in memory" is the existing no-overcommit invariant. Omitting profiles
   means the single fixed shape (v1 behavior). Notes: for vLLM TP a split profile's
   effective budget is `degree × min(free across chosen GPUs)`, not the aggregate
-  (llama.cpp `--tensor-split` and accelerate-style runners do get the aggregate);
+  (runner-specific asymmetric profiles may use more of the aggregate only after their
+  measured split profile passes the pre-v2 gate);
   per-profile cold-start cost differs (torch.compile caches per shape). A forced split
   is a *degraded* placement: report the active profile in status/metrics, and note it
   self-heals at the next lifecycle boundary — bindings recompute at every start, so an
@@ -187,11 +203,12 @@ validation.
   Replicas are additive service instances, consistent with add-only registration (§2).
 - **GPU power stewardship (US9):** lifecycle tiers are already the largest power lever —
   a stopped service releases its CUDA context and lets the GPU reach deep idle, while
-  slept services hold residual context and a higher power floor. v2 may additionally
-  lower an empty GPU's power limit via NVML and restore it before the next placement.
-  NVML power-limit writes need root and may not be permitted from the unprivileged
-  LXC — verify on CT 107 before committing to this mechanism; measure the actual
-  watt delta per tier while running the interference profiles.
+  slept services hold residual context and a higher power floor. V2-S5 measured
+  12.309 W stopped idle versus 51.168 W with gpt-oss resident on GPU 0 in its bounded
+  windows. NVML telemetry is readable in CT 107, but even no-op power-limit writes are
+  denied with `Insufficient Permissions`; direct in-LXC power-limit control is cut.
+  A host-privileged broker would be a separate trust-boundary design, not part of US9
+  unless explicitly approved.
 - **Isolation caveat:** memory fit is not performance isolation; consumer Blackwell has
   no MIG. Enabling awake co-residency requires benchmarked interference profiles (the
   v1 resolutions' precondition) plus a per-service latency-priority signal to bias
@@ -241,6 +258,12 @@ per convention, skill updates for durable facts). Prerequisite for most: the v1 
 sleep matrix, since Dynamic Scheduling's economics change completely if wakes are
 seconds instead of minutes.
 
+**Bounded pass reviewed 2026-07-29.** Detailed evidence and review disposition are in
+[`spikes/review.md`](spikes/review.md), with one findings file per spike. V2-S4 and
+V2-S5 reached their decision exits. V2-S1, V2-S2, V2-S3, and the CUDA-placement part
+of deferred V2-S6 remain open; their missing experiments are explicit and no
+unmeasured performance values are promoted into planner inputs.
+
 **V2-S1 — Placement-profile ground truth.** For the four configured models, measure
 per-profile reality on sm_120: actual VRAM at the utilization target, cold-start phase
 timings (load / compile / warmup separately), and throughput/latency under fixed load —
@@ -252,12 +275,14 @@ the vLLM runner. *Prerequisite tooling:* per-start phase instrumentation in the 
 (systemd→active, active→ready, warmup duration) — a small v1.x metrics change that
 generates this data continuously instead of via one-off stopwatching.
 
-**V2-S2 — Co-residency interference curves.** Two awake models sized to share one
-32 GB card (e.g. gpt-oss-20b at low utilization + qwen27b), each measured solo vs
-co-resident under load; repeat with CUDA MPS if it works in the unprivileged LXC (a
-question in itself). *Exit:* latency/throughput degradation curves and an MPS verdict —
-the data §4's isolation caveat and latency-priority signal are waiting on, and the
-gate for ever relaxing `max_awake_owners_per_gpu`.
+**V2-S2 — Co-residency interference curves.** Two awake models demonstrably sized to
+share one 32 GB card, each measured solo vs co-resident under load; repeat with CUDA
+MPS if it works in the unprivileged LXC (a question in itself). The first fit probe
+showed that gpt-oss-20b + the current multimodal qwen27b profile cannot fit even before
+usable KV cache, so it is no longer the example pair. *Exit:* latency/throughput
+degradation curves and an MPS verdict — the data §4's isolation caveat and
+latency-priority signal are waiting on, and the gate for ever relaxing
+`max_awake_owners_per_gpu`.
 
 **V2-S3 — Diffusers runner prototype (Qwen-Image).** Stand the downloaded
 `QwenImagePipeline` up behind a minimal HTTP server + systemd unit; map it onto the

@@ -310,3 +310,16 @@ or skip `ProxyHttp` for that listener and implement a custom `HttpServerApp` tha
 buffers the (bounded) body itself and speaks to upstreams with its own client —
 losing the proxy phase machinery but keeping pingora's server/runtime layer. Verified
 in production by a router that took the second path for 32 MiB multimodal payloads.
+
+For an LLM/model gateway that takes the custom-application path:
+
+- Parse only the bounded routing envelope and preserve the exact request bytes for
+  upstream forwarding.
+- Check endpoint capability before starting or waking a model; not every endpoint
+  should trigger lifecycle work.
+- Keep canonical model identity separate from the client-visible request body.
+  Forward aliases unchanged only when the upstream serves those aliases; otherwise
+  perform an explicit, tested rewrite.
+- Hold exact RAII active-request/parked-request guards through upstream completion
+  or downstream cancellation. Approximate load-balancer counters are not safe for
+  drain, stop, or eviction decisions.

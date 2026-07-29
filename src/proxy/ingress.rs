@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     future::Future,
-    sync::Arc,
+    sync::{Arc, RwLock},
     time::{Duration, Instant},
 };
 
@@ -118,7 +118,7 @@ pub struct DataPlane {
     pool: Arc<dyn PoolManager>,
     client: reqwest::Client,
     global_parked: Arc<Semaphore>,
-    model_parked: HashMap<String, Arc<Semaphore>>,
+    model_parked: RwLock<HashMap<String, Arc<Semaphore>>>,
 }
 
 impl DataPlane {
@@ -145,7 +145,7 @@ impl DataPlane {
             global_parked: Arc::new(Semaphore::new(
                 snapshot.policies.global_parked_request_limit,
             )),
-            model_parked,
+            model_parked: RwLock::new(model_parked),
         })
     }
 
@@ -445,23 +445,38 @@ impl DataPlane {
                 message: "global parked-request capacity is exhausted".into(),
                 retry_after: Some(service.parking.retry_after_seconds),
             })?;
-        let model_semaphore =
+        // Registration publishes a fully validated config snapshot before demand can
+        // reach this point. Lazily inserting the canonical model's semaphore makes
+        // the data-plane registry additive without replacing permits held by existing
+        // requests.
+        let existing = {
             self.model_parked
+                .read()
+                .expect("model parking registry lock poisoned")
                 .get(model)
-                .ok_or_else(|| IngressError::Unavailable {
-                    code: "model_not_found",
-                    message: format!("model `{model}` is not configured"),
-                    retry_after: None,
-                })?;
-        let model =
-            model_semaphore
-                .clone()
-                .try_acquire_owned()
-                .map_err(|_| IngressError::Unavailable {
-                    code: "parking_capacity_exceeded",
-                    message: format!("parked-request capacity for `{model}` is exhausted"),
-                    retry_after: Some(service.parking.retry_after_seconds),
-                })?;
+                .cloned()
+        };
+        let model_semaphore = existing.unwrap_or_else(|| {
+            let limit = self
+                .config
+                .snapshot()
+                .policies
+                .per_model_parked_request_limit;
+            Arc::clone(
+                self.model_parked
+                    .write()
+                    .expect("model parking registry lock poisoned")
+                    .entry(model.to_string())
+                    .or_insert_with(|| Arc::new(Semaphore::new(limit))),
+            )
+        });
+        let model = model_semaphore
+            .try_acquire_owned()
+            .map_err(|_| IngressError::Unavailable {
+                code: "parking_capacity_exceeded",
+                message: format!("parked-request capacity for `{model}` is exhausted"),
+                retry_after: Some(service.parking.retry_after_seconds),
+            })?;
         Ok(ParkingPermits {
             _global: global,
             _model: model,
@@ -1456,6 +1471,52 @@ mod tests {
                 "aliases": ["alias-b", "alias-a", "alias-c"],
                 "max_model_len": 32768
             }])
+        );
+    }
+
+    #[tokio::test]
+    async fn additive_config_publication_gains_model_discovery_and_parking_capacity() {
+        let backend = closed_loopback_address().await;
+        let config = test_config(&[backend]);
+        let pool = Arc::new(FakePool::new(
+            config.snapshot().as_ref(),
+            Lifecycle::Stopped,
+            EnsureBehavior::Ready,
+        ));
+        let plane = DataPlane::new(config.clone(), pool).unwrap();
+        let mut candidate = config.snapshot().services[0].clone();
+        candidate.name = "registered".into();
+        candidate.served_model = "example/registered".into();
+        candidate.aliases = vec!["registered-alias".into()];
+        candidate.backend.port = candidate.backend.port.saturating_add(1);
+        candidate.systemd.unit = "vllm@registered.service".into();
+        candidate.systemd.environment_file = "/etc/vllm/registered.env".into();
+
+        assert!(
+            !plane
+                .model_parked
+                .read()
+                .unwrap()
+                .contains_key("example/registered")
+        );
+        config.register_service(candidate.clone()).unwrap();
+
+        let response = router_owned_response(
+            &http::Method::GET,
+            MODELS_ENDPOINT,
+            config.snapshot().as_ref(),
+        )
+        .unwrap();
+        assert_eq!(response.body["data"][1]["id"], "example/registered");
+        let _permits = plane
+            .acquire_parking("example/registered", &candidate)
+            .unwrap();
+        assert!(
+            plane
+                .model_parked
+                .read()
+                .unwrap()
+                .contains_key("example/registered")
         );
     }
 

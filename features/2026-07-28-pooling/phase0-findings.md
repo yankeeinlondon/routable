@@ -27,38 +27,34 @@ suite because this container currently has no reachable vLLM GPU service.
 
 ## S2 — sm_120 sleep matrix
 
-Not executable in the current environment: `nvidia-smi` cannot communicate
-with the NVIDIA driver. Sleep remains opt-in per service and configuration
-validation requires it to be explicitly marked validated. The default/fallback
-path is systemd stop/start.
-
-Required matrix remains:
+Executed on CT 107 on 2026-07-29 with two RTX 5090s and vLLM 0.26.0. Sleep
+remains opt-in per service and none of the tested cells qualifies for
+`hardware_validated: true`. The default/fallback path remains systemd
+stop/start.
 
 | TP | quantization | level | result |
 |---:|---|---:|---|
-| 1 | FP8 | 1 | pending on-box |
-| 1 | FP8 | 2 | pending on-box |
-| 1 | FP8 | L1 → L2 | pending on-box |
-| 1 | NVFP4 | 1 | pending on-box |
-| 1 | NVFP4 | 2 | pending on-box |
-| 1 | NVFP4 | L1 → L2 | pending on-box |
-| 2 | FP8 | 1 | pending on-box |
-| 2 | FP8 | 2 | pending on-box |
-| 2 | FP8 | L1 → L2 | pending on-box |
-| 2 | NVFP4 | 1 | pending on-box |
-| 2 | NVFP4 | 2 | pending on-box |
-| 2 | NVFP4 | L1 → L2 | pending on-box |
+| 1 | FP8 | 1 | 5/5 output-stable cycles; fail because inference while asleep hung and host-RAM budget was exceeded |
+| 1 | FP8 | 2 | 5/5 output-stable cycles and correct three-step wake; same gating failures |
+| 1 | FP8 | L1 → L2 | promotion pass; cell remains unvalidated |
+| 1 | NVFP4 | 1 | 5/5 output-stable cycles; fail because inference while asleep hung and host-RAM budget was exceeded |
+| 1 | NVFP4 | 2 | 5/5 output-stable cycles and correct three-step wake; same gating failures |
+| 1 | NVFP4 | L1 → L2 | promotion pass; cell remains unvalidated |
+| 2 | FP8 | 1 | 5/5 output-stable cycles; fail because inference while asleep hung and host-RAM budget was exceeded |
+| 2 | FP8 | 2 | 5/5 output-stable cycles and correct three-step wake; same gating failures |
+| 2 | FP8 | L1 → L2 | promotion pass; cell remains unvalidated |
+| 2 | NVFP4 | 1 | initialization failed before the matrix |
+| 2 | NVFP4 | 2 | initialization failed before the matrix |
+| 2 | NVFP4 | L1 → L2 | initialization failed before the matrix |
 
-Each run must record five sleep/wake cycles, fixed-prompt output sanity, wake
-latency, `nvidia-smi` residual VRAM, pinned host RAM, 503 while asleep,
-drain-then-sleep, attempted sleep during a request, and the L2 reload sequence.
-The L1 → L2 cells specifically validate promotion by waking the L1 sleeper and
-then issuing `POST /sleep?level=2`, with no inference admitted between those
-steps. Installed vLLM 0.26 source returns early from a sleep command when the
-executor is already sleeping, so a direct second sleep call cannot perform the
-promotion. The router's request sequence and lifecycle update are covered by
-mock tests; VRAM release, output sanity, and transition latency remain gated on
-the real sm_120 host.
+The initialized cells released VRAM repeatably, preserved fixed-prompt output,
+refused sleep safely when the drain deadline expired, and exercised the
+router's L1→L2 promotion and three-step L2 wake. The common behavioral failure
+was the required 503 while asleep: vLLM accepted the connection but returned no
+bytes before the 2-second test timeout. The TP=2 NVFP4 launch failed in
+FlashInfer FP4 quantization with `last dim has to be multiple of 16, but got
+2152`. Detailed latency and memory measurements are recorded in the per-model
+documents and `acceptance.md`.
 
 ## S3 — systemd D-Bus
 

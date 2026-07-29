@@ -1,4 +1,4 @@
-//! Router configuration schema, loading, validation, and immutable runtime access.
+//! Router configuration schema, loading, validation, and snapshot-based runtime access.
 //!
 //! The schema intentionally owns every vLLM option which affects placement or
 //! lifecycle. `runner_args` is only an escape hatch for explicitly allowlisted,
@@ -9,7 +9,7 @@ use std::fmt;
 use std::fs;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -91,19 +91,21 @@ impl RouterConfig {
     }
 }
 
-/// A validated configuration snapshot that is immutable for the process lifetime.
+/// Validated configuration snapshots.
 ///
-/// Applying configuration changes requires a supervised router restart.
+/// Readers retain an immutable `Arc` snapshot for the duration of an operation.
+/// The only live update seam is additive service registration; mutating or removing
+/// an existing definition still requires a supervised router restart.
 #[derive(Debug)]
 pub struct ConfigStore {
-    current: Arc<RouterConfig>,
+    current: RwLock<Arc<RouterConfig>>,
 }
 
 impl ConfigStore {
     pub fn new(config: RouterConfig) -> Result<Self, ValidationErrors> {
         config.validate()?;
         Ok(Self {
-            current: Arc::new(config),
+            current: RwLock::new(Arc::new(config)),
         })
     }
 
@@ -112,7 +114,35 @@ impl ConfigStore {
     }
 
     pub fn snapshot(&self) -> Arc<RouterConfig> {
-        Arc::clone(&self.current)
+        Arc::clone(
+            &self
+                .current
+                .read()
+                .expect("configuration store lock poisoned"),
+        )
+    }
+
+    /// Merge one candidate into the live snapshot, run the complete boot-time
+    /// validator, and atomically publish the new snapshot if it is valid.
+    ///
+    /// This is the publication seam exercised by the V2-S4 code spike. A production
+    /// registration coordinator must call it only after generated inputs, the runner
+    /// adapter, and the pool entry have been prepared successfully; this method does
+    /// not perform or roll back those external side effects.
+    pub fn register_service(
+        &self,
+        candidate: ServiceDefinition,
+    ) -> Result<Arc<RouterConfig>, ValidationErrors> {
+        let mut current = self
+            .current
+            .write()
+            .expect("configuration store lock poisoned");
+        let mut merged = current.as_ref().clone();
+        merged.services.push(candidate);
+        merged.validate()?;
+        let merged = Arc::new(merged);
+        *current = Arc::clone(&merged);
+        Ok(merged)
     }
 }
 

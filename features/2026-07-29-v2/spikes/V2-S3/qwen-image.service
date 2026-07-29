@@ -1,0 +1,26 @@
+# V2-S3 prototype only. Install dependencies in the referenced dedicated venv.
+[Unit]
+Description=Qwen-Image Diffusers spike server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=HF_HUB_OFFLINE=1
+Environment=TRANSFORMERS_OFFLINE=1
+Environment=CUDA_DEVICE_ORDER=PCI_BUS_ID
+Environment=CUDA_VISIBLE_DEVICES=0,1
+EnvironmentFile=/etc/vllm-router/qwen-image.env
+ExecStart=/opt/qwen-image-venv/bin/python /opt/vllm-router/features/2026-07-29-v2/spikes/V2-S3/server.py --model-path ${QWEN_IMAGE_MODEL_PATH} --served-model ${QWEN_IMAGE_SERVED_MODEL} --host 127.0.0.1 --port 8100 --max-memory ${QWEN_IMAGE_MAX_MEMORY}
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=10min
+TimeoutStopSec=30s
+KillSignal=SIGTERM
+LimitMEMLOCK=infinity
+LimitNOFILE=65535
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

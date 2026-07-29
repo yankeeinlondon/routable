@@ -24,6 +24,7 @@ use tokio::runtime::Handle;
 use tokio::sync::{Mutex, watch};
 use uuid::Uuid;
 
+use crate::metrics;
 use crate::state::{
     ActiveGuard, Activity, GpuStatus, Lifecycle, ObservedState, ParkedGuard, ProbeStatus,
     ServiceStatus, StateStore, SystemdState, SystemdStatus,
@@ -1006,6 +1007,7 @@ impl<R: Runner + 'static> Pool<R> {
             .claim_placement(service, &options, transition, operation_id)
             .await?;
 
+        let runner_phase_started = Instant::now();
         let runner_result = if let Some(level) = from_sleep {
             timeout_future(
                 options.deadline,
@@ -1025,21 +1027,39 @@ impl<R: Runner + 'static> Pool<R> {
         };
         let runner_result = runner_result
             .and_then(|result| result.map_err(|error| self.runner_error(service, error)));
+        if from_sleep.is_none() {
+            observe_start_phase(
+                service,
+                "systemd_to_active",
+                runner_phase_started,
+                runner_result.is_ok(),
+            );
+        }
         if let Err(error) = runner_result {
             self.record_failure_and_schedule_backoff(service, generation, operation_id, &error);
             return Err(error);
         }
 
-        let ready_observation = match self
+        let readiness_phase_started = Instant::now();
+        let ready_result = self
             .wait_until_ready(service, &entry.definition, options.deadline)
-            .await
-        {
+            .await;
+        if from_sleep.is_none() {
+            observe_start_phase(
+                service,
+                "active_to_ready",
+                readiness_phase_started,
+                ready_result.is_ok(),
+            );
+        }
+        let ready_observation = match ready_result {
             Ok(observation) => observation,
             Err(error) => {
                 self.record_failure_and_schedule_backoff(service, generation, operation_id, &error);
                 return Err(error);
             }
         };
+        let warmup_phase_started = Instant::now();
         let warmup_result = timeout_future(
             options.deadline,
             self.inner.runner.warmup(&entry.definition),
@@ -1048,6 +1068,14 @@ impl<R: Runner + 'static> Pool<R> {
         )
         .await
         .and_then(|result| result.map_err(|error| self.runner_error(service, error)));
+        if from_sleep.is_none() {
+            observe_start_phase(
+                service,
+                "warmup",
+                warmup_phase_started,
+                warmup_result.is_ok(),
+            );
+        }
         if let Err(error) = warmup_result {
             self.record_failure_and_schedule_backoff(service, generation, operation_id, &error);
             return Err(error);
@@ -1955,6 +1983,14 @@ fn blocker_reason(blockers: &[(Arc<ServiceEntry>, ObservedState)]) -> String {
         .join(", ")
 }
 
+fn observe_start_phase(service: &str, phase: &'static str, started: Instant, succeeded: bool) {
+    let result = if succeeded { "success" } else { "error" };
+    metrics::global()
+        .start_phase_seconds
+        .with_label_values(&[service, phase, result])
+        .observe(started.elapsed().as_secs_f64());
+}
+
 async fn timeout_future<F, T>(
     deadline: Instant,
     future: F,
@@ -2415,6 +2451,75 @@ mod tests {
             assert_eq!(task.await.unwrap().unwrap().lifecycle, Lifecycle::Running);
         }
         assert_eq!(starts.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn cold_start_records_each_successful_phase_once() {
+        let service = "phase-metrics-success";
+        let runner = MockRunner::new(&[service], &[]);
+        let pool = reconciled_pool(vec![definition(service, "phase-metrics-gpu")], runner).await;
+
+        pool.ensure_ready_status(
+            service,
+            EnsureReadyOptions::by(Instant::now() + Duration::from_secs(1)),
+        )
+        .await
+        .unwrap();
+
+        for phase in ["systemd_to_active", "active_to_ready", "warmup"] {
+            assert_eq!(start_phase_sample_count(service, phase, "success"), 1);
+            assert_eq!(start_phase_sample_count(service, phase, "error"), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_cold_start_records_only_the_failed_completed_phase() {
+        let service = "phase-metrics-start-error";
+        let runner = MockRunner::new(&[service], &[]);
+        runner.fail_start.store(true, Ordering::Release);
+        let pool =
+            reconciled_pool(vec![definition(service, "phase-metrics-error-gpu")], runner).await;
+
+        let result = pool
+            .ensure_ready_status(
+                service,
+                EnsureReadyOptions::by(Instant::now() + Duration::from_secs(1)),
+            )
+            .await;
+        assert!(matches!(result, Err(PoolError::Runner { .. })));
+        assert_eq!(
+            start_phase_sample_count(service, "systemd_to_active", "error"),
+            1
+        );
+        assert_eq!(
+            start_phase_sample_count(service, "active_to_ready", "success"),
+            0
+        );
+        assert_eq!(start_phase_sample_count(service, "warmup", "success"), 0);
+    }
+
+    fn start_phase_sample_count(service: &str, phase: &str, result: &str) -> u64 {
+        prometheus::gather()
+            .into_iter()
+            .find(|family| family.get_name() == "vllm_router_start_phase_duration_seconds")
+            .and_then(|family| {
+                family
+                    .get_metric()
+                    .iter()
+                    .find(|metric| {
+                        let labels: HashMap<_, _> = metric
+                            .get_label()
+                            .iter()
+                            .map(|label| (label.get_name(), label.get_value()))
+                            .collect();
+                        labels.get("service") == Some(&service)
+                            && labels.get("phase") == Some(&phase)
+                            && labels.get("result") == Some(&result)
+                    })
+                    .cloned()
+            })
+            .map(|metric| metric.get_histogram().get_sample_count())
+            .unwrap_or(0)
     }
 
     #[tokio::test]

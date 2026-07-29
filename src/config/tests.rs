@@ -923,7 +923,7 @@ fn assert_rejections(cases: &[RejectionCase]) {
 }
 
 #[test]
-fn yaml_load_is_strict_and_store_exposes_an_immutable_snapshot() {
+fn yaml_load_is_strict_and_store_exposes_immutable_snapshots() {
     let directory = tempfile::tempdir().unwrap();
     let good_path = directory.path().join("good.yaml");
     std::fs::write(&good_path, serde_yaml::to_string(&valid_config()).unwrap()).unwrap();
@@ -940,6 +940,35 @@ fn yaml_load_is_strict_and_store_exposes_an_immutable_snapshot() {
         .unwrap_err()
         .to_string();
     assert!(error.contains("unknown field") || error.contains("missing field"));
+}
+
+#[test]
+fn additive_registration_validates_the_merged_config_before_publication() {
+    let store = ConfigStore::new(valid_config()).unwrap();
+    let original = store.snapshot();
+    let mut candidate = valid_service("beta", "model-b", 8101, "GPU-b");
+    candidate.aliases = vec!["model-a".into()];
+
+    let error = store.register_service(candidate.clone()).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("conflicts with a canonical served model")
+    );
+    assert_eq!(store.snapshot().services.len(), 1);
+
+    candidate.aliases = vec!["friendly-b".into()];
+    let merged = store.register_service(candidate).unwrap();
+    assert_eq!(
+        original.services.len(),
+        1,
+        "existing snapshots stay immutable"
+    );
+    assert_eq!(merged.services.len(), 2);
+    assert_eq!(
+        store.snapshot().canonical_model("friendly-b"),
+        Some("model-b")
+    );
 }
 
 #[test]

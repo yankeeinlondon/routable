@@ -191,7 +191,7 @@ tool-smoke model: _need-router
 
 # Fire n concurrent requests at a model and tally status codes (stampede drill).
 stampede model n='20': _need-router
-    seq {{n}} | xargs -P {{n}} -I_ curl -s -o /dev/null -w "%{http_code}\n" \
+    seq {{n}} | xargs -P {{n}} -I__REQUEST__ curl -s -o /dev/null -w "%{http_code}\n" \
         -X POST {{data}}/v1/chat/completions \
         -H 'content-type: application/json' \
         -d '{"model":"{{model}}","messages":[{"role":"user","content":"hi"}],"max_tokens":8}' \

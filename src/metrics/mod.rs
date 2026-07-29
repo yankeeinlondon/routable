@@ -24,6 +24,9 @@ pub struct RouterMetrics {
     pub active: IntGaugeVec,
     pub active_streams: IntGaugeVec,
     pub service_state: IntGaugeVec,
+    /// Cold-start phase timings. `phase` and `result` are fixed vocabularies;
+    /// `service` is bounded by the validated configuration.
+    pub start_phase_seconds: HistogramVec,
     pub global_parked: IntGauge,
 }
 
@@ -104,6 +107,15 @@ impl RouterMetrics {
                 &["service", "state"]
             )
             .expect("state metric registration"),
+            start_phase_seconds: register_histogram_vec!(
+                HistogramOpts::new(
+                    "vllm_router_start_phase_duration_seconds",
+                    "Cold-start duration by phase and outcome"
+                )
+                .buckets(LLM_DURATION_BUCKETS.to_vec()),
+                &["service", "phase", "result"]
+            )
+            .expect("cold-start phase metric registration"),
             global_parked: register_int_gauge!(
                 "vllm_router_parked_requests_total_current",
                 "Current parked requests across every model"
@@ -143,10 +155,15 @@ mod tests {
             .parking_seconds
             .with_label_values(&["bucket-test"])
             .observe(120.0);
+        global()
+            .start_phase_seconds
+            .with_label_values(&["bucket-test", "warmup", "success"])
+            .observe(10.0);
 
         for name in [
             "vllm_router_request_duration_seconds",
             "vllm_router_parking_duration_seconds",
+            "vllm_router_start_phase_duration_seconds",
         ] {
             let families = prometheus::gather();
             let histogram = families

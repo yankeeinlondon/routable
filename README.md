@@ -234,6 +234,7 @@ Prometheus text format:
 | `vllm_router_probe_failures_total{service,probe}` | failed systemd/HTTP/NVML observations |
 | `vllm_router_active_requests{service}` | exact in-flight requests per service |
 | `vllm_router_service_state{service,state}` | one-hot lifecycle state per service |
+| `vllm_router_start_phase_duration_seconds{service,phase,result}` | cold-start duration for systemd activation, readiness, and HTTP warmup phases |
 
 ## CLI and environment reference
 

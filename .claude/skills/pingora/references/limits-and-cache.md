@@ -52,6 +52,14 @@ let (guard, count) = inflight.incr(&backend_addr, 1);  // count = current estima
 This is the building block for least-loaded upstream selection and per-backend concurrency
 caps (e.g. cap in-flight requests per inference server; reject or requeue above a threshold).
 
+`Inflight` is Count-Min-Sketch based and may overestimate. Use it for routing
+signals and soft admission, not as the authoritative count for drain, stop, GPU
+eviction, billing, or any safety decision. For those, keep an exact per-service
+atomic count behind RAII guards and refresh the service's last-used timestamp on
+admission and completion. Use exact semaphores for parking capacity; when a
+dynamic registry adds a model, insert a new semaphore without replacing existing
+ones that may still have outstanding permits.
+
 ### `Estimator` — raw CM-sketch
 
 `Estimator::new(hashes, slots)`, `incr(key, n)`, `decr`, `get(key)`, `reset()`.

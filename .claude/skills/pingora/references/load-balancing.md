@@ -192,13 +192,46 @@ where S: BackendSelection + 'static, S::Iter: BackendIter {
 // server.add_service for the proxy AND every cluster's background service.
 ```
 
-Scaling this up (e.g. an LLM router keyed by model): `HashMap<String, Arc<LoadBalancer<_>>>`
-on the proxy struct, looked up in `upstream_peer`; unknown key → `session.respond_error(404)`
-in `request_filter` or return `Err`. To route on a JSON field (OpenAI-style `"model"`), you
-must read the request body: buffer chunks in `request_body_filter` / use `early_request_filter`
-with `session.read_request_body()` patterns, stash the choice in CTX, then pick the pool in
-`upstream_peer`. Header-based routing (`X-Model: ...`) avoids body buffering entirely and is
-preferable when you control the clients.
+Scaling this up (e.g. an LLM router keyed by model): keep an immutable snapshot
+of `model -> pool` state and select from it per request. Path/header routing can
+still use `ProxyHttp`. OpenAI-style routing on a JSON `model` field cannot
+generally choose in `request_body_filter`: `upstream_peer` has already run, and
+Pingora's only replay buffer is capped at 64 KiB. For larger bounded bodies,
+use a custom `HttpServerApp` that reads the body, resolves the route, and sends
+the exact bytes with its own upstream client. A trusted routing header avoids
+body buffering when controlled clients can provide one, but the body remains
+authoritative unless the trust contract explicitly says otherwise. See
+`proxy-lifecycle.md` § "Reading the request body before upstream_peer".
+
+## Dynamic backends are not dynamic services
+
+`ServiceDiscovery` changes backend membership inside one already-constructed
+`LoadBalancer`. It does not add a new route key, parking/admission capacity,
+lifecycle state, runner adapter, generated unit, or background participant.
+
+For additive application registration, use one serialized prepare/commit
+transaction:
+
+1. Snapshot the latest configuration, merge the candidate, and run the complete
+   validator.
+2. Prepare every fallible adapter, route entry, generated file, and state object.
+3. Install external inputs and complete required reloads before routing can see
+   the candidate.
+4. Commit runner/pool/state entries without holding a registry lock across
+   `.await`.
+5. Publish the immutable routing/config snapshot last; old request snapshots
+   remain valid until their requests finish.
+
+Preserve existing `Arc<Semaphore>` or guard-owning objects when adding entries;
+replacing one strands permits held by in-flight requests. Recompute or constrain
+boot-derived aggregates such as background cadence and operation timeouts when
+new entries can request stricter values.
+
+If routing resolves aliases but forwards the original body unchanged, publish a
+new alias only when every selectable backend already advertises it. Otherwise
+canonicalize the body deliberately or reject alias expansion. Also validate
+endpoint capabilities before any cold-start/lifecycle action: a global path
+allowlist must not start a backend that cannot serve that path.
 
 ### Selection-key tips for inference routing
 
