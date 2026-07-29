@@ -85,6 +85,13 @@ naive symmetric launch (50/50) would OOM GPU1. v2 must place such a model gracef
   (`--tensor-split`) and accelerate-style servers (`max_memory` per device) support
   arbitrary splits natively. The `Runner` adapter gains a planning hook ("given these
   per-GPU budgets, produce launch parameters or decline"); the pool stays generic.
+- **Eviction as budget reclamation:** under co-residency, evicting a service frees its
+  *budget*, not a whole GPU. The victim planner must find the minimal-cost eligible set
+  whose reclaimed budgets (including slept residuals) make the candidate placement
+  feasible, without touching pinned allocations of non-victims — e.g. M3 fits GPU1 only
+  if long-idle M1 is drained off it, while co-resident M2's binding is untouched.
+  Cost ordering remains priority, then least-recently-used, and drain-first semantics
+  are unchanged: victims are drained, never killed mid-request.
 - **Refusal:** a model that fits the inventory but not the *current* free budget gets
   the existing evict-or-503 treatment (`Retry-After`); a model that can never fit the
   inventory is rejected at registration/validation time. No placement may overcommit.
@@ -106,6 +113,13 @@ scope until a concrete need exists.
 
 Eligible for a v1.x patch rather than v2 if convenient:
 
+- **Minimum-idle eviction guard** (`min_idle_before_eviction`, per service): v1
+  demand-driven eviction treats *instantaneous* idleness as eligibility, so a service
+  whose request stream has a momentary gap can be evicted and immediately need a
+  multi-minute cold start back (thrash between alternating models). A service should
+  become a demand-eviction candidate only after an agreed idle period; `idle_for`
+  stays the LRU tie-breaker. Small change (one eligibility condition + config field),
+  meaningful protection.
 - **Dialect-aware router error envelopes** (review-2 CO2): router-generated errors on
   `/v1/messages` should use Anthropic's error shape; Cohere-style endpoints likewise.
 - **Multipart model extraction** so audio transcription/translation endpoints become
