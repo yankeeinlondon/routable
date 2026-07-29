@@ -65,6 +65,19 @@ and sleep/wake behavior specific to a runner.
 > place runners on multiple hosts; v1 does not need distributed scheduling, consensus, or
 > cross-host failure recovery.
 
+**Dynamic service registration (future, decided 2026-07-29):** a later version will
+support *adding* a new service definition at runtime (e.g. `POST /pool/v1/services`,
+enabling a web UI to make a new model available alongside the existing inventory).
+Registration is purely additive — new map entries, a new parking semaphore, a new
+placement participant — so it does not reopen the stale-consumer invalidation class
+that motivated immutable configuration. The candidate definition must pass the same
+full validation as boot-time configuration, merged against the live config, and unit
+generation plus `daemon-reload` run before the service becomes schedulable.
+**Mutating or removing an existing definition stays restart-to-apply** (validated
+restart / `-u` graceful upgrade); in-place mutation is explicitly out of scope at any
+version. This dovetails with the multi-host evolution: service definitions become
+control-plane-owned data with a single writer, not a file the process re-reads.
+
 ---
 
 ## Decisions (2026-07-28)
@@ -246,9 +259,10 @@ Each immutable-at-runtime service definition includes at least:
 Validate the entire configuration before applying it: reject duplicate names/aliases or
 ports, unknown GPU UUIDs, impossible TP topology, overlapping exclusive reservations,
 unsafe runner arguments, relative model paths, and host-RAM/VRAM overcommit under every
-allowed awake/asleep combination. Configuration reload is atomic; invalid new configuration
-leaves the last valid configuration active. Generated systemd inputs must use allowlisted
-fields rather than interpolating arbitrary shell fragments.
+allowed awake/asleep combination. Configuration is immutable at runtime; changes require a
+supervised router restart, and invalid configuration prevents the replacement process from
+starting. Generated systemd inputs must use allowlisted fields rather than interpolating
+arbitrary shell fragments.
 
 Ports are stable, declared configuration rather than allocated opportunistically. vLLM binds
 only to loopback, and the router is the sole supported client-facing entry point.
