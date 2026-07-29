@@ -78,6 +78,33 @@ restart / `-u` graceful upgrade); in-place mutation is explicitly out of scope a
 version. This dovetails with the multi-host evolution: service definitions become
 control-plane-owned data with a single writer, not a file the process re-reads.
 
+**Occupancy-aware placement (future, decided 2026-07-29).** Motivating example: M1
+occupies 20 of 32 GB on GPU1 under constant load; M2 needs to span both GPUs and fits
+the *aggregate* free VRAM (12 GB on GPU1 + 32 GB on GPU2), but a naive symmetric launch
+(50/50) would OOM GPU1. A later version must place such a model gracefully:
+
+- **Budget ledger:** at placement time compute per-GPU free budget = capacity − awake
+  reservations − sleep residuals, from the same declaration-based accounting v1 uses.
+- **Deploy-time parameterization:** the service definition becomes a template; the
+  router computes the per-GPU memory assignment and GPU selection at start time and
+  renders them into the generated unit. A computed binding is pinned in the ledger for
+  as long as the service is running *or asleep* (a woken vLLM re-grabs its original
+  allocation).
+- **Runner-declared split capability:** asymmetric fitting is runner-specific — vLLM TP
+  is symmetric-only (uniform `gpu_memory_utilization`; verified no per-GPU cap), vLLM
+  PP can split unevenly by layers (`VLLM_PP_LAYER_PARTITION`), llama.cpp
+  (`--tensor-split`) and accelerate-style servers (`max_memory` per device) support
+  arbitrary splits natively. The `Runner` adapter therefore gains a planning hook
+  ("given these per-GPU budgets, produce launch parameters or decline"); the pool stays
+  generic.
+- **Refusal:** a model that fits the inventory but not the *current* free budget gets
+  the existing evict-or-503 treatment (`Retry-After`); a model that can never fit the
+  inventory is rejected at registration/validation time. No placement may overcommit.
+- **Isolation caveat:** memory fit is not performance isolation; consumer Blackwell has
+  no MIG. Enabling awake co-residency requires the benchmarked interference profiles
+  already demanded by the v1 resolutions, plus a per-service latency-priority signal to
+  bias packing decisions.
+
 ---
 
 ## Decisions (2026-07-28)
@@ -245,8 +272,9 @@ text.
 
 Each immutable-at-runtime service definition includes at least:
 
-- unique service name, runner type, canonical served model name, optional aliases, model path,
-  tokenizer path/options, quantization, and additional validated runner arguments;
+- unique service name, runner type and absolute executable path, canonical served model name,
+  optional aliases, model path, tokenizer path/options, quantization, and additional validated
+  runner arguments;
 - stable GPU UUIDs, TP/PP/DP settings, VRAM reservation per GPU, expected residual sleep VRAM,
   L1 pinned-host-memory reservation, and whether the service is evictable;
 - loopback address/port, systemd unit, environment file, readiness path and thresholds,
@@ -259,10 +287,12 @@ Each immutable-at-runtime service definition includes at least:
 Validate the entire configuration before applying it: reject duplicate names/aliases or
 ports, unknown GPU UUIDs, impossible TP topology, overlapping exclusive reservations,
 unsafe runner arguments, relative model paths, and host-RAM/VRAM overcommit under every
-allowed awake/asleep combination. Configuration is immutable at runtime; changes require a
-supervised router restart, and invalid configuration prevents the replacement process from
-starting. Generated systemd inputs must use allowlisted fields rather than interpolating
-arbitrary shell fragments.
+allowed awake/asleep combination. Configuration is immutable for the lifetime of a router
+process. To apply changes, validate the replacement configuration with `vllm-router -t`
+while the current process remains serving, then use either a supervised router restart or a
+`-u` graceful upgrade. If the replacement configuration is invalid, leave the current
+process serving its last valid snapshot. Generated systemd inputs must use allowlisted
+fields rather than interpolating arbitrary shell fragments.
 
 Ports are stable, declared configuration rather than allocated opportunistically. vLLM binds
 only to loopback, and the router is the sole supported client-facing entry point.
