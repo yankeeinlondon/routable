@@ -125,3 +125,34 @@ duplication for replica sets.
   replicas of the same canonical (currently `alias_owners` likely rejects any
   cross-service duplicate even when the canonical matches — either allow-when-same-
   canonical or document declare-on-one-replica; test whichever is chosen).
+
+## F4 — `run_forever` panics under `#[tokio::main]`: the router has never actually served
+
+**Severity: critical (blocks all serving; found at first real launch, 2026-07-29).**
+
+`main` is `#[tokio::main] async fn` (required today because `managed_pool_from_config`
+awaits the zbus connection), but `pingora_core::server::Server::run_forever` performs a
+`block_on` internally (pingora-core-0.8.1 `server/mod.rs:756`) — which tokio forbids
+from inside a runtime: `"Cannot start a runtime from within a runtime"`. The panic is
+deterministic on every real start.
+
+**Why 140 passing tests missed it:** nothing ever executes `run_forever`. `-t` mode
+exits inside `bootstrap` before it; unit tests never start the server; review-2's C1
+fix addressed the *daemon-fork* hazard by rejecting `-d` but left the async-main
+incompatibility in place, unexercised. Tier 3 of the runbook is the first code path in
+the project's life to reach this line.
+
+**Fix requirement:** `main` must be synchronous and `run_forever()` must be called
+outside any tokio context, while the zbus connection's I/O tasks stay on a runtime
+that lives for the whole process (the C1 lesson: those tasks must never lose their
+runtime). Recommended shape: build the pool on a dedicated multi-thread runtime kept
+alive for process lifetime (owned in `main` or intentionally leaked — never dropped),
+then call `run_forever()` from plain `fn main`. Cross-runtime awaits of the pool from
+pingora's worker runtimes are fine (futures are `Send`; zbus internals stay home).
+Alternative shape: defer all async construction into a pingora background service with
+a lazy `PoolManager` handle — larger diff, same guarantee.
+
+**Regression test requirement:** an `#[ignore]`d host test that launches the built
+binary with a minimal valid config on ephemeral ports, polls `/livez` until 200, and
+sends SIGTERM — i.e. "the binary actually serves." Wire it into the runbook's Tier 1
+so no future refactor of `main` can regress unserved again.
