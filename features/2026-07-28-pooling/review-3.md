@@ -403,3 +403,34 @@ Acceptance outcomes:
 - The obsolete `10-toolchain.conf` hand-patch was removed from systemd and retained
   recoverably as `/tmp/10-toolchain.conf.review3-backup`. The router supervisor is
   enabled for boot.
+
+---
+
+## Independent validation of the F5–F10 + short-park batch (2026-07-29)
+
+Verified against the developer's working tree, code plus live drills on CT 107:
+
+- **F5 ✓ live** — `systemctl restart vllm-router` completed in **10 s** (grace
+  period), models served straight through, new instance reconciled both `running`
+  immediately; `binary_serves` bounded-exit regression passes.
+- **F6 ✓** — drift warnings log on appearance and clearing only (previous-state diff).
+- **F7 ✓ live** — global + per-service `environment:` maps rendered into env files;
+  live config carries the toolchain PATH/`HF_HOME`/`VLLM_CACHE_ROOT`; the
+  `10-toolchain.conf` drop-in is retired (backup in `/tmp`).
+- **F8 ✓ live** — regenerated units have bare `EnvironmentFile=` paths; env files
+  carry numeric `CUDA_VISIBLE_DEVICES` + `CUDA_DEVICE_ORDER=PCI_BUS_ID` via UUID→index
+  translation; each worker observed only on its assigned GPU.
+- **F9 ✓ live** — `tool-call-parser`/`reasoning-parser` allowlisted with registry
+  validation; `just tool-smoke` passes on both services post-restart (structured tool
+  calls, reasoning separated).
+- **F10 ✓** — convergent failed-state recovery in reconcile with regression test.
+- **Short-park ✓ live** — stopped service + cold request: held exactly 20.0 s, then
+  `model_starting` 503 with human-readable progress, machine-readable `progress`
+  object, `Retry-After: 150`; detached start completed; retry served warm in 0.29 s.
+- Suite: 147 passing (143 lib + 4 bin), 2 host-only ignored both passing on-box,
+  clippy clean, `-t` valid. Router now runs as an installed binary under an enabled
+  `vllm-router.service` — production posture.
+
+**All review-3 findings (F1–F10) and the bundled short-park policy are closed.**
+Remaining v1 work is unchanged in kind: Tier-4 drills, the Tier-5 sleep matrix, and
+service definitions for the two downloaded models (gpt-oss-20b, gemma-4-31B).
