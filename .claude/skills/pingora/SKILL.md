@@ -99,3 +99,7 @@ Run: `RUST_LOG=INFO cargo run -- -c conf.yaml` (flags: `-d` daemon, `-t` test co
 - **Retry safety**: `fail_to_connect` guarantees nothing was sent upstream (safe to retry even POSTs, via `e.set_retry(true)`); `error_while_proxy` does not — default only retries reused connections.
 - **`Backend` identity = (addr, weight)**: changing a weight makes it a "new" backend (health state resets). `ext` is ignored for equality.
 - **Version drift**: repo `main` docs/examples may be ahead of your pinned crates.io release (e.g. `fail_to_proxy` returns `FailToProxy` struct on main, `u16` on ≤0.5). Verify signatures on docs.rs for your version.
+- **`run_forever()` must be called from a synchronous `main`** — it does a `block_on` internally and panics ("Cannot start a runtime from within a runtime") under `#[tokio::main]`. Async setup before it needs a dedicated runtime you keep alive. See server-lifecycle.md § Runtime rules.
+- **Detached `tokio::spawn` tasks on a service's runtime block graceful shutdown** — pingora waits for each service runtime to quiesce; a lingering task hangs SIGTERM until the (long) timeout. Spawn long-lived work on your own runtime or abort it on `ShutdownWatch`.
+- **A busy listen port is retried every second forever**, not failed fast — guard for "already running" yourself if you want a clean error.
+- **`-t` exits inside `bootstrap()`** — code after `bootstrap()` never runs in test mode, so do your own config validation *before* it if `-t` should cover it.

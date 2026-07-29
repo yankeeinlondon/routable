@@ -298,3 +298,15 @@ For LLM/SSE proxying:
 `examples/grpc_web_module.rs`): add the module there, then grab its per-request ctx in
 `early_request_filter` via `session.downstream_modules_ctx.get_mut::<GrpcWebBridge>()`.
 Enable compression by registering `ResponseCompressionBuilder::enable(level)` with level > 0.
+
+## Reading the request body before `upstream_peer` (0.8.1 limitation)
+
+Routing on a body field (e.g. an LLM gateway routing on JSON `model`) wants
+read-body → pick peer → replay body. At 0.8.1 this only works for small bodies: the
+only replay facility is the retry buffer, hard-capped at `BODY_BUF_LIMIT` = 64 KiB
+(H1 and H2), and there is no public API to inject an arbitrary consumed body back
+into the downstream session. Beyond 64 KiB the choice is: route on a header instead,
+or skip `ProxyHttp` for that listener and implement a custom `HttpServerApp` that
+buffers the (bounded) body itself and speaks to upstreams with its own client —
+losing the proxy phase machinery but keeping pingora's server/runtime layer. Verified
+in production by a router that took the second path for 32 MiB multimodal payloads.

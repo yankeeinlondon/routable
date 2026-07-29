@@ -103,3 +103,30 @@ server (tokio task isolation); set `server.sentry = Some(sentry::ClientOptions{.
 - Access/metrics logging belongs in `ProxyHttp::logging()` (always runs, has the final
   status via `session.response_written()` and the `Option<&Error>`).
 - Error log path: conf `error_log`; `RUST_LOG=INFO` controls `env_logger` verbosity in examples.
+
+## Runtime rules learned in production (verified on 0.8.1, 2026-07-29)
+
+- **`run_forever()` calls `block_on` internally** (`server/mod.rs:756`): calling it
+  from inside any tokio runtime — most commonly `#[tokio::main] async fn main` —
+  panics deterministically with "Cannot start a runtime from within a runtime".
+  Nothing catches this before the first real launch: `-t` exits earlier and unit
+  tests don't serve. Pattern: `fn main()` synchronous; if construction needs async
+  (e.g. a zbus connection whose I/O tasks live on the runtime that created them),
+  build a dedicated `tokio::runtime::Runtime`, `block_on` the construction, and keep
+  that runtime alive for the whole process (it must never be dropped — its tasks die
+  with it; `run_forever` never returning makes an owning local sufficient). Awaiting
+  those objects later from pingora's worker runtimes is fine.
+- **Graceful shutdown waits for every service runtime to fully quiesce.** Any
+  detached `tokio::spawn` on a service's runtime (including a background service's)
+  that outlives the shutdown signal keeps that runtime alive — SIGTERM then hangs at
+  "waiting for service runtime … to exit" until the graceful-shutdown timeout (which
+  you may have set to many minutes). Spawn long-lived detached work on your own
+  process-lifetime runtime instead, or track and abort it on `ShutdownWatch`.
+  Regression-test with a spawned binary: SIGTERM must exit within the grace period.
+- **Busy listeners retry, not fail**: a port already in use logs
+  `"<addr> is in use, will try again"` every second indefinitely. If "another
+  instance is already running" should be an error, detect it before `run_forever`.
+- **Test mode exits early**: `bootstrap()` terminates the process under `-t`, so any
+  validation you want `-t` to cover must run before `bootstrap()`; everything after
+  it is unreachable in test mode (also useful: expensive construction after
+  `bootstrap()` is automatically skipped during config checks).

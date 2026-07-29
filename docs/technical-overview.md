@@ -3,16 +3,22 @@
 Companion to the [README](../README.md), for engineers working on or evaluating the
 router's internals. Authoritative requirements live in
 [`features/2026-07-28-pooling/spec.md`](../features/2026-07-28-pooling/spec.md); this
-document describes how the implementation realizes them. Known defects and their
-remediation order are tracked in
-[`review-1.md`](../features/2026-07-28-pooling/review-1.md).
+document describes how the implementation realizes them. The implementation went
+through three reviews (`features/2026-07-28-pooling/review-{1,2,3}.md`) — all findings
+are closed and independently validated; the reviews double as a catalog of the
+sharp edges encountered (runtime nesting, systemd quoting, GPU pinning, parser
+selection) and are worth reading before deep changes.
 
 ## Architecture
 
 One Rust binary built on Pingora 0.8.1 (pinned exactly; pre-1.0 API churn is real).
-Pingora provides the process/runtime layer — listeners, worker threads, daemonization,
-graceful shutdown and the zero-downtime upgrade socket — while the router contributes
-three Pingora services and a background loop:
+Pingora provides the process/runtime layer — listeners, worker threads, graceful
+shutdown and the zero-downtime upgrade socket — while the router contributes three
+Pingora services and a background loop. Two runtime rules are load-bearing: `main` is
+**synchronous** because `run_forever()` performs a `block_on` and panics inside any
+tokio context (daemon mode is rejected for the related fork hazard), and the zbus/pool
+construction happens on a **dedicated process-lifetime runtime** so its I/O tasks
+never lose their executor:
 
 ```mermaid
 graph TD
@@ -85,11 +91,14 @@ Request handling, in order (`proxy/ingress.rs`):
    admission is serialized against lifecycle transitions per service).
 5. **Parking (cold path).** If nothing is running: acquire global and per-model parking
    permits (semaphores — exhaustion returns 503 + `Retry-After`), then a parked-slot
-   guard, then call `ensure_ready` with the service's parking deadline. The call is
-   raced against downstream-disconnect detection (`read_body_or_idle` on the
-   already-consumed request), so a hung-up client frees its slot immediately — but the
-   underlying start continues, because other waiters may need it (single-flight,
-   detached).
+   guard, then call `ensure_ready` with the service's parking deadline. The deadline is
+   deliberately *short* (~20 s default — the short-park amendment to spec Decision 3):
+   sized to wake time, not cold-start time. On expiry the client gets a
+   progress-reporting `model_starting` 503 (elapsed + typical duration + `Retry-After`)
+   while the detached start keeps warming. The call is raced against
+   downstream-disconnect detection (`read_body_or_idle` on the already-consumed
+   request), so a hung-up client frees its slot immediately — but the underlying start
+   continues, because other waiters may need it (single-flight, detached).
 6. **Forwarding.** Hop-by-hop and `Connection`-nominated headers are stripped both
    directions, `Host` is set to the backend, `x-request-id`/`traceparent` are added.
    Response chunks stream through one at a time; nothing aggregates SSE, and
@@ -124,6 +133,7 @@ stateDiagram-v2
     Waking --> Failed: error / deadline
     Failed --> Backoff: scheduled cleanup
     Backoff --> Stopped: unit force-stopped
+    Failed --> Stopped: convergent reconcile<br/>(unit inactive, no flight, no pending backoff)
 ```
 
 Key mechanics (`pool/mod.rs`, `state/mod.rs`):
@@ -201,7 +211,8 @@ identity (duplicate names/aliases/ports, alias-vs-canonical ambiguity), placemen
 (unknown GPU UUIDs, parallelism vs GPU count, per-GPU awake-owner policy), safety
 (loopback-only backends, a per-service absolute runner executable path, absolute model
 paths, allowlisted vLLM runner arguments with control-character and Ray-executor rejection,
-newline-safe systemd command/environment values), timing
+newline-safe systemd command/environment values, tool/reasoning parser names checked
+against the installed vLLM's registries), timing
 (threshold/interval/deadline sanity, parking vs startup deadlines), and **budgets** —
 host pinned-RAM under the all-L1-asleep worst case, and per-GPU VRAM for both
 all-asleep and each-awake-plus-others-asleep combinations, which under the
@@ -211,6 +222,13 @@ endpoint for live reload: edit the YAML, validate it with `vllm-router -t`, and 
 with a supervised router restart. An invalid configuration prevents the replacement
 process from starting; systemd-owned model processes remain up and are reconstructed by
 startup reconciliation.
+
+**Unit generation** renders complete units under `/run/systemd/system` plus mode-`0600`
+environment files: bare (unquoted) `EnvironmentFile=` paths, GPU UUIDs translated via
+NVML to numeric `CUDA_VISIBLE_DEVICES` with `CUDA_DEVICE_ORDER=PCI_BUS_ID`, and the
+allowlisted `environment:` maps merged global-then-service. Rendered units are checked
+with `systemd-analyze verify` in tests — the quoting/typo class of systemd defect fails
+CI rather than silently not loading at runtime.
 
 ## Security model
 
@@ -244,6 +262,6 @@ startup reconciliation.
 | Custom ingress instead of `ProxyHttp` | 64 KiB replay ceiling in pinned Pingora (Phase-0 S1); revisit if upstream grows a bounded body-replay API |
 | systemd owns processes | crash-restart, cgroup/GPU-zombie cleanup, and router/model lifetime decoupling for free |
 | Declaration-based GPU budgeting | vLLM pre-allocates `gpu_memory_utilization` at startup, so free-VRAM measurement can't drive placement; NVML is for observation and drift, not scheduling |
-| Park, don't 503, on cold models | callers get latency instead of retry loops; caps + deadlines bound the cost |
+| Short-park, then informative 503 | fast wakes succeed transparently; true cold starts fail fast with visible progress + `Retry-After` while the detached start warms — live testing showed long silent holds are strictly worse for interactive clients |
 | Exact guards over sketches | lifecycle safety needs zero/nonzero truth, not estimates |
 | One awake owner per GPU (v1) | eliminates co-residency profiling; slept residuals still share, validated by budget checks |
