@@ -57,9 +57,9 @@ token_file := env_var_or_default('TOKEN_FILE', '/run/secrets/vllm-router-token')
 
 # Ports `just run` binds and every client recipe targets (override per call,
 # e.g. `DATA_PORT=9000 just run`). The example-config conventions:
-data_port := env_var_or_default('DATA_PORT', '8000')
-mgmt_port := env_var_or_default('MGMT_PORT', '8001')
-metrics_port := env_var_or_default('METRICS_PORT', '8002')
+data_port := env_var_or_default('DATA_PORT', '6969')
+mgmt_port := env_var_or_default('MGMT_PORT', '6970')
+metrics_port := env_var_or_default('METRICS_PORT', '6971')
 
 data := env_var_or_default('DATA', 'http://127.0.0.1:' + data_port)
 mgmt := env_var_or_default('MGMT', 'http://127.0.0.1:' + mgmt_port)
@@ -84,7 +84,7 @@ validate:
     cargo run --locked --release --all-features -- -t -c {{pingora_config}} --router-config {{router_config}}
 
 # Run the router in the foreground (info logs) on DATA_PORT/MGMT_PORT/METRICS_PORT
-# (defaults 8000/8001/8002), patching a temp copy of the config to those ports.
+# (defaults 6969/6970/6971), patching a temp copy of the config to those ports.
 # Production/systemd uses the config file's ports as-is — this override is dev-only.
 run:
     #!/usr/bin/env bash
@@ -96,7 +96,12 @@ run:
         -e 's#(management:[[:space:]]*"?[^":]+:)[0-9]+#\1{{mgmt_port}}#' \
         -e 's#(metrics:[[:space:]]*"?[^":]+:)[0-9]+#\1{{metrics_port}}#' \
         {{router_config}} > "$tmp"
-    echo "data-plane :{{data_port}}  management :{{mgmt_port}}  metrics :{{metrics_port}}"
+    echo
+    echo -e "{{bold}}{{green}}vLLM router starting{{reset}}"
+    echo -e "  data-plane  {{bold}}http://0.0.0.0:{{data_port}}{{reset}}"
+    echo -e "  management  {{bold}}http://127.0.0.1:{{mgmt_port}}{{reset}}"
+    echo -e "  metrics     {{bold}}http://127.0.0.1:{{metrics_port}}{{reset}}"
+    echo
     RUST_LOG=info cargo run --locked --release --all-features -- \
         -c {{pingora_config}} --router-config "$tmp"
 

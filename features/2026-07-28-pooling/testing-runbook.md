@@ -7,7 +7,7 @@ being exercised are `spec.md` §Acceptance criteria; results belong in `acceptan
 Most commands below have `just` shortcuts (see `just --list`): `gpus`, `host-test`,
 `token`, `validate`, `run`, `ready`, `pool`/`pool-raw`, `pool-op <svc> <action>
 ['{json}']`, `operation <id>`, `models`, `chat <model>`, `stream <model>`,
-`stampede <model> [n]`, `metrics`, `unit-logs <svc>`. Ports default to 8000/8001/8002
+`stampede <model> [n]`, `metrics`, `unit-logs <svc>`. Ports default to 6969/6970/6971
 and override per call (`DATA_PORT=9000 just run`) — `just run` patches a temp config
 copy so the router and every client recipe agree; production uses the config file's
 ports as-is. Full URLs/paths override via `DATA`/`MGMT`/`METRICS`/`ROUTER_CONFIG`/
@@ -55,14 +55,14 @@ small gap; record what you find).
 
 Run the router in the foreground first (`RUST_LOG=info`), systemd unit later.
 
-1. `curl :8001/livez` and `/readyz` — ready via automatic-start reachability.
-2. `curl -H "Authorization: Bearer $TOKEN" :8001/pool/v1/services | jq` — service
+1. `curl :6970/livez` and `/readyz` — ready via automatic-start reachability.
+2. `curl -H "Authorization: Bearer $TOKEN" :6970/pool/v1/services | jq` — service
    `stopped`, real GPU observations, probe ages.
-3. **Cold start + parking:** `time curl :8000/v1/chat/completions -d '{"model":…}'` —
+3. **Cold start + parking:** `time curl :6969/v1/chat/completions -d '{"model":…}'` —
    request parks, unit starts (`journalctl -u vllm@<name> -f`), answer arrives after
    readiness + warmup. Second request is warm and fast.
 4. **Streaming:** `curl -N … "stream": true` — tokens arrive incrementally; check
-   `vllm_router_active_streams` on `:8002/metrics` during the stream.
+   `vllm_router_active_streams` on `:6971/metrics` during the stream.
 5. `/v1/models` lists **exactly one entry per service** (canonical `id`, aliases on
    the entry's `aliases` extension field — review-3 F2, no duplicate entries); **an
    alias-named completion request must succeed end-to-end** (exercises

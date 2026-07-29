@@ -17,9 +17,9 @@ three Pingora services and a background loop:
 ```mermaid
 graph TD
     subgraph binary [vllm-router :: pingora Server]
-        DP["DataPlane<br/><i>HttpServerApp</i> :8000"]
-        CP["ControlPlane<br/><i>HttpServerApp</i> :8001"]
-        MX["Prometheus service :8002"]
+        DP["DataPlane<br/><i>HttpServerApp</i> :6969"]
+        CP["ControlPlane<br/><i>HttpServerApp</i> :6970"]
+        MX["Prometheus service :6971"]
         BG["PoolBackground<br/><i>reconcile + idle reaper</i>"]
         TRAIT{{"PoolManager trait<br/>(the seam)"}}
         POOL["Pool&lt;R&gt;<br/>lifecycle engine, placement,<br/>single-flight, backoff"]

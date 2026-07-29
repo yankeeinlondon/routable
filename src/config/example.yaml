@@ -1,7 +1,7 @@
 listeners:
-  data_plane: "0.0.0.0:8000"
-  management: "127.0.0.1:8001"
-  metrics: "127.0.0.1:8002"
+  data_plane: "0.0.0.0:6969"
+  management: "127.0.0.1:6970"
+  metrics: "127.0.0.1:6971"
   management_bearer_token_file: /run/secrets/vllm-router-token
 
 inventory:

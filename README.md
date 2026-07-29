@@ -35,7 +35,7 @@ model serving.
 ```mermaid
 sequenceDiagram
     participant C as Client
-    participant R as Router :8000
+    participant R as Router :6969
     participant P as Pool manager
     participant S as systemd
     participant V as vLLM backend
@@ -108,11 +108,13 @@ complete, commented service:
 
 - **`listeners`** — three separate binds: `data_plane` (public inference), `management`
   (authenticated control API), `metrics` (Prometheus), plus the bearer-token file path.
-  All three are **required** — the router has no built-in default ports; `:8000`,
-  `:8001`, and `:8002` used throughout this document are the example config's
-  conventional values. There is no port flag or env var: ports are validated
-  configuration (collision and loopback rules run at `-t` time), changed like any
-  other setting via restart-to-apply.
+  All three are **required** — the router has no built-in default ports; `:6969`,
+  `:6970`, and `:6971` used throughout this document are the example config's
+  conventional values. (Deliberately not 8000: that is vLLM's own default port, so a
+  manually-launched `vllm serve` would collide with the router's data plane.) There is
+  no port flag or env var: ports are validated configuration (collision and loopback
+  rules run at `-t` time), changed like any other setting via restart-to-apply. The
+  router logs its effective listeners at startup (`"listeners configured"`).
 - **`inventory`** — host RAM and each GPU by **stable UUID** (`nvidia-smi -L`) with its
   VRAM capacity. Placement and budget validation are computed against these.
 - **`services`** — one entry per model server: served model name + aliases, GPU
@@ -125,7 +127,7 @@ complete, commented service:
 
 ## API surface
 
-### Inference (data plane, default `:8000`)
+### Inference (data plane, default `:6969`)
 
 vLLM exposes several API dialects on one server, and the router forwards the
 model-bearing `POST` endpoints of each, all routed by the JSON `model` field (aliases
@@ -156,7 +158,7 @@ over the configured limit, `503` + `Retry-After` when parking capacity or the pa
 deadline is exhausted. A cold model does **not** error by default — the request parks
 until the model is ready or the service's `parking.deadline_ms` expires.
 
-### Control (management listener, default `127.0.0.1:8001`)
+### Control (management listener, default `127.0.0.1:6970`)
 
 All `/pool/v1` calls require `Authorization: Bearer <token>`; every mutation is
 audit-logged and returns `202` with an `operation_id`.
@@ -175,13 +177,13 @@ audit-logged and returns `202` with an `operation_id`.
 
 ```console
 curl -s -H "Authorization: Bearer $(cat /run/secrets/vllm-router-token)" \
-  http://127.0.0.1:8001/pool/v1/services | jq '.services[] | {service, lifecycle}'
+  http://127.0.0.1:6970/pool/v1/services | jq '.services[] | {service, lifecycle}'
 
 curl -s -X POST -H "Authorization: Bearer $TOKEN" \
-  http://127.0.0.1:8001/pool/v1/services/example-30b/sleep -d '{"level":"l1"}'
+  http://127.0.0.1:6970/pool/v1/services/example-30b/sleep -d '{"level":"l1"}'
 ```
 
-### Metrics (default `127.0.0.1:8002`)
+### Metrics (default `127.0.0.1:6971`)
 
 Prometheus text format:
 

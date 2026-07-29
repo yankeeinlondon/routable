@@ -7,7 +7,7 @@ use pingora::{
     services::{background::BackgroundService, listening::Service},
 };
 use tokio::time::MissedTickBehavior;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 use vllm_router::{
     PoolManager,
     api::{ControlPlane, TokenAuth},
@@ -59,6 +59,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let mut prometheus = Service::prometheus_http_service();
     prometheus.add_tcp(&router_config.listeners.metrics.to_string());
+
+    info!(
+        data_plane = %router_config.listeners.data_plane,
+        management = %router_config.listeners.management,
+        metrics = %router_config.listeners.metrics,
+        "listeners configured"
+    );
 
     server.add_service(data_plane);
     server.add_service(management);
