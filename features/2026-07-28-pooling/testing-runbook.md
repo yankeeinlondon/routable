@@ -22,15 +22,20 @@ torch.compile caches under `/models/vllm/torch_compile_cache`.
 ## Tier 0 — fast suite (anywhere) — ✅ green
 
 ```console
-just lint && just test        # 126 lib + 4 bin tests, 1 host-only ignored
+just lint && just test        # 136 passed lib + 4 bin; 2 host-only ignored (1 lib + 1 integration)
 ```
 
-## Tier 1 — host integration probes (read-only) — ✅ green
+## Tier 1 — host integration probes — ✅ green
 
 ```console
-cargo test --lib -- --ignored         # live systemd D-Bus round trip (passed 2026-07-29)
-nvidia-smi -L                          # real GPU UUIDs for the config
+cargo test --lib -- --ignored                                      # live systemd D-Bus round trip (passed 2026-07-29)
+cargo test --test binary_serves -- --ignored --nocapture           # built binary reaches /livez, then exits on SIGTERM (passed 2026-07-29)
+nvidia-smi -L                                                       # real GPU UUIDs for the config
 ```
+
+The binary-serving probe creates one uniquely named generated systemd unit and unique
+Pingora PID/upgrade-socket paths; its cleanup removes the unit and reloads systemd,
+including when the assertion path fails.
 
 ## Tier 2 — real configuration validation
 
@@ -63,11 +68,11 @@ Run the router in the foreground first (`RUST_LOG=info`), systemd unit later.
    readiness + warmup. Second request is warm and fast.
 4. **Streaming:** `curl -N … "stream": true` — tokens arrive incrementally; check
    `vllm_router_active_streams` on `:6971/metrics` during the stream.
-5. `/v1/models` lists **exactly one entry per service** (canonical `id`, aliases on
-   the entry's `aliases` extension field — review-3 F2, no duplicate entries); **an
-   alias-named completion request must succeed end-to-end** (exercises
-   `--served-model-name` alias rendering — review-3 F1); unknown model →
-   OpenAI-shaped 404;
+5. `/v1/models` lists **exactly one entry per unique served model** (canonical `id`,
+   aliases on the entry's `aliases` extension field — review-3 F2, no duplicate
+   entries); **an alias-named completion (`just chat <configured-alias>`) must return
+   a generated answer end-to-end** (exercises `--served-model-name` alias rendering
+   — review-3 F1); unknown model → OpenAI-shaped 404;
    `/v1/messages` bad request → Anthropic-shaped error.
 6. **Idle tier:** set `idle.stop_after_ms` low (e.g. 120000), watch the reaper drain
    and stop via `/pool/v1/services` + `vllm_router_transitions_total`.

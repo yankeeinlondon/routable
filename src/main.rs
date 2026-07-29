@@ -23,8 +23,7 @@ struct Arguments {
     router_config: String,
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+fn main() -> Result<(), Box<dyn Error>> {
     tracing_subscriber::fmt()
         .json()
         .with_env_filter(
@@ -42,7 +41,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let config = Arc::new(ConfigStore::new(router_config.clone())?);
     let auth = TokenAuth::load(&router_config.listeners.management_bearer_token_file)?;
-    let pool = Arc::new(managed_pool_from_config(&router_config).await?);
+    // zbus owns I/O tasks on the runtime where its connection is constructed.
+    // Keep this dedicated runtime alive for the process, while allowing Pingora
+    // to construct and block on its own runtimes in `run_forever`.
+    let pool_runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_name("vllm-router-pool")
+        .build()?;
+    let pool = Arc::new(pool_runtime.block_on(managed_pool_from_config(&router_config))?);
     let facade: Arc<dyn PoolManager> = pool.clone();
 
     let mut data_plane = Service::new(

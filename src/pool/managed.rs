@@ -451,9 +451,7 @@ impl Runner for ManagedVllmRunner {
                 (
                     health.is_ok(),
                     models.is_some_and(|models| {
-                        models
-                            .iter()
-                            .any(|model| model == &service.config.served_model)
+                        served_model_matches(&models, &service.config.served_model)
                     }),
                 )
             };
@@ -649,6 +647,10 @@ fn reported_sleep_level(commanded: Option<SleepLevel>) -> SleepLevel {
     commanded.unwrap_or(SleepLevel::L1)
 }
 
+fn served_model_matches(models: &[String], canonical: &str) -> bool {
+    models.iter().any(|model| model == canonical)
+}
+
 fn systemd_state(state: &UnitActiveState) -> SystemdState {
     match state {
         UnitActiveState::Active | UnitActiveState::Reloading | UnitActiveState::Refreshing => {
@@ -797,6 +799,24 @@ mod tests {
         let later = probe.status_at(observed_at + Duration::from_secs(5));
         assert_eq!(later.age, Some(Duration::from_secs(5)));
         assert!(later.age > wrong_model.age);
+    }
+
+    #[test]
+    fn served_model_matches_canonical_among_additional_names() {
+        let models = vec![
+            "short-name".to_owned(),
+            "example/model-30b".to_owned(),
+            "legacy-name".to_owned(),
+        ];
+
+        assert!(served_model_matches(&models, "example/model-30b"));
+    }
+
+    #[test]
+    fn served_model_does_not_match_aliases_without_canonical() {
+        let models = vec!["short-name".to_owned(), "legacy-name".to_owned()];
+
+        assert!(!served_model_matches(&models, "example/model-30b"));
     }
 
     #[test]

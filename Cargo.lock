@@ -2972,6 +2972,7 @@ dependencies = [
  "bytes",
  "futures-util",
  "http",
+ "libc",
  "nvml-wrapper",
  "pingora",
  "prometheus",

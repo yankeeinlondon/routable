@@ -147,10 +147,19 @@ resolve to the canonical name):
 
 | Protocol family | Endpoints |
 |---|---|
+| Router model discovery | `GET /v1/models` |
 | OpenAI-compatible | `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/responses` |
 | Anthropic Messages | `/v1/messages`, `/v1/messages/count_tokens` |
 | Cohere/Jina-style pooling | `/v1/score`, `/v1/rerank`, `/v2/rerank`, `/v2/embed` (plus legacy `/score`, `/rerank`) |
 | vLLM native | `/tokenize`, `/detokenize`, `/classify` |
+
+`GET /v1/models` is synthesized by the router with exactly one entry per unique
+canonical `served_model`; replicas collapse into that entry rather than duplicating
+it. In addition to the standard model fields, each entry includes `aliases`, the
+declaration-ordered union of accepted alternate request ids across its replicas, and
+`max_model_len`, copied from `compatibility.maximum_model_length`. Aliases remain
+valid in inference request bodies but never appear as independent model ids.
+`POST /v1/models` returns `405 Method Not Allowed`.
 
 Everything else — including vLLM's admin endpoints (`/sleep`, `/wake_up`, …) — is
 refused on this listener. Multipart endpoints such as audio transcription/translation

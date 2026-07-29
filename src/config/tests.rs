@@ -6,6 +6,7 @@ use super::*;
 
 const GIB: u64 = 1024 * 1024 * 1024;
 type RejectionCase = (&'static str, fn(&mut RouterConfig), &'static str);
+type ConfigAcceptanceCase = (&'static str, fn(&mut RouterConfig));
 type IdleAcceptanceCase = (&'static str, fn(&mut ServiceDefinition));
 
 fn valid_config() -> RouterConfig {
@@ -98,6 +99,103 @@ fn accepts_valid_configuration_and_resolves_models() {
     assert_eq!(config.canonical_model("friendly"), Some("model-a"));
     assert_eq!(config.services_for_model("friendly").len(), 2);
     assert_eq!(config.service("replica").unwrap().backend.port, 8101);
+}
+
+#[test]
+fn validates_replica_client_contract_table() {
+    let rejection_cases: &[RejectionCase] = &[
+        (
+            "maximum model length differs",
+            |config| {
+                config.services[0].compatibility.maximum_model_length = Some(32_768);
+                let mut replica = valid_service("replica", "model-a", 8101, "GPU-b");
+                replica.compatibility.maximum_model_length = Some(131_072);
+                config.services.push(replica);
+            },
+            "compatibility.maximum_model_length",
+        ),
+        (
+            "KV cache dtype differs",
+            |config| {
+                config.services[0].compatibility.kv_cache_dtype = Some("fp8".into());
+                let mut replica = valid_service("replica", "model-a", 8101, "GPU-b");
+                replica.compatibility.kv_cache_dtype = Some("auto".into());
+                config.services.push(replica);
+            },
+            "compatibility.kv_cache_dtype",
+        ),
+    ];
+
+    for (name, mutate, differing_field) in rejection_cases {
+        let mut config = valid_config();
+        mutate(&mut config);
+        let errors = messages(&config);
+        assert!(errors.contains(differing_field), "case {name}: {errors}");
+        assert!(errors.contains("\"alpha\""), "case {name}: {errors}");
+        assert!(errors.contains("\"replica\""), "case {name}: {errors}");
+    }
+
+    let acceptance_cases: &[ConfigAcceptanceCase] = &[
+        ("replicas with identical contracts", |config| {
+            config.services[0].compatibility.maximum_model_length = Some(32_768);
+            config.services[0].compatibility.kv_cache_dtype = Some("fp8".into());
+            let mut replica = valid_service("replica", "model-a", 8101, "GPU-b");
+            replica.compatibility = config.services[0].compatibility.clone();
+            config.services.push(replica);
+        }),
+        ("served-model variants sharing a model path", |config| {
+            config.services[0].compatibility.maximum_model_length = Some(32_768);
+            let mut variant = valid_service("variant", "model-a-128k", 8101, "GPU-b");
+            variant.model_path = config.services[0].model_path.clone();
+            variant.compatibility.maximum_model_length = Some(131_072);
+            variant.compatibility.kv_cache_dtype = Some("fp8".into());
+            config.services.push(variant);
+        }),
+    ];
+
+    for (name, mutate) in acceptance_cases {
+        let mut config = valid_config();
+        mutate(&mut config);
+        config
+            .validate()
+            .unwrap_or_else(|error| panic!("case {name}: {error}"));
+    }
+}
+
+#[test]
+fn validates_alias_ownership_across_replicas() {
+    let mut replicas = valid_config();
+    replicas.services[0].aliases = vec!["friendly".into()];
+    let mut replica = valid_service("replica", "model-a", 8101, "GPU-b");
+    replica.aliases = vec!["friendly".into()];
+    replicas.services.push(replica);
+    replicas
+        .validate()
+        .expect("one alias may be owned by replicas of the same canonical model");
+
+    let rejection_cases: &[RejectionCase] = &[
+        (
+            "alias shared by different canonical models",
+            |config| {
+                config.services[0].aliases = vec!["shared".into()];
+                let mut service = valid_service("beta", "model-b", 8101, "GPU-b");
+                service.aliases = vec!["shared".into()];
+                config.services.push(service);
+            },
+            "ambiguous between canonical models",
+        ),
+        (
+            "alias conflicts with another canonical model",
+            |config| {
+                config.services[0].aliases = vec!["model-b".into()];
+                config
+                    .services
+                    .push(valid_service("beta", "model-b", 8101, "GPU-b"));
+            },
+            "conflicts with a canonical served model",
+        ),
+    ];
+    assert_rejections(rejection_cases);
 }
 
 #[test]

@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::HashMap,
     future::Future,
     sync::Arc,
     time::{Duration, Instant},
@@ -64,6 +64,8 @@ struct ModelDescription {
     owned_by: &'static str,
     root: String,
     parent: Option<String>,
+    aliases: Vec<String>,
+    max_model_len: Option<u64>,
 }
 
 struct RouterOwnedResponse {
@@ -763,30 +765,37 @@ fn router_owned_response(
 }
 
 fn configured_models(config: &RouterConfig) -> ModelsResponse {
-    let mut names = BTreeMap::new();
+    let mut canonical_indices = HashMap::new();
+    let mut data: Vec<ModelDescription> = Vec::new();
+
     for service in &config.services {
-        names
+        let index = *canonical_indices
             .entry(service.served_model.clone())
-            .or_insert_with(|| service.served_model.clone());
+            .or_insert_with(|| {
+                let index = data.len();
+                data.push(ModelDescription {
+                    id: service.served_model.clone(),
+                    object: "model",
+                    created: 0,
+                    owned_by: "vllm-router",
+                    root: service.served_model.clone(),
+                    parent: None,
+                    aliases: Vec::new(),
+                    max_model_len: service.compatibility.maximum_model_length,
+                });
+                index
+            });
+
         for alias in &service.aliases {
-            names
-                .entry(alias.clone())
-                .or_insert_with(|| service.served_model.clone());
+            if !data[index].aliases.contains(alias) {
+                data[index].aliases.push(alias.clone());
+            }
         }
     }
+
     ModelsResponse {
         object: "list",
-        data: names
-            .into_iter()
-            .map(|(id, canonical)| ModelDescription {
-                id,
-                object: "model",
-                created: 0,
-                owned_by: "vllm-router",
-                root: canonical,
-                parent: None,
-            })
-            .collect(),
+        data,
     }
 }
 
@@ -1277,7 +1286,60 @@ mod tests {
     }
 
     #[test]
-    fn model_discovery_lists_canonical_names_and_aliases_once() {
+    fn model_discovery_lists_two_unique_models_without_alias_ids() {
+        let mut config: RouterConfig = serde_yaml::from_str(include_str!("../config/example.yaml"))
+            .expect("example config should parse");
+        config.services[0].aliases = vec!["alias-b".into(), "alias-a".into()];
+        let mut distinct_model = config.services[0].clone();
+        distinct_model.name = "distinct-model".into();
+        distinct_model.served_model = "example/model-70b".into();
+        distinct_model.aliases = vec!["large".into()];
+        distinct_model.compatibility.maximum_model_length = Some(65_536);
+        config.services.push(distinct_model);
+
+        let response = router_owned_response(&http::Method::GET, MODELS_ENDPOINT, &config).unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body["object"], "list");
+        let data = response.body["data"].as_array().unwrap();
+        let ids: Vec<_> = data
+            .iter()
+            .map(|model| model["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["example/model-30b", "example/model-70b"]);
+
+        assert_eq!(
+            data[0],
+            json!({
+                "id": "example/model-30b",
+                "object": "model",
+                "created": 0,
+                "owned_by": "vllm-router",
+                "root": "example/model-30b",
+                "parent": null,
+                "aliases": ["alias-b", "alias-a"],
+                "max_model_len": 32768
+            })
+        );
+        assert_eq!(
+            data[1],
+            json!({
+                "id": "example/model-70b",
+                "object": "model",
+                "created": 0,
+                "owned_by": "vllm-router",
+                "root": "example/model-70b",
+                "parent": null,
+                "aliases": ["large"],
+                "max_model_len": 65536
+            })
+        );
+        assert!(data.iter().all(|model| {
+            !["alias-a", "alias-b", "large"].contains(&model["id"].as_str().unwrap())
+        }));
+    }
+
+    #[test]
+    fn model_discovery_collapses_replicas_and_unions_aliases_in_declaration_order() {
         let mut config: RouterConfig = serde_yaml::from_str(include_str!("../config/example.yaml"))
             .expect("example config should parse");
         config.services[0].aliases = vec!["alias-b".into(), "alias-a".into()];
@@ -1288,19 +1350,87 @@ mod tests {
 
         let response = router_owned_response(&http::Method::GET, MODELS_ENDPOINT, &config).unwrap();
         assert_eq!(response.status, 200);
-        assert_eq!(response.body["object"], "list");
-        let data = response.body["data"].as_array().unwrap();
-        let ids: Vec<_> = data
-            .iter()
-            .map(|model| model["id"].as_str().unwrap())
-            .collect();
-        assert_eq!(ids, ["alias-a", "alias-b", "alias-c", "example/model-30b"]);
-        assert!(data.iter().all(|model| {
-            model["object"] == "model"
-                && model["owned_by"] == "vllm-router"
-                && model["root"] == "example/model-30b"
-                && model["parent"].is_null()
-        }));
+        assert_eq!(
+            response.body["data"],
+            json!([{
+                "id": "example/model-30b",
+                "object": "model",
+                "created": 0,
+                "owned_by": "vllm-router",
+                "root": "example/model-30b",
+                "parent": null,
+                "aliases": ["alias-b", "alias-a", "alias-c"],
+                "max_model_len": 32768
+            }])
+        );
+    }
+
+    #[tokio::test]
+    async fn model_discovery_get_is_serialized_and_post_remains_method_not_allowed() {
+        let backend = closed_loopback_address().await;
+        let config = test_config(&[backend]);
+        let pool = Arc::new(FakePool::new(
+            config.snapshot().as_ref(),
+            Lifecycle::Running,
+            EnsureBehavior::Ready,
+        ));
+        let plane = Arc::new(DataPlane::new(config, pool).unwrap());
+
+        let (mut get_client, get_task) = ingress_connection(Arc::clone(&plane)).await;
+        get_client
+            .write_all(
+                b"GET /v1/models HTTP/1.1\r\n\
+                  Host: router.test\r\n\
+                  Connection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let get_response = read_response(get_client).await;
+        get_task.await.unwrap();
+        assert!(
+            get_response.starts_with(b"HTTP/1.1 200"),
+            "unexpected GET response: {}",
+            String::from_utf8_lossy(&get_response)
+        );
+        let get_body_start = get_response
+            .windows(4)
+            .position(|bytes| bytes == b"\r\n\r\n")
+            .unwrap()
+            + 4;
+        let get_body: Value = serde_json::from_slice(&get_response[get_body_start..]).unwrap();
+        assert_eq!(
+            get_body,
+            json!({
+                "object": "list",
+                "data": [{
+                    "id": "example/model-30b",
+                    "object": "model",
+                    "created": 0,
+                    "owned_by": "vllm-router",
+                    "root": "example/model-30b",
+                    "parent": null,
+                    "aliases": [],
+                    "max_model_len": 32768
+                }]
+            })
+        );
+
+        let (mut post_client, post_task) = ingress_connection(plane).await;
+        write_inference_request_to(&mut post_client, MODELS_ENDPOINT, b"{}").await;
+        let post_response = read_response(post_client).await;
+        post_task.await.unwrap();
+        assert!(
+            post_response.starts_with(b"HTTP/1.1 405"),
+            "unexpected POST response: {}",
+            String::from_utf8_lossy(&post_response)
+        );
+        let post_body_start = post_response
+            .windows(4)
+            .position(|bytes| bytes == b"\r\n\r\n")
+            .unwrap()
+            + 4;
+        let post_body: Value = serde_json::from_slice(&post_response[post_body_start..]).unwrap();
+        assert_eq!(post_body["error"]["code"], "method_not_allowed");
     }
 
     #[tokio::test]

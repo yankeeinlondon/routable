@@ -562,6 +562,7 @@ fn validate_services(config: &RouterConfig, errors: &mut Vec<String>) {
     let mut names = HashSet::new();
     let mut ports: HashMap<u16, &str> = HashMap::new();
     let mut alias_owners: HashMap<&str, &str> = HashMap::new();
+    let mut replica_contracts: HashMap<&str, (&str, &VllmCompatibility)> = HashMap::new();
     let mut systemd_units: HashMap<&str, &str> = HashMap::new();
     let mut environment_files: HashMap<&Path, &str> = HashMap::new();
 
@@ -620,6 +621,7 @@ fn validate_services(config: &RouterConfig, errors: &mut Vec<String>) {
         validate_timing(service, &location, config, errors);
         validate_sleep(service, &location, errors);
         validate_compatibility(service, &location, errors);
+        validate_replica_contract(service, &mut replica_contracts, errors);
     }
 }
 
@@ -662,14 +664,49 @@ fn validate_aliases<'a>(
             ));
         } else if !local.insert(alias.as_str()) {
             errors.push(format!("{location}.aliases contains duplicate {alias:?}"));
-        } else if let Some(owner) = alias_owners.insert(alias, &service.served_model) {
-            if owner != service.served_model {
+        } else if let Some(owner) = alias_owners.get(alias.as_str()) {
+            if *owner != service.served_model.as_str() {
                 errors.push(format!(
                     "alias {alias:?} is ambiguous between canonical models {owner:?} and {:?}",
                     service.served_model
                 ));
             }
+        } else {
+            alias_owners.insert(alias, &service.served_model);
         }
+    }
+}
+
+fn validate_replica_contract<'a>(
+    service: &'a ServiceDefinition,
+    replica_contracts: &mut HashMap<&'a str, (&'a str, &'a VllmCompatibility)>,
+    errors: &mut Vec<String>,
+) {
+    let Some((other_name, other)) = replica_contracts.get(service.served_model.as_str()) else {
+        replica_contracts.insert(
+            service.served_model.as_str(),
+            (service.name.as_str(), &service.compatibility),
+        );
+        return;
+    };
+
+    if other.maximum_model_length != service.compatibility.maximum_model_length {
+        errors.push(format!(
+            "services {other_name:?} and {:?} share served_model {:?} but compatibility.maximum_model_length differs ({:?} versus {:?})",
+            service.name,
+            service.served_model,
+            other.maximum_model_length,
+            service.compatibility.maximum_model_length,
+        ));
+    }
+    if other.kv_cache_dtype != service.compatibility.kv_cache_dtype {
+        errors.push(format!(
+            "services {other_name:?} and {:?} share served_model {:?} but compatibility.kv_cache_dtype differs ({:?} versus {:?})",
+            service.name,
+            service.served_model,
+            other.kv_cache_dtype,
+            service.compatibility.kv_cache_dtype,
+        ));
     }
 }
 

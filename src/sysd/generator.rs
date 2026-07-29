@@ -57,7 +57,8 @@ fn install_generated_inputs_in(
         .services
         .iter()
         .map(|service| {
-            let rendered = render_service(service, unit_directory)?;
+            let aliases = aliases_for_canonical_model(config, &service.served_model);
+            let rendered = render_service_with_aliases(service, &aliases, unit_directory)?;
             for path in [&rendered.unit_path, &rendered.environment_path] {
                 if !destinations.insert(path.clone()) {
                     return Err(GeneratedSystemdError::DuplicateOutput { path: path.clone() });
@@ -80,8 +81,17 @@ fn install_generated_inputs_in(
     Ok(())
 }
 
+#[cfg(test)]
 fn render_service(
     service: &ServiceDefinition,
+    unit_directory: &Path,
+) -> Result<RenderedService, GeneratedSystemdError> {
+    render_service_with_aliases(service, &service.aliases, unit_directory)
+}
+
+fn render_service_with_aliases(
+    service: &ServiceDefinition,
+    aliases: &[String],
     unit_directory: &Path,
 ) -> Result<RenderedService, GeneratedSystemdError> {
     validate_unit_filename(service)?;
@@ -98,7 +108,7 @@ fn render_service(
         environment.push_str("VLLM_SERVER_DEV_MODE=1\n");
     }
 
-    let arguments = vllm_arguments(service, sleep_enabled)?;
+    let arguments = vllm_arguments(service, aliases, sleep_enabled)?;
     let command = arguments
         .iter()
         .map(|argument| exec_argument(service, argument))
@@ -148,6 +158,7 @@ fn render_service(
 
 fn vllm_arguments(
     service: &ServiceDefinition,
+    aliases: &[String],
     sleep_enabled: bool,
 ) -> Result<Vec<String>, GeneratedSystemdError> {
     let mut arguments = vec![
@@ -159,6 +170,9 @@ fn vllm_arguments(
         service.backend.port.to_string(),
         "--served-model-name".into(),
         service.served_model.clone(),
+    ];
+    arguments.extend(aliases.iter().cloned());
+    arguments.extend([
         "--tensor-parallel-size".into(),
         service.placement.tensor_parallelism.to_string(),
         "--pipeline-parallel-size".into(),
@@ -167,7 +181,7 @@ fn vllm_arguments(
         service.placement.data_parallelism.to_string(),
         "--gpu-memory-utilization".into(),
         service.compatibility.gpu_memory_utilization.to_string(),
-    ];
+    ]);
 
     if let Some(path) = &service.tokenizer.path {
         arguments.push("--tokenizer".into());
@@ -227,6 +241,22 @@ fn vllm_arguments(
         }
     }
     Ok(arguments)
+}
+
+fn aliases_for_canonical_model(config: &RouterConfig, canonical: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut aliases = Vec::new();
+    for service in &config.services {
+        if service.served_model != canonical {
+            continue;
+        }
+        for alias in &service.aliases {
+            if seen.insert(alias.as_str()) {
+                aliases.push(alias.clone());
+            }
+        }
+    }
+    aliases
 }
 
 fn push_value_argument(arguments: &mut Vec<String>, name: &str, value: &str) {
@@ -519,6 +549,79 @@ mod tests {
                 .environment
                 .contains("CUDA_VISIBLE_DEVICES=\"GPU-00000000-0000-0000-0000-000000000001\"")
         );
+    }
+
+    #[test]
+    fn renders_canonical_name_followed_by_aliases_in_declaration_order() {
+        let mut config = example_config();
+        let service = &mut config.services[0];
+        service.aliases = vec!["short-name".into(), "legacy-name".into()];
+
+        let rendered = render_service(service, Path::new("/run/systemd/system")).unwrap();
+
+        assert!(rendered.unit.contains(
+            "\"--served-model-name\" \"example/model-30b\" \"short-name\" \"legacy-name\" \
+             \"--tensor-parallel-size\""
+        ));
+    }
+
+    #[test]
+    fn renders_only_the_canonical_name_when_there_are_no_aliases() {
+        let mut config = example_config();
+        let service = &mut config.services[0];
+        service.aliases.clear();
+
+        let rendered = render_service(service, Path::new("/run/systemd/system")).unwrap();
+
+        assert!(
+            rendered.unit.contains(
+                "\"--served-model-name\" \"example/model-30b\" \"--tensor-parallel-size\""
+            )
+        );
+    }
+
+    #[test]
+    fn safely_escapes_aliases_containing_quotes_and_spaces() {
+        let mut config = example_config();
+        let service = &mut config.services[0];
+        service.aliases = vec!["quoted \"alias name".into()];
+
+        let rendered = render_service(service, Path::new("/run/systemd/system")).unwrap();
+
+        assert!(rendered.unit.contains(
+            "\"--served-model-name\" \"example/model-30b\" \"quoted \\\"alias name\" \
+             \"--tensor-parallel-size\""
+        ));
+    }
+
+    #[test]
+    fn installs_every_replica_with_the_stable_union_of_model_aliases() {
+        let directory = tempfile::tempdir().unwrap();
+        let unit_directory = directory.path().join("units");
+        let environment_directory = directory.path().join("environment");
+        let mut config = example_config();
+        let first = &mut config.services[0];
+        first.aliases = vec!["first-alias".into()];
+        first.systemd.environment_file = environment_directory.join("first.env");
+
+        let mut second = first.clone();
+        second.name = "example-30b-replica".into();
+        second.aliases = vec!["second-alias".into()];
+        second.backend.port = 8101;
+        second.systemd.unit = "vllm@example-30b-replica.service".into();
+        second.systemd.environment_file = environment_directory.join("second.env");
+        config.services.push(second);
+
+        install_generated_inputs_in(&config, &unit_directory).unwrap();
+
+        let expected = "\"--served-model-name\" \"example/model-30b\" \
+                        \"first-alias\" \"second-alias\" \"--tensor-parallel-size\"";
+        let first_unit =
+            fs::read_to_string(unit_directory.join("vllm@example-30b.service")).unwrap();
+        let second_unit =
+            fs::read_to_string(unit_directory.join("vllm@example-30b-replica.service")).unwrap();
+        assert!(first_unit.contains(expected));
+        assert!(second_unit.contains(expected));
     }
 
     #[test]
