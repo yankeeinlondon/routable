@@ -281,3 +281,18 @@ specific (hermes for Qwen; gpt-oss and Gemma need their own), and consider surfa
 tool-capability in the `/v1/models` entry (contract rule, F2). **Interim (deployed):**
 `--enable-auto-tool-choice --tool-call-parser hermes` appended to both generated
 units by hand — overwritten at every router restart.
+
+**F8 root-cause correction (2026-07-29, later):** the primary defect is that the
+generator emits `EnvironmentFile="/etc/vllm/<name>.env"` — systemd rejects the quoted
+path (`EnvironmentFile= path is not absolute, ignoring`, warned at every daemon-reload
+since first generation) and **silently loads no environment file at all**. Every
+process therefore started with no `CUDA_VISIBLE_DEVICES` whatsoever; the UUID-vs-
+numeric question was never actually exercised. Fix: emit the path unquoted (the
+generator's exec-quoting was over-applied to a directive that must be bare), and add a
+generator test asserting `systemd-analyze verify` passes on a rendered unit — that
+check catches this class wholesale. Keep numeric CVD + `CUDA_DEVICE_ORDER=PCI_BUS_ID`
+as the rendered form regardless (vLLM's own device bookkeeping is index-based), and
+keep the post-readiness NVML placement check from the original F8 write-up — it would
+have converted both variants of this failure from silent to loud. Interim: quotes
+stripped by hand in both generated units (overwritten at router restart, as with the
+other interim fixes).
