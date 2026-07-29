@@ -107,7 +107,12 @@ exits non-zero with an actionable error if anything is wrong.
 complete, commented service:
 
 - **`listeners`** — three separate binds: `data_plane` (public inference), `management`
-  (authenticated control API), `metrics` (Prometheus). Plus the bearer-token file path.
+  (authenticated control API), `metrics` (Prometheus), plus the bearer-token file path.
+  All three are **required** — the router has no built-in default ports; `:8000`,
+  `:8001`, and `:8002` used throughout this document are the example config's
+  conventional values. There is no port flag or env var: ports are validated
+  configuration (collision and loopback rules run at `-t` time), changed like any
+  other setting via restart-to-apply.
 - **`inventory`** — host RAM and each GPU by **stable UUID** (`nvidia-smi -L`) with its
   VRAM capacity. Placement and budget validation are computed against these.
 - **`services`** — one entry per model server: served model name + aliases, GPU
@@ -190,6 +195,21 @@ Prometheus text format:
 | `vllm_router_probe_failures_total{service,probe}` | failed systemd/HTTP/NVML observations |
 | `vllm_router_active_requests{service}` | exact in-flight requests per service |
 | `vllm_router_service_state{service,state}` | one-hot lifecycle state per service |
+
+## CLI and environment reference
+
+```
+vllm-router -c <pingora.yaml> [--router-config <router.yaml>] [-t] [-u]
+```
+
+| Flag / variable | Meaning |
+|---|---|
+| `-c`, `--conf <path>` | Pingora server configuration (required) |
+| `--router-config <path>` | router configuration; overrides `VLLM_ROUTER_CONFIG` |
+| `VLLM_ROUTER_CONFIG` | env var selecting the router config path (default `/etc/vllm-router/router.yaml`) |
+| `-t`, `--test` | validate both configurations and exit non-zero on any error |
+| `-u`, `--upgrade` | take over listening sockets from a running instance (zero-downtime upgrade) |
+| `-d`, `--daemon` | **rejected by design** — run under systemd instead (daemonizing would break the D-Bus connection) |
 
 ## Operating notes
 
