@@ -117,49 +117,56 @@ run: _need-config
     RUST_LOG=info cargo run --locked --release --all-features -- \
         -c {{pingora_config}} --router-config "$tmp"
 
+# Fail fast with a friendly message when the router isn't up.
+_need-router:
+    @curl -s -o /dev/null --max-time 2 {{mgmt}}/livez || { \
+        echo "router is not reachable at {{mgmt}}."; \
+        echo "start it with:  just run   (or check MGMT_PORT if you overrode ports)"; \
+        exit 1; }
+
 # Router liveness and routing readiness.
-ready:
+ready: _need-router
     @curl -sS {{mgmt}}/livez | jq -c .
     @curl -sS {{mgmt}}/readyz | jq -c .
 
 # Authenticated pool status: every service's desired + observed state.
-pool:
+pool: _need-router
     @curl -sS -H "Authorization: Bearer $(cat {{token_file}})" \
         {{mgmt}}/pool/v1/services | jq '.services[] | {service, lifecycle, active_requests, parked_requests, last_error}'
 
 # Full pool status, unabridged JSON.
-pool-raw:
+pool-raw: _need-router
     @curl -sS -H "Authorization: Bearer $(cat {{token_file}})" {{mgmt}}/pool/v1/services | jq .
 
 # Run a lifecycle action (start|wake|drain|sleep|stop) with an optional JSON body.
-pool-op service action body='{}':
+pool-op service action body='{}': _need-router
     @curl -sS -X POST -H "Authorization: Bearer $(cat {{token_file}})" \
         -H 'content-type: application/json' -d '{{body}}' \
         {{mgmt}}/pool/v1/services/{{service}}/{{action}} | jq .
 
 # Poll an asynchronous operation by id.
-operation id:
+operation id: _need-router
     @curl -sS -H "Authorization: Bearer $(cat {{token_file}})" \
         {{mgmt}}/pool/v1/operations/{{id}} | jq .
 
 # The router's synthesized model list (what clients see).
-models:
+models: _need-router
     @curl -sS {{data}}/v1/models | jq .
 
 # One timed non-streaming completion; a cold model exercises parking.
-chat model prompt='Say hello in five words.':
+chat model prompt='Say hello in five words.': _need-router
     time curl -sS -X POST {{data}}/v1/chat/completions \
         -H 'content-type: application/json' \
         -d '{"model":"{{model}}","messages":[{"role":"user","content":"{{prompt}}"}],"max_tokens":64}' | jq -r '.choices[0].message.content // .'
 
 # A streaming completion; tokens should render incrementally.
-stream model prompt='Count slowly from one to twenty.':
+stream model prompt='Count slowly from one to twenty.': _need-router
     curl -sN -X POST {{data}}/v1/chat/completions \
         -H 'content-type: application/json' \
         -d '{"model":"{{model}}","messages":[{"role":"user","content":"{{prompt}}"}],"max_tokens":128,"stream":true}'
 
 # Fire n concurrent requests at a model and tally status codes (stampede drill).
-stampede model n='20':
+stampede model n='20': _need-router
     seq {{n}} | xargs -P {{n}} -I_ curl -s -o /dev/null -w "%{http_code}\n" \
         -X POST {{data}}/v1/chat/completions \
         -H 'content-type: application/json' \
@@ -167,7 +174,7 @@ stampede model n='20':
         | sort | uniq -c
 
 # Current router metrics (Prometheus text).
-metrics:
+metrics: _need-router
     @curl -sS {{metrics_url}}/metrics | grep '^vllm_router'
 
 # Follow a managed model unit's journal.
