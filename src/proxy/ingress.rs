@@ -371,11 +371,14 @@ impl DataPlane {
         let parking_deadline = started + Duration::from_millis(service.parking.deadline_ms);
         let lifecycle_deadline = started
             + Duration::from_millis(service.deadlines.startup_ms.max(service.deadlines.wake_ms));
-        let permits = self.acquire_parking(model, &service)?;
+        let permits = self
+            .acquire_parking(model, &service)
+            .map_err(|error| count_admission_rejection(&service.name, error))?;
         let parked = self
             .pool
             .acquire_parked(service.name.clone())
-            .map_err(IngressError::Pool)?;
+            .map_err(IngressError::Pool)
+            .map_err(|error| count_admission_rejection(&service.name, error))?;
         let parking_started = Instant::now();
         metrics::global().parked.with_label_values(&[model]).inc();
         metrics::global().global_parked.inc();
@@ -411,16 +414,25 @@ impl DataPlane {
         metrics::global().global_parked.dec();
         drop(parked);
         drop(permits);
-        outcome?;
+        // A parked request that outlives its parking deadline is the most common
+        // fail-closed refusal the router issues, and the lifecycle start it triggered
+        // continues in the background. Recording it here is what makes an unexplained
+        // running service traceable back to the request that woke it.
+        outcome.map_err(|error| count_admission_rejection(&service.name, error))?;
 
         // Re-select across every now-ready replica, then atomically acquire its
         // active guard. A drain racing this step fails closed.
         self.choose_running(config, model, None)
             .await?
-            .ok_or_else(|| IngressError::Unavailable {
-                code: "model_not_ready",
-                message: format!("model `{model}` did not become routable"),
-                retry_after: Some(service.parking.retry_after_seconds),
+            .ok_or_else(|| {
+                count_admission_rejection(
+                    &service.name,
+                    IngressError::Unavailable {
+                        code: "model_not_ready",
+                        message: format!("model `{model}` did not become routable"),
+                        retry_after: Some(service.parking.retry_after_seconds),
+                    },
+                )
             })
     }
 
@@ -906,6 +918,40 @@ enum IngressError {
     },
     #[error("downstream disconnected before the response completed")]
     ClientDisconnected,
+}
+
+/// Record a data-plane admission refusal against `service` and return it unchanged, so
+/// counting composes into an existing `?` path without restructuring the caller.
+///
+/// The pool counts the refusals it decides itself (`require_admissible_status`); this
+/// covers the ones ingress decides — parking capacity, the parking deadline, and a
+/// post-start re-selection that found nothing routable. Cancellation is deliberately not
+/// a rejection: the router refused nothing, the client left.
+fn count_admission_rejection(service: &str, error: IngressError) -> IngressError {
+    if let Some(reason) = admission_rejection_reason(&error) {
+        metrics::global()
+            .admission_rejections
+            .with_label_values(&[service, reason])
+            .inc();
+    }
+    error
+}
+
+/// `None` for anything that is not a fail-closed admission refusal. Every returned
+/// reason is a `&'static str` from a closed vocabulary, keeping the label bounded.
+fn admission_rejection_reason(error: &IngressError) -> Option<&'static str> {
+    match error {
+        IngressError::ParkingExpired { .. } => Some("parking_expired"),
+        IngressError::Unavailable { code, .. } => Some(code),
+        IngressError::Pool(error) => Some(error.code()),
+        IngressError::ClientDisconnected => None,
+        IngressError::Pingora(_)
+        | IngressError::Routing(_)
+        | IngressError::Upstream(_)
+        | IngressError::UpstreamTimeout { .. }
+        | IngressError::ConnectFailure(_)
+        | IngressError::Json(_) => None,
+    }
 }
 
 fn alias_map(config: &RouterConfig) -> HashMap<String, String> {
@@ -2250,6 +2296,13 @@ mod tests {
         assert!(first_response.contains(r#""elapsed_seconds":"#));
         assert!(first_response.contains(r#""typical_duration_seconds":7"#));
         assert!(first_response.contains("is starting"));
+        // The refusal is recorded against the service whose start it triggered. This is
+        // the fact that makes a service found running with zero successful requests
+        // traceable back to the request that woke it.
+        assert_eq!(
+            admission_rejection_count("slow-start-0", "parking_expired"),
+            1
+        );
 
         tokio::time::sleep(Duration::from_millis(80)).await;
         assert_eq!(pool.ensure_calls.load(Ordering::Acquire), 1);
@@ -2270,6 +2323,34 @@ mod tests {
         assert!(retry_response.starts_with(b"HTTP/1.1 200"));
         assert!(retry_response.ends_with(b"warm"));
         assert_eq!(pool.ensure_calls.load(Ordering::Acquire), 1);
+        // An admitted request is not a refusal: the counter stays where the 503 left it.
+        assert_eq!(
+            admission_rejection_count("slow-start-0", "parking_expired"),
+            1
+        );
+    }
+
+    fn admission_rejection_count(service: &str, reason: &str) -> u64 {
+        prometheus::gather()
+            .into_iter()
+            .find(|family| family.get_name() == "vllm_router_admission_rejections_total")
+            .and_then(|family| {
+                family
+                    .get_metric()
+                    .iter()
+                    .find(|metric| {
+                        let labels: HashMap<_, _> = metric
+                            .get_label()
+                            .iter()
+                            .map(|label| (label.get_name(), label.get_value()))
+                            .collect();
+                        labels.get("service") == Some(&service)
+                            && labels.get("reason") == Some(&reason)
+                    })
+                    .cloned()
+            })
+            .map(|metric| metric.get_counter().get_value() as u64)
+            .unwrap_or(0)
     }
 
     #[tokio::test]

@@ -1168,6 +1168,21 @@ impl<R: Runner + 'static> Pool<R> {
         let task_affected_requests = affected_requests.clone();
         let task = async move {
             let outcome = task(pool.clone(), operation_id, task_affected_requests).await;
+            // Counted here rather than at the call sites because this is the only place a
+            // transition actually executes: joining callers inherit a running flight and
+            // must not each register a transition that ran once. `result` reuses the
+            // `PoolError` code vocabulary so a failure says why without a second metric.
+            metrics::global()
+                .transitions
+                .with_label_values(&[
+                    &service_name,
+                    policy.audit_action(),
+                    match &outcome {
+                        Ok(_) => "success",
+                        Err(error) => error.code(),
+                    },
+                ])
+                .inc();
             let entry = pool
                 .inner
                 .services
@@ -2801,6 +2816,126 @@ mod tests {
             0
         );
         assert_eq!(start_phase_sample_count(service, "warmup", "success"), 0);
+    }
+
+    #[tokio::test]
+    async fn a_completed_transition_is_counted_once_with_its_outcome() {
+        let service = "transition-metrics-success";
+        let runner = MockRunner::new(&[service], &[]);
+        let pool =
+            reconciled_pool(vec![definition(service, "transition-metrics-gpu")], runner).await;
+
+        pool.ensure_ready_status(
+            service,
+            EnsureReadyOptions::by(Instant::now() + Duration::from_secs(1)),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(transition_count(service, "ensure_ready", "success"), 1);
+
+        pool.stop_status(
+            service,
+            StopOptions {
+                deadline: Instant::now() + Duration::from_secs(1),
+                force: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Each transition kind is counted under its own label, so a service that started
+        // and later stopped is distinguishable from one that only started.
+        assert_eq!(transition_count(service, "stop", "success"), 1);
+        assert_eq!(transition_count(service, "ensure_ready", "success"), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_transition_is_counted_under_its_error_code() {
+        let service = "transition-metrics-failure";
+        let runner = MockRunner::new(&[service], &[]);
+        runner.fail_start.store(true, Ordering::Release);
+        let pool = reconciled_pool(
+            vec![definition(service, "transition-metrics-failure-gpu")],
+            runner,
+        )
+        .await;
+
+        let result = pool
+            .ensure_ready_status(
+                service,
+                EnsureReadyOptions::by(Instant::now() + Duration::from_secs(1)),
+            )
+            .await;
+
+        assert!(matches!(result, Err(PoolError::Runner { .. })));
+        assert_eq!(
+            transition_count(service, "ensure_ready", "runner_failure"),
+            1
+        );
+        assert_eq!(transition_count(service, "ensure_ready", "success"), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn joining_callers_do_not_inflate_the_transition_count() {
+        let service = "transition-metrics-join";
+        let runner = MockRunner::new(&[service], &[]);
+        let pool = reconciled_pool(
+            vec![definition(service, "transition-metrics-join-gpu")],
+            runner,
+        )
+        .await;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut tasks = Vec::new();
+        for _ in 0..50 {
+            let pool = pool.clone();
+            tasks.push(tokio::spawn(async move {
+                pool.ensure_ready_status(service, EnsureReadyOptions::by(deadline))
+                    .await
+            }));
+        }
+        for task in tasks {
+            assert_eq!(task.await.unwrap().unwrap().lifecycle, Lifecycle::Running);
+        }
+
+        // The counter measures transitions executed, not callers served: fifty arrivals
+        // collapse onto one flight and must read as one transition.
+        assert_eq!(transition_count(service, "ensure_ready", "success"), 1);
+    }
+
+    fn transition_count(service: &str, transition: &str, result: &str) -> u64 {
+        counter_value(
+            "vllm_router_transitions_total",
+            &[
+                ("service", service),
+                ("transition", transition),
+                ("result", result),
+            ],
+        )
+    }
+
+    fn counter_value(name: &str, expected: &[(&str, &str)]) -> u64 {
+        prometheus::gather()
+            .into_iter()
+            .find(|family| family.get_name() == name)
+            .and_then(|family| {
+                family
+                    .get_metric()
+                    .iter()
+                    .find(|metric| {
+                        let labels: HashMap<_, _> = metric
+                            .get_label()
+                            .iter()
+                            .map(|label| (label.get_name(), label.get_value()))
+                            .collect();
+                        expected
+                            .iter()
+                            .all(|(name, value)| labels.get(name) == Some(value))
+                    })
+                    .cloned()
+            })
+            .map(|metric| metric.get_counter().get_value() as u64)
+            .unwrap_or(0)
     }
 
     fn start_phase_sample_count(service: &str, phase: &str, result: &str) -> u64 {
