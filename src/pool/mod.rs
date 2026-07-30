@@ -1547,6 +1547,22 @@ impl<R: Runner + 'static> Pool<R> {
                 affected_requests,
             )
             .await;
+        // Eviction owns its flight slot directly instead of going through
+        // `get_or_spawn_flight`, so it must count itself or a model that vanished to make
+        // room for another would leave no transition record at all. It is labelled
+        // `evict` rather than `stop` because "something displaced my model" and "my model
+        // idled out" are the two questions this counter exists to tell apart.
+        metrics::global()
+            .transitions
+            .with_label_values(&[
+                &service,
+                "evict",
+                match &outcome {
+                    Ok(_) => "success",
+                    Err(error) => error.code(),
+                },
+            ])
+            .inc();
         let mut flight_slot = victim.flight.lock().await;
         if flight_slot
             .as_ref()
@@ -4338,6 +4354,12 @@ mod tests {
             Lifecycle::Stopped
         );
         assert_eq!(*stop_order.lock().await, vec!["low", "high"]);
+        // Eviction does not run through `get_or_spawn_flight`, so without its own counter
+        // a displaced model would leave no transition record. `evict` keeps "something
+        // took my GPU" separate from an idle reap, which is recorded as `stop`.
+        assert_eq!(transition_count("low", "evict", "success"), 1);
+        assert_eq!(transition_count("high", "evict", "success"), 1);
+        assert_eq!(transition_count("low", "stop", "success"), 0);
     }
 
     #[tokio::test]
