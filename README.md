@@ -23,8 +23,10 @@ switch into an ops task. This router makes the pool self-service:
   instead of a silent hang.
 - **GPU arbitration.** One awake owner per GPU, priority-then-LRU eviction when demand
   needs a busy GPU, declared VRAM/RAM budgets validated up front.
-- **Sleep mode aware.** Where validated, vLLM's sleep levels replace full restarts:
-  sub-second (L1) or few-second (L2) wakes instead of multi-minute cold starts.
+- **Sleep mode aware.** Where validated, vLLM's two sleep levels replace full restarts —
+  offloading weights to host RAM (L1) or discarding them (L2) to hand the GPU back while
+  the process stays alive, so returning costs seconds instead of a multi-minute cold
+  start. See [the lifecycle section](#first-the-vocabulary-sleep-l1-and-l2).
 - **Streams are sacred.** SSE token streams pass through chunk-by-chunk, are never
   buffered or compressed, and long generations are bounded by an *inter-token* idle
   timeout rather than a total duration limit.
@@ -69,6 +71,46 @@ sequenceDiagram
 Nothing runs until something asks for it, and nothing stays running forever. Four
 mechanisms decide residency, and every state change on a model traces back to exactly
 one of them.
+
+### First, the vocabulary: sleep, L1, and L2
+
+A loaded model holds its full VRAM reservation even when nobody is using it — about 31 GB
+per GPU in the reference configuration. Without sleep the only choices are to keep it
+(blocking the GPU) or stop the process (paying a full cold start to come back).
+
+**Sleep is the middle option: keep the backend process alive, hand the GPU memory back.**
+It is a vLLM feature, not a router invention. The generator enables it with the
+`--enable-sleep-mode` launch flag, which exposes `POST /sleep?level=N` and
+`POST /wake_up` on the backend; `L1` and `L2` are this project's names for vLLM's two
+sleep levels, written `l1` and `l2` in configuration.
+
+- **L1 — weights move to host RAM.** Weights are copied out of VRAM into system RAM and
+  the KV cache is dropped; the process keeps holding those weights. Waking copies them
+  back: a single `POST /wake_up`. This is why `sleep.l1_host_ram_bytes` exists and why it
+  is required for L1 only.
+- **L2 — weights are discarded.** Nothing is retained in host RAM, so waking must re-read
+  the weights from disk. That is why the router's L2 wake is three calls rather than one:
+  `/wake_up?tags=weights`, a `collective_rpc` `reload_weights`, then `/wake_up?tags=kv_cache`.
+
+The trade, from the per-model measurements in `docs/`:
+
+| | L1 | L2 | Stopped |
+|---|---|---|---|
+| Weights held in | host RAM | nowhere — reloaded from disk | nowhere |
+| Host RAM cost | large — 39 GB measured for the 27B | none | none |
+| Wake, Qwen3.6-27B NVFP4 | ~3.03 s | ~5.05 s | minutes (full cold start) |
+| Wake, Llama-3.1-8B FP8 (TP=1) | ~0.27 s | ~3.10 s | minutes (full cold start) |
+
+Two measured properties that are easy to get wrong:
+
+- **Sleeping does not empty the GPU.** Roughly 1,414 MiB stays resident for the 27B and
+  944 MiB for Llama-8B. That residue is what `sleep.residual_vram_bytes_per_gpu` declares,
+  and the router uses it as the expected VRAM for a sleeping service. Enough headroom is
+  freed for another model to take the card; the card is not free.
+- **A sleeping backend does not refuse traffic, it stalls.** Every direct request to a
+  sleeping model in both validation runs was accepted and then returned no bytes before
+  the client timed out. The router therefore refuses on its own freshness facts and wakes
+  before forwarding, rather than treating the backend as a safety barrier.
 
 ### 1. Demand starts a model
 
@@ -144,6 +186,35 @@ sleep leaves residual VRAM behind and needs enough host RAM to hold the offloade
 Guessing those numbers over-commits a GPU. So a service with sleep unconfigured has
 exactly one idle tier available — `stop_after_ms` — and the reaper takes it.
 
+**How a value is earned.** `hardware_validated: true` is an attestation that the Tier 5
+matrix in `features/2026-07-28-pooling/testing-runbook.md` passed for this exact
+checkpoint, vLLM version, host, and tensor-parallel degree. Per cell of
+{TP degree} × {quantization} × {L1, L2} it runs five sleep/wake cycles checking a fixed
+prompt still returns the same output, and records wake latency, residual VRAM
+(`nvidia-smi`), pinned host RAM (the unit's `MemoryCurrent`), behavior of a request sent
+to a sleeping backend, drain-then-sleep, refusal to sleep mid-request, the L2 three-step
+wake, and L1→L2 promotion. Results go in `docs/{model-id}.md`.
+
+Note which of these is a claim and which is a measurement:
+
+| Field | Kind | Source |
+|---|---|---|
+| `sleep.l1_host_ram_bytes` | your declared budget | you write it; the matrix tests whether it held |
+| `compatibility.minimum_l1_host_ram_bytes` | measured floor | max observed `MemoryCurrent`, rounded up with margin |
+| `sleep.residual_vram_bytes_per_gpu` | measured | VRAM still held while asleep |
+
+Validation rejects a declared budget below the measured floor, and the floor is recorded
+**even when sleep stays disabled** so a later enablement cannot under-declare. A topology
+that fails outright is recorded in `compatibility.unsupported_tensor_parallelism`, which
+makes configuration validation reject that degree until the cell is revalidated.
+
+Both models measured on this host so far — `docs/qwen3.6-27b-nvfp4.md` and
+`docs/meta-llama-3.1-8b-instruct-fp8.md` — failed eligibility the same way: measured L1
+host-RAM use exceeded the declared budget (39.0 GB against 30 GB, and 24.53 GB against
+20 GB). In both cases the sleep mechanism itself worked; the budget declaration did not.
+That is the expected failure mode, and the reason the floor is recorded before sleep is
+ever switched on.
+
 **Sleep is better than stop for a model you return to**, and the difference is large: an
 L1 wake is a `/wake_up` call against a live process, well inside the 20 s parking window,
 so the request that triggers it is usually served without ever seeing a `503`. A cold
@@ -172,15 +243,17 @@ request that gave up.
 **A whole fleet found stopped after an hour away.** Every service here uses the default
 single tier, so an hour of idleness stops each one and the next request pays a full cold
 start. To make returns cheap, give the service a sleep ladder — offload after 10 minutes,
-deepen at 30, release the host entirely at 4 hours:
+deepen at 30, release the host entirely at 4 hours. Shown with the values actually
+measured for Qwen3.6-27B NVFP4 rather than invented ones, since every number here has to
+come from a matrix run:
 
 ```yaml
   sleep:
     enabled: true
-    hardware_validated: true          # only after measuring on this host
+    hardware_validated: true          # only after a passing Tier 5 run
     levels: [l1, l2]
-    residual_vram_bytes_per_gpu: 2147483648
-    l1_host_ram_bytes: 34359738368    # ≥ compatibility.minimum_l1_host_ram_bytes
+    residual_vram_bytes_per_gpu: 1482686464   # 1,414 MiB measured while asleep
+    l1_host_ram_bytes: 40000000000            # ≥ minimum_l1_host_ram_bytes
   idle:
     sleep_l1_after_ms: 600000         # 10 min → weights to host RAM
     sleep_l2_after_ms: 1800000        # 30 min → discard weights, keep process
@@ -193,9 +266,12 @@ Validate before restarting — the router applies configuration only at startup:
 vllm-router -t -c /etc/vllm-router/pingora.yaml --router-config /etc/vllm-router/router.yaml
 ```
 
-Until `hardware_validated` is honestly earned, the safer change is simply raising
-`stop_after_ms`. Note that a sleeping model still occupies host RAM and
-`residual_vram_bytes_per_gpu`, so sleep trades memory for latency — it is not free.
+This exact service is **not** currently eligible: its 2026-07-29 run measured 39.0 GB of
+L1 host RAM against a 30 GB declaration, so `hardware_validated: true` would be a false
+claim until a re-run passes against the 40 GB floor. Until that is honestly earned, the
+safer change is simply raising `stop_after_ms`. Note that a sleeping model still occupies
+host RAM and `residual_vram_bytes_per_gpu`, so sleep trades memory for latency — it is
+not free.
 
 **A model that vanished while another started.** Two services sharing `gpu-0`: `low`
 (`priority: -100`, idle 40 min) and `high` (`priority: 100`, idle 2 min). A request
