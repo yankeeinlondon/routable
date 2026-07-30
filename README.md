@@ -225,7 +225,7 @@ Note which of these fields is a claim and which is a measurement:
 Validation rejects a declared budget below the measured floor, and the floor is recorded
 **even when sleep stays disabled** so a later enablement cannot under-declare. A topology
 that fails outright is recorded in `compatibility.unsupported_tensor_parallelism`, which
-makes configuration validation reject that degree until the cell is revalidated.
+makes configuration validation reject that degree until it is measured again successfully.
 
 Both models measured on this host so far — `docs/qwen3.6-27b-nvfp4.md` and
 `docs/meta-llama-3.1-8b-instruct-fp8.md` — failed eligibility the same way: measured L1

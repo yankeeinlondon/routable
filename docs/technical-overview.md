@@ -177,22 +177,39 @@ Key mechanics (`pool/mod.rs`, `state/mod.rs`):
 
 ## Sleep and wake
 
-Sleep support is per-service opt-in and additionally gated on
-`hardware_validated: true` — config validation rejects enabled-but-unvalidated sleep,
-because sm_120/Blackwell has open upstream bugs (see the Phase-0 matrix). The runner
-speaks vLLM 0.26's dev-mode surface: `POST /sleep?level=N`, `GET /is_sleeping`, and for
-L2 wake the required three-step sequence — `wake_up?tags=weights` →
+Sleep is a vLLM feature that releases a model's GPU memory while leaving its process
+alive, so returning costs seconds rather than a full reload. It has two levels, which
+this codebase calls L1 and L2: **L1** copies the weights out to host RAM and wakes with a
+single `wake_up`; **L2** discards them, so waking must re-read the weights from disk.
+
+Sleep support is per-service opt-in and additionally gated on `hardware_validated: true`,
+which config validation requires before it will accept `sleep.enabled` — a service may not
+sleep until someone has measured it sleeping and waking on the target host.
+
+The runner speaks vLLM 0.26's dev-mode surface: `POST /sleep?level=N`, `GET /is_sleeping`,
+and for L2 wake the required three-step sequence — `wake_up?tags=weights` →
 `collective_rpc {"method":"reload_weights"}` → `wake_up?tags=kv_cache` — asserted by a
-sequence test. On the tested vLLM 0.26/sm_120 combinations, direct inference against a
-sleeping backend was accepted but produced no bytes before the client timed out; it did
-not return 503. The router therefore never treats a backend response as the sleep
-safety barrier: fresh fail-closed admission parks an asleep model, wakes and reprobes
-it before forwarding, and the inter-chunk idle timeout bounds a backend that stalls
-after admission. Budget validation accounts for sleep: an L1 reservation must meet the
-service's checkpoint/runtime-specific measured pinned-RAM floor, because the on-host
-FP8 and NVFP4 measurements exceeded weight size. Slept services also retain residual
-VRAM; both reservations are checked across every allowed awake/asleep combination at
-config load.
+sequence test.
+
+Nothing has cleared that gate on this hardware yet, for two reasons found by measurement
+rather than by inspection:
+
+- **A sleeping backend hangs instead of refusing.** Direct inference against a sleeping
+  model was accepted and then produced no bytes before the client timed out; it did not
+  return 503. The router therefore never treats a backend response as the sleep safety
+  barrier: fresh fail-closed admission parks an asleep model, wakes and reprobes it before
+  forwarding, and the inter-chunk idle timeout bounds a backend that stalls after
+  admission.
+- **Weight size underestimates L1 host RAM.** Every model measured so far exceeded a
+  provisional declaration sized from its weights, so an L1 reservation must meet a measured
+  floor recorded per checkpoint and runtime (25 GB for the tested FP8 model, 40 GB for
+  NVFP4). Slept services also retain residual VRAM; both reservations are checked across
+  every allowed awake/asleep combination at config load.
+
+One topology additionally failed to launch at all: tensor-parallel degree 2 with NVFP4
+died inside FlashInfer's FP4 quantizer (`last dim has to be multiple of 16, but got
+2152`). That is recorded in `compatibility.unsupported_tensor_parallelism`, and the
+boot-time validator rejects selecting a degree declared failed.
 
 ## Observation and reconciliation
 
@@ -290,8 +307,10 @@ CI rather than silently not loading at runtime.
   in-process mock `Runner` — single-flight stampede, FIFO contention, eviction safety,
   drain deadlines, idle tiers, failure fanout, and the L2 wake sequence.
 - **On-box suite** (`#[ignore]`d): live systemd D-Bus round-trips, real vLLM
-  streaming/body-fidelity drills, and the sm_120 sleep validation matrix
-  (TP × quantization × level, five cycles each with output-sanity checks). These gates
+  streaming/body-fidelity drills, and the per-model sleep measurements that gate
+  `hardware_validated` — for each combination of tensor-parallel degree, quantization,
+  and sleep level, five sleep/wake cycles checking the same prompt still returns the same
+  output, plus wake latency, residual VRAM, and host RAM held while asleep. These gates
   are recorded — deliberately unclaimed until run on the target host — in
   [`phase0-findings.md`](../features/2026-07-28-pooling/phase0-findings.md) and
   [`acceptance.md`](../features/2026-07-28-pooling/acceptance.md).
