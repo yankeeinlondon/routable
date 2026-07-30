@@ -186,20 +186,39 @@ sleep leaves residual VRAM behind and needs enough host RAM to hold the offloade
 Guessing those numbers over-commits a GPU. So a service with sleep unconfigured has
 exactly one idle tier available — `stop_after_ms` — and the reaper takes it.
 
-**How a value is earned.** `hardware_validated: true` is an attestation that the Tier 5
-matrix in `features/2026-07-28-pooling/testing-runbook.md` passed for this exact
-checkpoint, vLLM version, host, and tensor-parallel degree. Per cell of
-{TP degree} × {quantization} × {L1, L2} it runs five sleep/wake cycles checking a fixed
-prompt still returns the same output, and records wake latency, residual VRAM
-(`nvidia-smi`), pinned host RAM (the unit's `MemoryCurrent`), behavior of a request sent
-to a sleeping backend, drain-then-sleep, refusal to sleep mid-request, the L2 three-step
-wake, and L1→L2 promotion. Results go in `docs/{model-id}.md`.
+**How a value is earned.** `hardware_validated: true` asserts that someone put this model
+to sleep and woke it repeatedly on this machine, and wrote down what it cost. It is
+specific to the exact checkpoint, vLLM version, host, and tensor-parallel degree, because
+any of those can change the answer.
 
-Note which of these is a claim and which is a measurement:
+The procedure, run separately for each combination of tensor-parallel degree,
+quantization, and sleep level:
+
+1. **Sleep and wake it five times**, sending the same prompt after every wake and checking
+   the output is still identical. A model that wakes subtly broken is the failure this
+   catches.
+2. **Time each wake.** This is the number that decides whether sleep is worth its cost at
+   all.
+3. **Read the VRAM still held while asleep** (`nvidia-smi`) → `residual_vram_bytes_per_gpu`.
+4. **Read the host RAM held while asleep** — the systemd unit's `MemoryCurrent` — and
+   compare it against the budget you declared. This is the step both models on this host
+   failed.
+5. **Send a request to the sleeping model** and record what actually happens, rather than
+   assuming it returns an error.
+6. **Check sleep respects in-flight work**: it must drain first, and must refuse to sleep
+   mid-request.
+7. **Exercise the L2 wake sequence and the L1→L2 promotion**, since those paths only run
+   in specific transitions and are otherwise untested.
+
+Write the results into `docs/{model-id}.md`; the step-by-step drill lives in
+`features/2026-07-28-pooling/testing-runbook.md`. Only a combination that passes all of it
+may set `hardware_validated: true`.
+
+Note which of these fields is a claim and which is a measurement:
 
 | Field | Kind | Source |
 |---|---|---|
-| `sleep.l1_host_ram_bytes` | your declared budget | you write it; the matrix tests whether it held |
+| `sleep.l1_host_ram_bytes` | your declared budget | you write it; step 4 tests whether it held |
 | `compatibility.minimum_l1_host_ram_bytes` | measured floor | max observed `MemoryCurrent`, rounded up with margin |
 | `sleep.residual_vram_bytes_per_gpu` | measured | VRAM still held while asleep |
 
@@ -245,12 +264,12 @@ single tier, so an hour of idleness stops each one and the next request pays a f
 start. To make returns cheap, give the service a sleep ladder — offload after 10 minutes,
 deepen at 30, release the host entirely at 4 hours. Shown with the values actually
 measured for Qwen3.6-27B NVFP4 rather than invented ones, since every number here has to
-come from a matrix run:
+come from an actual sleep/wake run on this host:
 
 ```yaml
   sleep:
     enabled: true
-    hardware_validated: true          # only after a passing Tier 5 run
+    hardware_validated: true          # only after measuring it, per the steps above
     levels: [l1, l2]
     residual_vram_bytes_per_gpu: 1482686464   # 1,414 MiB measured while asleep
     l1_host_ram_bytes: 40000000000            # ≥ minimum_l1_host_ram_bytes
@@ -628,7 +647,9 @@ implementation reviews). Architecture and implementation detail for contributors
 Single-host v1, feature-complete and deployed. All findings from implementation
 reviews 1–3 (`features/2026-07-28-pooling/review-{1,2,3}.md`) are closed and
 independently validated; remaining v1 work is the on-box acceptance drills and the
-sleep-mode validation matrix per `features/2026-07-28-pooling/testing-runbook.md`.
-Known limitations: sleep mode requires per-service hardware validation (the sm_120
-matrix); one awake owner per GPU (no co-residency); completion responses are never
-cached. Future scope lives in `features/2026-07-29-v2/spec.md`.
+per-model sleep measurements described under
+[the model lifecycle](#why-your-models-stop-instead-of-sleeping), with the step-by-step
+drill in `features/2026-07-28-pooling/testing-runbook.md`. Known limitations: no model may
+use sleep until it has been measured asleep on this hardware, so idle models are stopped
+rather than suspended; one awake owner per GPU (no co-residency); completion responses are
+never cached. Future scope lives in `features/2026-07-29-v2/spec.md`.
