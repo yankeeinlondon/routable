@@ -64,6 +64,155 @@ sequenceDiagram
     end
 ```
 
+## Model lifecycle: what starts, sleeps, and stops a model
+
+Nothing runs until something asks for it, and nothing stays running forever. Four
+mechanisms decide residency, and every state change on a model traces back to exactly
+one of them.
+
+### 1. Demand starts a model
+
+A model is started only by an inference request naming it, or by an explicit
+`POST /pool/v1/services/{name}/start`. There is no "desired state = running" reconciler:
+`enabled: true` and `automatic_start: true` mean *may be started on demand*, not *keep
+running*. A fleet at rest reports every service `stopped`, and that is the healthy state.
+
+A demand-driven start parks the request while the backend comes up. If the model is not
+ready within `parking.deadline_ms` (default 20 s), the client gets `503` +
+`Retry-After` — **and the start continues in the background**, detached from the request
+that triggered it. That is deliberate: the retry lands warm. The consequence to know is
+that a failed request can leave a model resident.
+
+### 2. Placement: one awake owner per GPU
+
+Services declare `gpu_ids`. Two services whose GPU sets overlap cannot both be awake.
+Before a model starts, the router looks for an *awake owner* of any GPU it needs.
+`stopped`, `drained`, `asleep_l1`, and `asleep_l2` do not own placement; every other
+state does — including `failed`, `stale`, and `unknown`, which fail closed. A label that
+disagrees with reality also fails closed: a service labelled `stopped` whose systemd unit
+is still active keeps its placement.
+
+**A sleeping model releases its GPU.** That is the whole point of sleep, and the reason
+it is the better idle tier when it is available.
+
+### 3. Eviction: only with `evict`, and never a busy model
+
+When a start needs an occupied GPU, it displaces the owner only if the caller passed
+`evict` — which the data plane always does, and the control API does only when asked.
+Candidates are ordered:
+
+1. **lowest `priority` first**,
+2. then **longest idle** (LRU),
+3. then name, for determinism.
+
+A model is evictable only if `evictable: true`, it has **zero active and zero parked
+requests**, and it is not mid-transition. A busy model is never displaced — the incoming
+start waits, then fails with `placement_unavailable` at its deadline. Eviction issues a
+**non-force stop**, so it never kills in-flight work.
+
+### 4. The idle reaper: three tiers, in a fixed order
+
+Every observation tick, each service with no active and no parked requests is checked
+against `idle`. Thresholds are milliseconds of continuous idleness, and the **first
+matching rule wins**:
+
+| Order | Setting | Fires when | Action |
+|---|---|---|---|
+| 1 | `stop_after_ms` | idle ≥ threshold, from `running`, `drained`, **or either asleep state** | stop the unit — frees VRAM *and* host RAM |
+| 2 | `sleep_l2_after_ms` | already `asleep_l1` and idle ≥ threshold | deepen to L2 — discards weights, keeps the process |
+| 3 | `sleep_l1_after_ms` | `running` and idle ≥ threshold | sleep to L1 — offloads weights to host RAM |
+
+Because rule 1 is checked first and applies to sleeping models too, `stop_after_ms` is a
+ceiling on total residency, not an alternative to sleep. The intended shape is a ladder —
+sleep early, stop eventually — which the validator enforces:
+`sleep_l1_after_ms < sleep_l2_after_ms < stop_after_ms`, each greater than zero.
+
+**Default when `idle` is omitted: `stop_after_ms: 3_600_000` (1 h), no sleep tiers.**
+
+### Why your models stop instead of sleeping
+
+Sleep is fully implemented but **off by default**, and it stays off until a service opts
+in. `sleep.enabled: true` is rejected by `-t` unless the service also sets
+`hardware_validated: true`, a non-empty `levels`, a non-zero `residual_vram_bytes_per_gpu`,
+and — for L1 — an `l1_host_ram_bytes` at or above the measured
+`compatibility.minimum_l1_host_ram_bytes`. Conversely, if `sleep.enabled` is false, every
+sleep field and both sleep thresholds must be unset; a stray `sleep_l1_after_ms` is a
+config error, not a silent no-op.
+
+That gate exists because sleep residency is a per-host, per-model measurement: vLLM's L1
+sleep leaves residual VRAM behind and needs enough host RAM to hold the offloaded weights.
+Guessing those numbers over-commits a GPU. So a service with sleep unconfigured has
+exactly one idle tier available — `stop_after_ms` — and the reaper takes it.
+
+**Sleep is better than stop for a model you return to**, and the difference is large: an
+L1 wake is a `/wake_up` call against a live process, well inside the 20 s parking window,
+so the request that triggers it is usually served without ever seeing a `503`. A cold
+start reloads weights from disk and takes minutes. Trading host RAM for that is usually
+the right call on a workstation.
+
+### Worked examples
+
+**A cold model on first use, and why a `503` still leaves it running.** You send a request
+to a stopped model. The router parks it, starts the unit, and the load exceeds the 20 s
+window, so you get `503` with `Retry-After: 120`. You never retry. Ten minutes later
+`just pool` shows it `running` with zero requests served — the detached start finished
+without you. Nothing is wrong: it will reap itself at `stop_after_ms`. To confirm this is
+what happened rather than a phantom start, look for a transition with no matching audit
+record:
+
+```console
+curl -s :6971/metrics | grep -E 'transitions_total|admission_rejections_total'
+# vllm_router_transitions_total{service="qwen35b",transition="ensure_ready",result="success"} 1
+# vllm_router_admission_rejections_total{service="qwen35b",reason="parking_expired"} 1
+```
+
+A start plus a `parking_expired` on the same service is demand-driven warming from a
+request that gave up.
+
+**A whole fleet found stopped after an hour away.** Every service here uses the default
+single tier, so an hour of idleness stops each one and the next request pays a full cold
+start. To make returns cheap, give the service a sleep ladder — offload after 10 minutes,
+deepen at 30, release the host entirely at 4 hours:
+
+```yaml
+  sleep:
+    enabled: true
+    hardware_validated: true          # only after measuring on this host
+    levels: [l1, l2]
+    residual_vram_bytes_per_gpu: 2147483648
+    l1_host_ram_bytes: 34359738368    # ≥ compatibility.minimum_l1_host_ram_bytes
+  idle:
+    sleep_l1_after_ms: 600000         # 10 min → weights to host RAM
+    sleep_l2_after_ms: 1800000        # 30 min → discard weights, keep process
+    stop_after_ms: 14400000           #  4 h   → release the unit entirely
+```
+
+Validate before restarting — the router applies configuration only at startup:
+
+```console
+vllm-router -t -c /etc/vllm-router/pingora.yaml --router-config /etc/vllm-router/router.yaml
+```
+
+Until `hardware_validated` is honestly earned, the safer change is simply raising
+`stop_after_ms`. Note that a sleeping model still occupies host RAM and
+`residual_vram_bytes_per_gpu`, so sleep trades memory for latency — it is not free.
+
+**A model that vanished while another started.** Two services sharing `gpu-0`: `low`
+(`priority: -100`, idle 40 min) and `high` (`priority: 100`, idle 2 min). A request
+arrives for a third service on the same GPU. The data plane always evicts, so the router
+sorts candidates by priority first and stops `low` — idle time only breaks ties within a
+priority. Had `low` been serving even one request, it would have been skipped entirely and
+the incoming start would have failed with `placement_unavailable` at its deadline rather
+than interrupting work. Eviction is recorded distinctly from an idle reap:
+
+```console
+curl -s :6971/metrics | grep transitions_total
+# vllm_router_transitions_total{service="low",transition="evict",result="success"} 1
+```
+
+`transition="evict"` means something displaced it; `transition="stop"` means it idled out
+or an operator stopped it.
+
 ## Requirements
 
 - Linux with systemd (the router controls model units over D-Bus).
@@ -316,7 +465,7 @@ Prometheus text format:
 | `vllm_router_request_duration_seconds{model}` | end-to-end request latency |
 | `vllm_router_parked_requests{model}` / `…_total_current` | requests currently waiting on a cold model |
 | `vllm_router_parking_duration_seconds{model}` | how long parked requests waited |
-| `vllm_router_transitions_total{service,transition,result}` | lifecycle transitions **executed** — `transition` is one of `ensure_ready`, `drain`, `sleep`, `stop`; `result` is `success` or a `PoolError` code (`runner_failure`, `deadline_exceeded`, `terminal_failure`, …). Callers that coalesce onto a running flight are not counted, so this measures transitions that ran, not requests served. A start nobody asked for shows up here as an `ensure_ready` with no matching control-plane audit record |
+| `vllm_router_transitions_total{service,transition,result}` | lifecycle transitions **executed** — `transition` is one of `ensure_ready`, `drain`, `sleep`, `stop`, `evict` (a stop forced by another model claiming the GPU, kept distinct from an idle reap); `result` is `success` or a `PoolError` code (`runner_failure`, `deadline_exceeded`, `terminal_failure`, …). Callers that coalesce onto a running flight are not counted, so this measures transitions that ran, not requests served. A start nobody asked for shows up here as an `ensure_ready` with no matching control-plane audit record |
 | `vllm_router_probe_failures_total{service,probe}` | failed systemd/HTTP/NVML observations |
 | `vllm_router_admission_rejections_total{service,reason}` | fail-closed admission refusals. Readiness verdicts: `transition_in_progress`, `lifecycle_not_running`, `asleep`, `stale_probe`, `systemd_not_active`, `not_ready`, `served_model_mismatch`. Ingress refusals: `parking_expired` (parked past `parking.deadline_ms` — the background start continues), `parking_capacity_exceeded`, `parking_full`, `model_not_ready` (warmed, then nothing routable). A rising `stale_probe` across every service means observation is not keeping up with `readiness.maximum_probe_age_ms`, not that the backends are unhealthy. A client that disconnects is not counted — the router refused nothing |
 | `vllm_router_active_requests{service}` | exact in-flight requests per service |
