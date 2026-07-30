@@ -1,12 +1,13 @@
 # Acceptance status
 
-Automated verification recorded 2026-07-29 (re-measured after the review-4 fix
-batch; the previous 2026-07-28 record predates it):
+Automated verification recorded 2026-07-29 (re-measured after the review-5 fix
+batch at `0591167`; the previous records predate it):
 
 - `cargo fmt --all -- --check`: pass
 - `cargo clippy --all-targets --all-features -- -D warnings`: pass
-- `cargo test --all-targets --all-features`: 168 pass, 3 ignored, 0 fail
-- two-file `-t` configuration check: pass against a host-valid configuration
+- `cargo test --all-targets --all-features`: 198 pass, 3 ignored, 0 fail
+- `cargo build --locked --release --all-features`: pass
+- host-aware two-file `-t`: pass against the production configuration
 
 `-t` became a host check in review 5 (F23), so what it accepts changed. It now
 resolves every inventory UUID through live NVML, renders the generated units, and
@@ -33,13 +34,82 @@ sleep-fact provenance that keeps an unproven `/is_sleeping` from aging as
 fresh, joined-flight audit records, the deployment shutdown-signal contract,
 and the probe-freshness configuration floor.
 
+The review-5 batch adds inference-plane bearer authentication and credential
+stripping, policy-compatible flight joining, generation-bound sleep proofs,
+admission-consistent `/readyz`, cancellation while awaiting upstream headers,
+and host-NVML validation in `-t`. The sleep-proof paths remain covered in
+automated tests rather than on live hardware because every production service
+still has sleep disabled and `hardware_validated: false`.
+
 The custom Pingora ingress additionally enforces bounded body reads before
 lifecycle admission, a public endpoint allowlist, hop-by-hop stripping,
 loopback Host rewriting, request/trace IDs, global/per-model parking caps,
 disconnect-aware parking, connect-only failover, inter-chunk response timeout,
 and incremental upstream-to-downstream body writes.
 
-## On-box Tier 4 re-run — 2026-07-29 (post-fix, commit 00ad691)
+## Live migration and Tier 4 re-run — 2026-07-29 (review-5 closure, commit 0591167)
+
+The release binary was built from `0591167` and installed atomically. Both the
+build artifact and `/usr/local/bin/vllm-router` have SHA-256
+`77648c896f1a3b80e610a958d659d79b83cdd2ce77b7bd38bbd12bddaf5ed6db`.
+The prior binary and configuration are recoverable as
+`/usr/local/bin/vllm-router.pre-review5-20260729` and
+`/etc/vllm-router/router.yaml.pre-review5-20260729`.
+
+Migration added the required
+`listeners.inference_bearer_token_file:
+/run/secrets/vllm-router-inference-token`. The inference and management token
+files are distinct, root-owned mode 0600 files. Host-aware `-t` passed before
+installation. The production restart completed in about 62 ms; authenticated
+data-plane and management probes returned 200, unauthenticated data-plane access
+returned 401, and no model unit was started by migration.
+
+**Tier 4 passes on the review-5 build.**
+
+| Drill | Result | Evidence |
+|---|---|---|
+| Negative admission / auth (**F18**) | pass | unauthenticated 401; malformed JSON 400; 33,554,433-byte body 413; data-plane `/sleep` 404; unknown model 404; transition counter stayed 0 and the model stayed stopped |
+| Stampede, audit, cap | pass | 50-way stopped-model demand produced 50 bounded 503s at 20 s; the combined cancellation/cap run shared operation `bedf278c…`, emitted 64 `joined_existing` records, reached exactly 64 parked requests, and created one systemd invocation with `NRestarts=0` |
+| Disconnect while parked | pass | parked count moved 51 → 50 immediately; the detached start continued and reached readiness |
+| Cancellation before headers (**F22**) | pass | request admitted in 9 ms against a paused backend; disconnect released active count 1 → 0 in 8 ms while the backend was still paused |
+| Long active stream | pass | four streams remained active until the clients' deliberate 190 s cap, each with HTTP 200 and about 2.4 MB received; no 120 s idle timeout fired because the actual no-progress interval stayed below the threshold |
+| Stalled stream | pass | SIGSTOP after response bytes → curl exit 18 at 122 s total; router logged `upstream response idle timeout after 120s while reading the response body`; active count returned to 0 |
+| Busy-owner protection | pass | with eight active Qwen requests, an evicting Gemma start failed after its 5 s deadline with `placement_unavailable`; Qwen stayed running with all eight requests and the Gemma unit never activated |
+| Idle eviction / one owner | pass | idle Qwen stopped before Gemma started; Gemma reached probe-confirmed `running` in 30 s with one invocation and zero restarts; Qwen remained inactive |
+| Force-stop count and durability | pass | force-stop began with exactly eight active requests, succeeded after its 3 s drain deadline with `affected_requests: 8`, latched `drained`, and kept the unit inactive across ten immediate 503 retries |
+| Force-stop restart boundary | pass | router restart took 22 ms; `drained` reconciled to `stopped`; demand parked for 20 s and created a fresh model invocation, which later reached probe-confirmed readiness |
+| Crash recovery | pass | `kill -9` mid-stream → curl exit 18; lifecycle observed non-running, systemd moved to a new PID with `NRestarts=1`, and reload-time demand bounded-failed rather than reaching the unready backend |
+| Router restart under traffic | pass | restart took 22 ms and broke the stream as expected; model `MainPID`, `InvocationID`, and `NRestarts` were byte-for-byte unchanged; router reconciled back to `running` |
+| Host-aware check / graceful upgrade (**F23**) | pass | `-t` passed; isolated production-equivalent listeners transferred all three FDs on `-u` + SIGQUIT; the pre-handoff SSE received 6,169,435 bytes through its deliberate 120 s client cap, a post-handoff request returned 200, production stayed live, and the model process was untouched |
+
+The isolated graceful-upgrade cell used ports 7969–7971 and unique PID/socket
+paths. This kept the real systemd-owned listener supervised while the old test
+process entered Pingora's fixed 660-second grace period. Cleanup sent fast
+SIGINT to the new isolated process and SIGKILL only to the exact old isolated
+PID; production remained active and all isolated listeners closed.
+
+After the drill, Gemma was stopped explicitly. Final state was four stopped
+services, zero active requests, zero parked requests, `livez` 200, `readyz` 200,
+unauthenticated inference 401, authenticated model discovery 200, and an active
+production router with `NRestarts=0`.
+
+### Residual observations after review 5
+
+1. **The crash-path diagnostic remains generic.** The fresh `kill -9` drill
+   again logged `upstream HTTP error: error decoding response body`. This is the
+   already-recorded residual below, not a regression in F22's cancellation or
+   the idle-timeout classifier.
+2. **A Pingora process in its grace-period sleep still requires SIGKILL for
+   early cleanup.** The isolated upgrade avoided putting production into that
+   unsupervised state, but the manual live-upgrade procedure still needs an
+   explicitly supervised cutover before it should be used on the systemd-owned
+   ports.
+
+No additional review-5 blocker was found. F19–F21's behavior-changing policy,
+sleep-proof, and readiness cases pass their new automated regression coverage;
+sleep itself remains correctly disabled pending a future Tier 5 hardware cell.
+
+## On-box Tier 4 re-run — 2026-07-29 (superseded, commit 00ad691)
 
 Re-run on CT 107 against the deployed fix batch, same topology as the failed run
 below. **Tier 4 passes.** Every drill that previously failed now passes on the
