@@ -43,9 +43,6 @@ lint:
     cargo clippy --locked --all-targets --all-features -- -D warnings
 
 
-# Run `just _colors` if you want to exercise this (it does nothing).
-_colors:
-    @: {{ bold }} {{ italic }} {{ reset }} {{ red }} {{ green }} {{ yellow }} {{ blue }} {{ magenta }} {{ cyan }} {{ dim }} >/dev/null || true
 
 
 # ── Testing & operations ────────────────────────────────────────────
@@ -221,3 +218,16 @@ metrics: _need-router
 # Follow a managed model unit's journal.
 unit-logs service:
     journalctl -u vllm@{{service}}.service -f
+
+# start claude code CLI
+cc *args="":
+  claude --dangerously-skip-permissions
+
+# start codex CLI
+codex *args="":
+  codex --dangerously-bypass-approvals-and-sandbox
+
+
+# Run `just _colors` if you want to exercise this (it does nothing).
+_colors:
+    @: {{ bold }} {{ italic }} {{ reset }} {{ red }} {{ green }} {{ yellow }} {{ blue }} {{ magenta }} {{ cyan }} {{ dim }} >/dev/null || true
