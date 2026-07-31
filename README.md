@@ -1,10 +1,10 @@
-# vLLM Pooling Router
+# LLM Router
 
 A model-routing gateway that lets a small pool of GPUs serve a large catalog of models
-through vLLM's native API surface — OpenAI-compatible chat/completions/embeddings,
-Anthropic's Messages API, and Cohere/Jina-style scoring and rerank. Clients send an
+through one endpoint — OpenAI-compatible chat/completions/embeddings, Anthropic's
+Messages API, and Cohere/Jina-style scoring and rerank. Clients send an
 ordinary request (say `POST /v1/chat/completions` or `POST /v1/messages`) naming any
-configured model; the router forwards to the vLLM server that serves it — and if that
+configured model; the router forwards to the model server that serves it — and if that
 model isn't running, the router **starts (or wakes) it on demand**: requests are held
 briefly (~20 s by default) so fast wakes succeed transparently, and a true cold start
 returns a progress-reporting 503 with an honest `Retry-After` while the model warms in
@@ -13,9 +13,13 @@ automatically so the GPUs are always available for what's actually being used.
 
 ## Why it exists
 
-GPUs are scarce and models are many. Running one vLLM server per model wastes VRAM on
+GPUs are scarce and models are many. Running a dedicated server per model wastes VRAM on
 models nobody is querying; manually starting and stopping servers turns every model
 switch into an ops task. This router makes the pool self-service:
+
+vLLM is the only model runner implemented today, and much of the detail below is
+necessarily specific to it. The router's design is not — the runner sits behind a trait,
+and llama.cpp is the next planned adapter (`features/2026-07-29-v2/spec.md`).
 
 - **One endpoint, many models.** Clients only know the router's address and a model name.
 - **Scale-from-zero.** First request for a cold model triggers the start; fast wakes
@@ -31,7 +35,7 @@ switch into an ops task. This router makes the pool self-service:
   buffered or compressed, and long generations are bounded by an *inter-token* idle
   timeout rather than a total duration limit.
 
-The router never becomes a single point of failure for running models: vLLM processes
+The router never becomes a single point of failure for running models: model processes
 are owned by systemd, not the router. Restarting or upgrading the router leaves every
 model serving.
 
@@ -43,7 +47,7 @@ sequenceDiagram
     participant R as Router :6969
     participant P as Pool manager
     participant S as systemd
-    participant V as vLLM backend
+    participant V as Model backend
 
     C->>R: POST /v1/chat/completions {"model": "…"}
     R->>R: parse + validate model, resolve alias
@@ -52,8 +56,8 @@ sequenceDiagram
         V-->>C: response / SSE stream (via router)
     else model cold or asleep
         R->>P: ensure ready (request parks ~20 s)
-        P->>S: start unit / wake via vLLM API
-        S->>V: launch vllm serve
+        P->>S: start unit / wake via runner API
+        S->>V: launch model server
         alt ready within the parking window (e.g. sleep wake)
             P-->>R: ready (health + model verified, warmed up)
             R->>V: forward request
@@ -311,7 +315,8 @@ or an operator stopped it.
 ## Requirements
 
 - Linux with systemd (the router controls model units over D-Bus).
-- vLLM ≥ 0.26 installed on the host with its models on local disk.
+- vLLM ≥ 0.26 — the only runner implemented today — installed on the host with its
+  models on local disk.
 - NVIDIA driver/NVML visible to the router for GPU observation.
 - Rust ≥ 1.85 and [`just`](https://github.com/casey/just) to build.
 

@@ -1,9 +1,12 @@
-# Technical Overview
+# LLM Router — Technical Overview
 
-This document explains **why the router is built the way it is**, for engineers working
-on it or evaluating it. It is not a reference manual: operational instructions live in
-the [README](../README.md), and the authoritative requirements live in
+This document explains **why the LLM Router is built the way it is**, for engineers
+working on it or evaluating it. It is not a reference manual: operational instructions
+live in the [README](../README.md), and the authoritative requirements live in
 [`features/2026-07-28-pooling/spec.md`](../features/2026-07-28-pooling/spec.md).
+
+vLLM is the only model runner implemented today, so much of the detail here describes it
+specifically. Where a section says "vLLM," it is naming the runner, not the project.
 
 It is organized so the reasoning arrives before the detail:
 
@@ -37,11 +40,11 @@ Four actors, with a strict division of ownership:
 | **Client** | the request | sees one stable OpenAI-compatible endpoint, never learns which backend served it |
 | **Router** | routing, admission, lifecycle policy | the only client-facing process; decides *when* a model should be resident |
 | **systemd** | the model processes | starts and stops units on the router's instruction; owns restart and cleanup |
-| **vLLM** | model execution and GPU memory | one process per model, loopback-bound; the router never spawns one directly |
+| **Model runner** | model execution and GPU memory | one process per model, loopback-bound; the router never spawns one directly. vLLM is the only implemented runner; llama.cpp is the next planned adapter |
 
 Three tensions make this harder than proxying:
 
-- **Idle costs the same as busy.** A loaded vLLM process reserves its VRAM at startup and
+- **Idle costs the same as busy.** A loaded model process reserves its VRAM at startup and
   holds it whether or not requests arrive. Residency is therefore a scheduling problem,
   not a caching one — something must decide what gets evicted, and when.
 - **Starting is slow, but clients need fast answers.** A cold start on a large quantized
@@ -174,7 +177,7 @@ systemd/NVML/probe adapters, and the state store. This is the multi-host cut lin
 future per-host agent replaces `Pool<R>` behind the same trait with an HTTP client, and
 neither the data plane nor the control API changes.
 
-**Process ownership.** The router never spawns model processes. vLLM units belong to
+**Process ownership.** The router never spawns model processes. Model units belong to
 systemd (`StartUnit`/`StopUnit` over D-Bus via zbus); the router's crash or upgrade leaves
 them serving, and reconciliation re-derives all live state from observation — nothing
 about running services is persisted. That is what makes the router restartable under
@@ -419,8 +422,8 @@ than silently not loading at runtime.
   one fails at `-t` time instead of silently exposing a listener that can spend GPU time.
   `GET /livez` and `GET /readyz` on the loopback management bind are the only
   unauthenticated endpoints; health checking therefore never needs a credential.
-- vLLM backends bind loopback and are enforced loopback by config validation; the router is
-  the only client-facing entry. vLLM's unauthenticated dev-mode endpoints are reachable
+- Model backends bind loopback and are enforced loopback by config validation; the router
+  is the only client-facing entry. vLLM's unauthenticated dev-mode endpoints are reachable
   only from the host.
 - Every accepted mutation emits a structured `audit=true` log line (operation ID, service,
   action, flags) to journald. No request bodies, no credentials, ever.
