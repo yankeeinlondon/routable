@@ -1,0 +1,643 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "anthropic",
+    "description": "Anthropic Messages API for Claude AI interactions and agent tool use",
+    "version": "0.1.0"
+  },
+  "servers": [
+    {
+      "url": "https://api.anthropic.com/v1",
+      "description": "Anthropic API Server"
+    }
+  ],
+  "paths": {
+    "/messages": {
+      "post": {
+        "summary": "Create a message with optional tool use for agent interactions",
+        "description": "Create a message with optional tool use for agent interactions",
+        "operationId": "CreateMessage",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateMessageBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful JSON response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MessageResponse"
+                }
+              }
+            }
+          }
+        },
+        "x-schematic": {
+          "request": {
+            "Json": {
+              "module_path": null,
+              "type_name": "CreateMessageBody"
+            }
+          },
+          "response": {
+            "Json": {
+              "module_path": null,
+              "type_name": "MessageResponse"
+            }
+          }
+        }
+      }
+    },
+    "/messages/count_tokens": {
+      "post": {
+        "summary": "Count tokens in a message before sending",
+        "description": "Count tokens in a message before sending",
+        "operationId": "CountTokens",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CountTokensBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful JSON response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CountTokensResponse"
+                }
+              }
+            }
+          }
+        },
+        "x-schematic": {
+          "request": {
+            "Json": {
+              "module_path": null,
+              "type_name": "CountTokensBody"
+            }
+          },
+          "response": {
+            "Json": {
+              "module_path": null,
+              "type_name": "CountTokensResponse"
+            }
+          }
+        }
+      }
+    },
+    "/models": {
+      "get": {
+        "summary": "List available Claude models",
+        "description": "List available Claude models",
+        "operationId": "ListModels",
+        "responses": {
+          "200": {
+            "description": "Successful JSON response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListModelsResponse"
+                }
+              }
+            }
+          }
+        },
+        "x-schematic": {
+          "response": {
+            "Json": {
+              "module_path": null,
+              "type_name": "ListModelsResponse"
+            }
+          }
+        }
+      }
+    },
+    "/models/{model_id}": {
+      "get": {
+        "summary": "Get information about a specific model",
+        "description": "Get information about a specific model",
+        "operationId": "RetrieveModel",
+        "responses": {
+          "200": {
+            "description": "Successful JSON response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModelInfo"
+                }
+              }
+            }
+          }
+        },
+        "x-schematic": {
+          "response": {
+            "Json": {
+              "module_path": null,
+              "type_name": "ModelInfo"
+            }
+          }
+        }
+      },
+      "parameters": [
+        {
+          "in": "path",
+          "name": "model_id",
+          "required": true,
+          "schema": {
+            "type": "string"
+          },
+          "style": "simple"
+        }
+      ]
+    }
+  },
+  "components": {
+    "schemas": {
+      "CreateMessageBody": {
+        "title": "CreateMessageBody",
+        "description": "Request body for the Create Message endpoint (POST /v1/messages).",
+        "type": "object",
+        "properties": {
+          "max_tokens": {
+            "description": "Maximum tokens to generate.\n\nMust be less than the model's maximum output limit.",
+            "type": "integer",
+            "format": "uint32"
+          },
+          "messages": {
+            "description": "Conversation messages.\n\nMessages alternate between user and assistant roles.",
+            "type": "array",
+            "items": {
+              "allOf": [
+                {
+                  "$ref": "#/components/schemas/Message"
+                }
+              ]
+            }
+          },
+          "metadata": {
+            "description": "Request metadata for tracking."
+          },
+          "model": {
+            "description": "Model identifier (e.g., \"claude-sonnet-4-5-20250514\").",
+            "type": "string"
+          },
+          "service_tier": {
+            "description": "Service tier selection."
+          },
+          "stop_sequences": {
+            "description": "Custom stop sequences.",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "stream": {
+            "description": "Whether to stream the response.",
+            "type": "boolean"
+          },
+          "system": {
+            "description": "System prompt providing context and instructions."
+          },
+          "temperature": {
+            "description": "Sampling temperature (0.0-1.0).\n\nLower values are more deterministic.",
+            "type": "number",
+            "format": "double"
+          },
+          "thinking": {
+            "description": "Extended thinking configuration."
+          },
+          "tool_choice": {
+            "description": "How to select tools for use."
+          },
+          "tools": {
+            "description": "Tools available for the model to use.",
+            "type": "array",
+            "items": {
+              "allOf": [
+                {
+                  "$ref": "#/components/schemas/Tool"
+                }
+              ]
+            }
+          },
+          "top_k": {
+            "description": "Top-K sampling parameter.",
+            "type": "integer",
+            "format": "uint32"
+          },
+          "top_p": {
+            "description": "Top-P (nucleus) sampling parameter.",
+            "type": "number",
+            "format": "double"
+          }
+        },
+        "required": [
+          "model",
+          "messages",
+          "max_tokens"
+        ]
+      },
+      "CacheControl": {
+        "description": "Cache control settings for prompt caching.\n\nPrompt caching reduces costs by up to 90% for repeated context.",
+        "type": "object",
+        "properties": {
+          "ttl": {
+            "description": "Time-to-live for the cache entry.\n\nValid values: \"5m\" (default), \"1h\""
+          },
+          "type": {
+            "description": "Cache type (currently only \"ephemeral\" is supported).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "ContentBlock": {
+        "title": "ContentBlock",
+        "description": "Content block for messages.\n\nMessages contain an array of content blocks that can include text,\nimages, documents, tool use requests, and tool results."
+      },
+      "DocumentSource": {
+        "description": "Source for document content."
+      },
+      "ImageSource": {
+        "description": "Source for image content."
+      },
+      "Message": {
+        "title": "Message",
+        "description": "A message in the conversation.",
+        "type": "object",
+        "properties": {
+          "content": {
+            "description": "Content blocks making up the message.\n\nFor simple text messages, use a single TextBlock.\nFor multimodal or tool interactions, use multiple blocks.",
+            "type": "array",
+            "items": {
+              "allOf": [
+                {
+                  "$ref": "#/components/schemas/ContentBlock"
+                }
+              ]
+            }
+          },
+          "role": {
+            "description": "The role of the message author."
+          }
+        },
+        "required": [
+          "role",
+          "content"
+        ]
+      },
+      "MessageRole": {
+        "description": "The role of a message in the conversation."
+      },
+      "Metadata": {
+        "description": "Request metadata for tracking purposes.",
+        "type": "object",
+        "properties": {
+          "user_id": {
+            "description": "External user identifier for abuse detection.\n\nShould be a UUID or hash, not raw identifiable information."
+          }
+        }
+      },
+      "ServiceTier": {
+        "description": "Service tier selection for the request."
+      },
+      "SystemContent": {
+        "description": "System prompt content block."
+      },
+      "SystemPrompt": {
+        "description": "System prompt for the conversation.\n\nCan be a simple string or an array of content blocks."
+      },
+      "ThinkingConfig": {
+        "description": "Configuration for extended thinking.\n\nExtended thinking allows the model to reason internally before responding,\nimproving accuracy on complex tasks.",
+        "type": "object",
+        "properties": {
+          "budget_tokens": {
+            "description": "Token budget for thinking (minimum 1024).\n\nOnly used when type is \"enabled\"."
+          },
+          "type": {
+            "description": "Whether extended thinking is enabled.",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ThinkingType"
+              }
+            ]
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "ThinkingType": {
+        "description": "Extended thinking enablement state."
+      },
+      "Tool": {
+        "title": "Tool",
+        "description": "A tool definition for the model to use.\n\nTools are defined using JSON Schema for the input parameters.",
+        "type": "object",
+        "properties": {
+          "cache_control": {
+            "description": "Optional cache control for the tool definition."
+          },
+          "description": {
+            "description": "Human-readable description of what the tool does.\n\nInclude when and how to use the tool. Be specific about trigger conditions.",
+            "type": "string"
+          },
+          "input_schema": {
+            "description": "JSON Schema defining the input parameters."
+          },
+          "name": {
+            "description": "Unique name for the tool.\n\nMust match the pattern `^[a-zA-Z0-9_-]{1,64}$`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "description",
+          "input_schema"
+        ]
+      },
+      "ToolChoice": {
+        "description": "How the model should choose which tools to use."
+      },
+      "ToolResultContent": {
+        "description": "Content for a tool result.\n\nCan be a simple string or an array of content blocks for rich results."
+      },
+      "CountTokensBody": {
+        "title": "CountTokensBody",
+        "description": "Request body for the Count Tokens endpoint (POST /v1/messages/count_tokens).",
+        "type": "object",
+        "properties": {
+          "messages": {
+            "description": "Conversation messages.",
+            "type": "array",
+            "items": {
+              "allOf": [
+                {
+                  "$ref": "#/components/schemas/Message"
+                }
+              ]
+            }
+          },
+          "model": {
+            "description": "Model identifier.",
+            "type": "string"
+          },
+          "system": {
+            "description": "System prompt."
+          },
+          "thinking": {
+            "description": "Extended thinking configuration."
+          },
+          "tool_choice": {
+            "description": "Tool choice strategy."
+          },
+          "tools": {
+            "description": "Tools to include in token count.",
+            "type": "array",
+            "items": {
+              "allOf": [
+                {
+                  "$ref": "#/components/schemas/Tool"
+                }
+              ]
+            }
+          }
+        },
+        "required": [
+          "model",
+          "messages"
+        ]
+      },
+      "MessageResponse": {
+        "title": "MessageResponse",
+        "description": "Response from the Create Message endpoint.",
+        "type": "object",
+        "properties": {
+          "content": {
+            "description": "Content blocks in the response.\n\nMay contain text, tool_use, and thinking blocks.",
+            "type": "array",
+            "items": {
+              "allOf": [
+                {
+                  "$ref": "#/components/schemas/ContentBlock"
+                }
+              ]
+            }
+          },
+          "id": {
+            "description": "Unique message identifier.",
+            "type": "string"
+          },
+          "model": {
+            "description": "Model used for generation.",
+            "type": "string"
+          },
+          "role": {
+            "description": "Message role (always \"assistant\")."
+          },
+          "stop_reason": {
+            "description": "Why generation stopped."
+          },
+          "stop_sequence": {
+            "description": "The stop sequence that was matched, if any.",
+            "type": "string"
+          },
+          "type": {
+            "description": "Object type (always \"message\").",
+            "type": "string"
+          },
+          "usage": {
+            "description": "Token usage statistics."
+          }
+        },
+        "required": [
+          "id",
+          "type",
+          "role",
+          "model",
+          "content",
+          "stop_reason",
+          "usage"
+        ]
+      },
+      "StopReason": {
+        "description": "Why the model stopped generating."
+      },
+      "Usage": {
+        "description": "Token usage statistics.",
+        "type": "object",
+        "properties": {
+          "cache_creation_input_tokens": {
+            "description": "Tokens written to cache."
+          },
+          "cache_read_input_tokens": {
+            "description": "Tokens read from cache."
+          },
+          "input_tokens": {
+            "description": "Number of input tokens.",
+            "type": "integer",
+            "format": "uint32"
+          },
+          "output_tokens": {
+            "description": "Number of output tokens.",
+            "type": "integer",
+            "format": "uint32"
+          },
+          "service_tier": {
+            "description": "Service tier used for this request."
+          }
+        },
+        "required": [
+          "input_tokens",
+          "output_tokens"
+        ]
+      },
+      "CountTokensResponse": {
+        "title": "CountTokensResponse",
+        "description": "Response from the Count Tokens endpoint.",
+        "type": "object",
+        "properties": {
+          "cache_creation_input_tokens": {
+            "description": "Tokens that would be written to cache.",
+            "type": "integer",
+            "format": "uint32"
+          },
+          "cache_read_input_tokens": {
+            "description": "Tokens that would be read from cache.",
+            "type": "integer",
+            "format": "uint32"
+          },
+          "input_tokens": {
+            "description": "Number of input tokens.",
+            "type": "integer",
+            "format": "uint32"
+          }
+        },
+        "required": [
+          "input_tokens"
+        ]
+      },
+      "ListModelsResponse": {
+        "title": "ListModelsResponse",
+        "description": "Response from the List Models endpoint.",
+        "type": "object",
+        "properties": {
+          "data": {
+            "description": "List of available models.",
+            "type": "array",
+            "items": {
+              "allOf": [
+                {
+                  "$ref": "#/components/schemas/ModelInfo"
+                }
+              ]
+            }
+          },
+          "first_id": {
+            "description": "First ID in the list (for backward pagination).",
+            "type": "string"
+          },
+          "has_more": {
+            "description": "Whether more results are available.",
+            "type": "boolean"
+          },
+          "last_id": {
+            "description": "Last ID in the list (for forward pagination).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "data",
+          "first_id",
+          "last_id",
+          "has_more"
+        ]
+      },
+      "ModelInfo": {
+        "title": "ModelInfo",
+        "description": "Information about an available model.",
+        "type": "object",
+        "properties": {
+          "created_at": {
+            "description": "RFC 3339 datetime of when the model was released.",
+            "type": "string"
+          },
+          "display_name": {
+            "description": "Human-readable display name.",
+            "type": "string"
+          },
+          "id": {
+            "description": "Unique model identifier.",
+            "type": "string"
+          },
+          "type": {
+            "description": "Object type (always \"model\").",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "created_at",
+          "display_name",
+          "type"
+        ]
+      }
+    },
+    "securitySchemes": {
+      "apiKeyAuth": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-Api-Key",
+        "description": "API Key authentication"
+      }
+    }
+  },
+  "security": [
+    {
+      "apiKeyAuth": []
+    }
+  ],
+  "externalDocs": {
+    "description": "API Documentation",
+    "url": "https://docs.anthropic.com/en/api/messages"
+  },
+  "x-schematic": {
+    "env_mapping": {
+      "api_key": {
+        "header": "X-Api-Key",
+        "names": {
+          "names": [
+            "ANTHROPIC_API_KEY"
+          ]
+        }
+      },
+      "basic_pass": null,
+      "basic_user": null,
+      "bearer_token": null
+    },
+    "headers": [
+      [
+        "anthropic-version",
+        "2023-06-01"
+      ]
+    ]
+  },
+  "x-schematic-grouped-from": [
+    "Anthropic"
+  ]
+}

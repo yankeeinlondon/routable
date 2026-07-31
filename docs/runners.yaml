@@ -1,0 +1,12 @@
+kind: sequence
+template:
+    id: "{{ snake_case(name) }}"
+    desc: "{{name}} (_site: {{site}}, repo: {{ repo || 'n/a' }}_)"
+
+list:
+    - name: vLLM
+      site: https://docs.vllm.ai/
+      repo: https://github.com/vllm-project/vllm
+    - name: llama.cpp
+      site: https://llama.app/
+      repo: https://github.com/ggerganov/llama.cpp
