@@ -912,6 +912,7 @@ fn validate_systemd(service: &ServiceDefinition, location: &str, errors: &mut Ve
 
 fn validate_runner_args(service: &ServiceDefinition, location: &str, errors: &mut Vec<String>) {
     const VALUE_ARGS: &[&str] = &[
+        "attention-backend",
         "block-size",
         "compilation-config",
         "cpu-offload-gb",
@@ -924,6 +925,7 @@ fn validate_runner_args(service: &ServiceDefinition, location: &str, errors: &mu
         "max-num-batched-tokens",
         "max-num-seqs",
         "max-seq-len-to-capture",
+        "mm-encoder-tp-mode",
         "mm-processor-cache-gb",
         "ngram-prompt-lookup-max",
         "ngram-prompt-lookup-min",
@@ -942,6 +944,7 @@ fn validate_runner_args(service: &ServiceDefinition, location: &str, errors: &mu
         "reasoning-parser",
     ];
     const BOOL_ARGS: &[&str] = &[
+        "disable-custom-all-reduce",
         "disable-log-requests",
         "disable-log-stats",
         "disable-sliding-window",
@@ -949,6 +952,7 @@ fn validate_runner_args(service: &ServiceDefinition, location: &str, errors: &mu
         "enable-chunked-prefill",
         "enable-prefix-caching",
         "enforce-eager",
+        "language-model-only",
         "skip-tokenizer-init",
         "use-tqdm-on-load",
     ];
@@ -1124,7 +1128,16 @@ fn validate_environment(
     location: &str,
     errors: &mut Vec<String>,
 ) {
-    const ALLOWED: &[&str] = &["HF_HOME", "PATH", "VLLM_CACHE_ROOT"];
+    const ALLOWED: &[&str] = &[
+        "FLASHINFER_CUDA_ARCH_LIST",
+        "HF_HOME",
+        "NCCL_P2P_DISABLE",
+        "PATH",
+        "PYTORCH_CUDA_ALLOC_CONF",
+        "VLLM_CACHE_ROOT",
+        "VLLM_USE_FASTOKENS",
+        "VLLM_WORKER_MULTIPROC_METHOD",
+    ];
 
     for (name, value) in environment {
         if !ALLOWED.contains(&name.as_str()) {

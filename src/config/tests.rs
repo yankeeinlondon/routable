@@ -234,6 +234,38 @@ fn validates_allowlisted_environment_at_global_and_service_scope() {
 }
 
 #[test]
+fn accepts_model_specific_gpu_environment_and_runner_arguments() {
+    let mut config = valid_config();
+    config.services[0].environment.extend([
+        ("FLASHINFER_CUDA_ARCH_LIST".into(), "12.0f".into()),
+        ("NCCL_P2P_DISABLE".into(), "1".into()),
+        (
+            "PYTORCH_CUDA_ALLOC_CONF".into(),
+            "expandable_segments:True".into(),
+        ),
+        ("VLLM_USE_FASTOKENS".into(), "1".into()),
+        ("VLLM_WORKER_MULTIPROC_METHOD".into(), "spawn".into()),
+    ]);
+    config.services[0].runner_args.extend([
+        (
+            "attention-backend".into(),
+            RunnerArgValue::String("flashinfer".into()),
+        ),
+        (
+            "mm-encoder-tp-mode".into(),
+            RunnerArgValue::String("data".into()),
+        ),
+        (
+            "disable-custom-all-reduce".into(),
+            RunnerArgValue::Bool(true),
+        ),
+        ("language-model-only".into(), RunnerArgValue::Bool(false)),
+    ]);
+
+    config.validate().unwrap();
+}
+
+#[test]
 fn validates_tool_and_reasoning_parsers_against_vllm_registries() {
     let mut config = valid_config();
     config.services[0].runner_args.extend([

@@ -1,8 +1,8 @@
-# CPU hardware optimization for LLM inference
+# Host and per-model hardware optimization for LLM inference
 
 This document records the host-level investigation performed on the AMD EPYC
-9175F host on 2026-08-17. It also defines a repeatable process for qualifying a
-new CPU host for vLLM and llama.cpp.
+9175F and dual RTX 5090 host on 2026-08-17. It also defines a repeatable process
+for qualifying a new host and ingesting models for vLLM and llama.cpp.
 
 The most important result is counterintuitive: on this host and the tested
 llama.cpp revision, the native `-march=native` ggml CPU device is faster than
@@ -14,6 +14,7 @@ ZenTorch integration works and should be used for BF16 serving.
 
 | Runtime | Recommended baseline |
 | --- | --- |
+| Qwen3.8-27B-FP8 on CUDA | Both RTX 5090s, TP=2/PP=1, native 262,144-token context, BF16 KV cache by default, `max-num-seqs=32`, `max-num-batched-tokens=8192`, FlashInfer attention |
 | vLLM online serving | CPU wheel with `vllm[zen]`, BF16, TP=1, 15 physical cores for inference, one physical core reserved for the front end |
 | vLLM CPU set in this LXC | Process tree: `6,7,10-21,24,25`; OpenMP inference: `6,7,10-21,24` |
 | vLLM allocation | Preload bundled tcmalloc and Intel OpenMP; size `VLLM_CPU_KVCACHE_SPACE` per model and workload |
@@ -42,11 +43,15 @@ runtime revision can all move the optimum.
 - isolated vLLM CPU environment: `/opt/vllm-cpu/.venv`
 - vLLM `0.26.0+cpu`, PyTorch `2.11.0+cpu`, ZenTorch `2.11.0.0`, and
   Intel OpenMP `2024.2.1`
+- Qwen3.8-27B-FP8 snapshot `017b9c7af6b5689d5dd426a76e0bc077eb5ca20a`
+  under `/models/hf/hub`, verified against the Hub manifest
+- CUDA vLLM `0.26.0`, PyTorch `2.11.0+cu130`, FlashInfer `0.6.14`,
+  Transformers `5.14.1`, and fastokens `0.3.1`
 
-The existing CUDA vLLM environment and GPU services were not modified. The CPU
-experiments ran while those services were live, so the results are suitable for
-choosing large configuration differences but should not be treated as
-publication-quality peak numbers.
+The original CPU experiments ran while the CUDA services were live, so those
+results are suitable for choosing large configuration differences but should
+not be treated as publication-quality peak numbers. The Qwen3.8 GPU matrix was
+run with the other GPU services stopped and under the host experiment lock.
 
 ## Host inventory
 
@@ -64,6 +69,8 @@ publication-quality peak numbers.
 | Environment | unprivileged Proxmox LXC, Ubuntu 26.04 userspace |
 | Effective container CPU set | `6-7,10-31` |
 | GPU locality | both GPUs report NUMA node 0 and the same visible CPU affinity |
+| GPUs | 2 x GeForce RTX 5090, 32 GiB each, Blackwell `sm_120` |
+| GPU link | PCIe/NUMA-local; CUDA peer access is unavailable between the GPUs |
 | Transparent huge pages | `madvise` |
 | Performance counters | unavailable in the guest (`perf_event_paranoid=4`) |
 | Locked-memory limit | 8 MiB |
@@ -120,6 +127,151 @@ cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor
 cat /sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference
 cat /sys/devices/system/cpu/cpufreq/boost
 ```
+
+## Qwen3.8-27B-FP8 GPU ingestion
+
+### Pinned artifact and architecture
+
+The deployed artifact is
+[Qwen/Qwen3.8-27B-FP8](https://huggingface.co/Qwen/Qwen3.8-27B-FP8) at commit
+`017b9c7af6b5689d5dd426a76e0bc077eb5ca20a`. The 81-file snapshot is 28.76 GiB,
+including 66 weight shards, and is stored at:
+
+```text
+/models/hf/hub/models--Qwen--Qwen3.8-27B-FP8/snapshots/017b9c7af6b5689d5dd426a76e0bc077eb5ca20a
+```
+
+Verify the local snapshot rather than trusting the existence of the directory:
+
+```bash
+/root/.venv/bin/hf cache verify Qwen/Qwen3.8-27B-FP8 \
+  --revision 017b9c7af6b5689d5dd426a76e0bc077eb5ca20a \
+  --cache-dir /models/hf/hub
+```
+
+This is a dense 64-layer multimodal model with a repeating three Gated
+DeltaNet linear-attention layers plus one full-attention layer. It therefore has
+48 recurrent GDN layers and 16 full-attention layers. The full-attention path
+uses 24 query heads and four KV heads; the GDN path uses 16 key and 48 value
+heads with 128-wide state. All relevant head counts divide cleanly at TP=2.
+
+These details change which knobs matter:
+
+- The 28.76 GiB checkpoint does not leave credible production headroom on one
+  32 GiB GPU after activations, CUDA graphs, encoder workspaces, and cache.
+  TP=2 is required; CPU weight offload is unnecessary and would turn the PCIe
+  link into a weight-streaming bottleneck.
+- Full-attention KV at TP=2 costs 32 KiB/token/GPU in BF16 or 16 KiB/token/GPU
+  in FP8. The 48 GDN layers also require about 73.4 MiB of FP32 recurrent and
+  BF16 convolution state per active sequence per GPU. At `max-num-seqs=32`,
+  that fixed recurrent state alone is about 2.29 GiB/GPU. For this model,
+  `max-num-seqs` is a memory control, not merely a scheduler preference.
+- Native context is 262,144 tokens. Both tested KV formats fit at least one full
+  context, so there is no reason to reduce the advertised limit for the default
+  service.
+- The GPUs do not have CUDA peer access. TP collectives stage through the PCIe
+  root complex and host memory; the EPYC's bandwidth helps, but does not remove
+  that tax. Set `NCCL_P2P_DISABLE=1` and disable vLLM's custom all-reduce so the
+  selected transport is explicit and repeatable.
+
+### Qualified production profile
+
+The default is the full multimodal model with BF16 KV cache. BF16 was selected
+because it preserved native context, matched FP8 throughput in the controlled
+matrix, and avoids the uncalibrated KV-scale warning emitted for this
+checkpoint. FP8 KV remains a capacity profile for deployments that validate its
+quality on their own evaluation set.
+
+```bash
+export HF_HOME=/models/hf
+export VLLM_CACHE_ROOT=/models/vllm
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
+export CUDA_VISIBLE_DEVICES=0,1
+export NCCL_P2P_DISABLE=1
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+export VLLM_USE_FASTOKENS=1
+export FLASHINFER_CUDA_ARCH_LIST=12.0f
+
+/root/.venv/bin/vllm serve \
+  /models/hf/hub/models--Qwen--Qwen3.8-27B-FP8/snapshots/017b9c7af6b5689d5dd426a76e0bc077eb5ca20a \
+  --served-model-name qwen3.8-27b-fp8 \
+  --tensor-parallel-size 2 \
+  --pipeline-parallel-size 1 \
+  --distributed-executor-backend mp \
+  --max-model-len 262144 \
+  --max-num-seqs 32 \
+  --max-num-batched-tokens 8192 \
+  --gpu-memory-utilization 0.92 \
+  --kv-cache-dtype auto \
+  --enable-prefix-caching \
+  --reasoning-parser qwen3 \
+  --enable-auto-tool-choice \
+  --tool-call-parser qwen3_coder \
+  --mm-encoder-tp-mode data \
+  --disable-custom-all-reduce \
+  --attention-backend flashinfer
+```
+
+The parser names and multimodal TP mode follow the
+[official vLLM recipe](https://recipes.vllm.ai/Qwen/Qwen3.8-27B). Do not add
+`--trust-remote-code`; the architecture is native to the installed
+Transformers/vLLM versions. vLLM auto-selects CUTLASS block-scaled FP8 GEMM on
+`sm_120`, Triton/FLA for GDN prefill, FlashInfer for language-model attention,
+and FlashAttention for the vision encoder. DeepGemm is intentionally
+auto-disabled by vLLM for this architecture on Blackwell because its E8M0 scale
+path can degrade accuracy.
+
+Prefix caching sets vLLM's Mamba cache mode to experimental `align` for this
+hybrid model. Keep it because repeated system/tool prefixes are a primary
+router workload, but include prefix-cache correctness in upgrade tests. A
+text-only service can add `--language-model-only`; qualify it independently
+because it changes memory balance and removes image support.
+
+### Measured placement and KV-cache matrix
+
+Each cell used vLLM's online benchmark with 12 random requests per repetition,
+1,024 input tokens, 128 forced output tokens, one warm-up, three repetitions,
+and a different seed per repetition. Prefix caching stayed enabled, but random
+prompts and fresh seeds prevented cross-repetition prefix reuse.
+
+| Placement / KV | Concurrency | Output tok/s | Mean TTFT | Mean TPOT | Cache tokens | Full-context concurrency |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| TP=2, PP=1, BF16 KV | 1 | 75.07 | 141.80 ms | 12.31 ms | 365,925 | 1.40x |
+| TP=2, PP=1, BF16 KV | 8 | 288.50 | 790.05 ms | 15.67 ms | 365,925 | 1.40x |
+| TP=2, PP=1, FP8 KV | 1 | 75.52 | 128.72 ms | 12.33 ms | 717,129 | 2.74x |
+| TP=2, PP=1, FP8 KV | 8 | 284.02 | 866.93 ms | 15.47 ms | 717,129 | 2.74x |
+| TP=1, PP=2, FP8 KV | 1 | 43.74 | 141.53 ms | 21.93 ms | 554,419 | 2.11x |
+| TP=1, PP=2, FP8 KV | 8 | 185.70 | 1,078.27 ms | 25.12 ms | 554,419 | 2.11x |
+
+TP=2 is the production placement. Despite the lack of peer access, PP=2 was
+42% slower for a single stream and 35% slower at concurrency 8. PP=2 also
+loaded the multimodal outside weights unevenly (14.71 versus 17.08 GiB), which
+reduced cache capacity. The EPYC memory system makes host-staged TP viable, but
+does not make pipeline bubbles cheaper than the TP collectives for this model.
+
+At 92% GPU memory utilization, TP=2 loaded 14.71 GiB of model weights per GPU,
+reserved 11.41 GiB of cache on the limiting rank, and used approximately
+29.3 GiB/GPU after startup. BF16 KV delivered slightly higher aggregate output
+throughput in this short-context matrix; the difference is small enough that
+quality/capacity policy should decide between the formats.
+
+FP8 KV doubles measured cache capacity, but vLLM 0.26 reports that the
+checkpoint supplies no calibrated Q/K/V/probability cache scales and falls back
+to 1.0. Treat `--kv-cache-dtype fp8` as an opt-in capacity profile until a
+task-relevant accuracy evaluation accepts that fallback. Do not infer output
+quality from the throughput benchmark.
+
+### MTP and upgrade constraints
+
+Do not enable the included one-layer MTP head on vLLM 0.26.0. The installed
+GDN implementation predates
+[vLLM PR #51812](https://github.com/vllm-project/vllm/pull/51812), which fixes
+mixed-batch speculative decoding state ordering for Qwen3.8. Re-evaluate MTP
+only after upgrading to a release that contains that fix, then run mixed
+prefill/decode correctness tests as well as throughput tests. The model serving
+profile must be requalified after any vLLM, Transformers, FlashInfer, CUDA,
+driver, model-revision, KV-format, context, or parallel-placement change.
 
 ## llama.cpp
 
