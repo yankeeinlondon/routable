@@ -228,6 +228,25 @@ router workload, but include prefix-cache correctness in upgrade tests. A
 text-only service can add `--language-model-only`; qualify it independently
 because it changes memory balance and removes image support.
 
+### Router placement policy
+
+Qwen3.8 occupies both GPUs, so the interactive production profile must be
+non-evictable while awake. Otherwise a background request for any single-GPU
+model can evict Qwen3.8, only for the next foreground prompt to evict that
+model and reload Qwen3.8 again. Chat clients may make such requests for title
+generation or other housekeeping even when the visible conversation is using
+Qwen3.8. Keep the one-hour idle stop so the GPUs are eventually released, but
+set `evictable: false` to prevent cross-model thrashing during an active
+session.
+
+The router's request-parking deadline must also cover the measured cold start.
+This host takes roughly 85-105 seconds to make the TP=2 service ready from a
+cold process, so the production Qwen3.8 profile uses `deadline_ms: 180000`.
+The former 20-second default guaranteed an otherwise healthy cold start would
+surface as `model_starting` to an OpenAI-compatible client. A client may still
+apply its own shorter HTTP timeout; configure that timeout above three minutes
+if the first request must wait for a cold load instead of being retried.
+
 ### Measured placement and KV-cache matrix
 
 Each cell used vLLM's online benchmark with 12 random requests per repetition,
