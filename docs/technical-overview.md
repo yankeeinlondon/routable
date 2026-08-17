@@ -418,6 +418,13 @@ than silently not loading at runtime.
   constant-time, and the two files must be distinct — validation rejects a config that
   points them at the same secret, because an inference client must never hold a credential
   that authorizes lifecycle mutations.
+- **Credentials survive host restarts.** The token files are long-lived client
+  credentials and belong on persistent storage, conventionally
+  `/etc/vllm-router/secrets/{inference-token,management-token}` in a root-owned mode-`0700`
+  directory. Never place them under `/run` or `/var/run`: those trees are tmpfs on this
+  host, so a reboot deletes the credentials, prevents the router from starting, and makes
+  every previously configured client key unusable. `just token` creates either missing
+  file without replacing an existing credential.
 - **Neither token has a default.** Both paths are required config, so a config that omits
   one fails at `-t` time instead of silently exposing a listener that can spend GPU time.
   `GET /livez` and `GET /readyz` on the loopback management bind are the only
@@ -427,6 +434,13 @@ than silently not loading at runtime.
   only from the host.
 - Every accepted mutation emits a structured `audit=true` log line (operation ID, service,
   action, flags) to journald. No request bodies, no credentials, ever.
+
+Token rotation is deliberately explicit: create a new mode-`0600`, root-owned file on
+persistent storage, update the corresponding configured path, validate with `vllm-router
+-t`, distribute an inference token to clients when applicable, and then restart the
+router. There is no live credential reload and no fallback token. Losing a token file is
+therefore recovery by minting and distributing a new credential, not restoration of the
+old value.
 
 ## Testing strategy
 

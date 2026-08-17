@@ -50,8 +50,8 @@ lint:
 
 router_config := env_var_or_default('ROUTER_CONFIG', '/etc/vllm-router/router.yaml')
 pingora_config := env_var_or_default('PINGORA_CONFIG', '/etc/vllm-router/pingora.yaml')
-token_file := env_var_or_default('TOKEN_FILE', '/run/secrets/vllm-router-token')
-inference_token_file := env_var_or_default('INFERENCE_TOKEN_FILE', '/run/secrets/vllm-router-inference-token')
+token_file := env_var_or_default('TOKEN_FILE', '/etc/vllm-router/secrets/management-token')
+inference_token_file := env_var_or_default('INFERENCE_TOKEN_FILE', '/etc/vllm-router/secrets/inference-token')
 
 # Ports `just run` binds and every client recipe targets (override per call,
 # e.g. `DATA_PORT=9000 just run`). The example-config conventions:
@@ -72,9 +72,10 @@ host-test:
     cargo test --lib -- --ignored
 
 # Create both bearer token files (root-owned, 0600) unless they already exist.
-# The router requires two distinct secrets: the management token authorizes
+# The router requires two distinct, persistent secrets: the management token authorizes
 # lifecycle mutations, the inference token authorizes data-plane requests. Run as
-# root — the router refuses a token file it does not own.
+# root — the router refuses a token file it does not own. Never place client
+# credentials under /run: it is a tmpfs and is erased at reboot.
 token:
     #!/usr/bin/env bash
     set -euo pipefail

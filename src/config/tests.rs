@@ -15,8 +15,10 @@ fn valid_config() -> RouterConfig {
             data_plane: SocketAddr::from(([0, 0, 0, 0], 8000)),
             management: SocketAddr::from(([127, 0, 0, 1], 8001)),
             metrics: SocketAddr::from(([127, 0, 0, 1], 8002)),
-            management_bearer_token_file: PathBuf::from("/run/secrets/vllm-router-token"),
-            inference_bearer_token_file: PathBuf::from("/run/secrets/vllm-router-inference-token"),
+            management_bearer_token_file: PathBuf::from(
+                "/etc/vllm-router/secrets/management-token",
+            ),
+            inference_bearer_token_file: PathBuf::from("/etc/vllm-router/secrets/inference-token"),
         },
         inventory: Inventory {
             host_ram_capacity_bytes: 128 * GIB,
@@ -1168,7 +1170,7 @@ fn additive_registration_validates_the_merged_config_before_publication() {
 #[test]
 fn omitted_inference_token_file_fails_to_parse_rather_than_serving_unauthenticated() {
     let yaml = include_str!("example.yaml").replace(
-        "  inference_bearer_token_file: /run/secrets/vllm-router-inference-token\n",
+        "  inference_bearer_token_file: /etc/vllm-router/secrets/inference-token\n",
         "",
     );
     let error = serde_yaml::from_str::<RouterConfig>(&yaml)
