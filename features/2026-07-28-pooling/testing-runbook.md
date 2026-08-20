@@ -46,8 +46,9 @@ the 27B NVFP4 model (TP=1, one GPU, `sleep.enabled: false`); backend on
 is documented at minutes-scale cold). Create the token:
 
 ```console
-install -m 0600 /dev/null /run/secrets/vllm-router-token
-openssl rand -hex 32 > /run/secrets/vllm-router-token
+install -d -m 0700 /etc/vllm-router/secrets
+openssl rand -out /etc/vllm-router/secrets/management-token -hex 32
+chmod 0600 /etc/vllm-router/secrets/management-token
 vllm-router -t -c deploy/pingora.yaml --router-config /etc/vllm-router/router.yaml
 ```
 

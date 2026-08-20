@@ -8,6 +8,23 @@ The **LLM Router** exposes three separate API's (across three separate ports). T
 
 The rest of this document will introduce the three API surfaces, what they are for, how to use them, and how they are impacted by CLI switches and ENV variables used when starting the service.
 
+## Authentication and listener boundaries
+
+- The inference API requires the inference bearer token on every request, including
+  `GET /v1/models`. An OpenAI-compatible client should use the data-plane base URL (for
+  the standard deployment, `http://<host>:6969/v1`) and configure the contents of
+  `/etc/vllm-router/secrets/inference-token` as its API key.
+- The management API uses a different bearer token from
+  `/etc/vllm-router/secrets/management-token`. It is loopback-bound by default and that
+  credential must not be given to inference clients.
+- The metrics listener is independently loopback-bound. The management liveness and
+  readiness endpoints are the only unauthenticated HTTP endpoints.
+
+Both token files are persistent, root-owned, mode `0600`, non-empty, and distinct. Their
+parent directory is root-owned mode `0700`. They must not be stored under `/run` or
+`/var/run`, because those tmpfs paths are cleared at reboot. Before binding any listener,
+the router validates each file's ownership, mode, contents, and distinct configured path.
+
 ## Inference API
 
 The **Inference API** will be the API that most clients will interact with and it exposes:

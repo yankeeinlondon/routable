@@ -15,8 +15,10 @@ fn valid_config() -> RouterConfig {
             data_plane: SocketAddr::from(([0, 0, 0, 0], 8000)),
             management: SocketAddr::from(([127, 0, 0, 1], 8001)),
             metrics: SocketAddr::from(([127, 0, 0, 1], 8002)),
-            management_bearer_token_file: PathBuf::from("/run/secrets/vllm-router-token"),
-            inference_bearer_token_file: PathBuf::from("/run/secrets/vllm-router-inference-token"),
+            management_bearer_token_file: PathBuf::from(
+                "/etc/vllm-router/secrets/management-token",
+            ),
+            inference_bearer_token_file: PathBuf::from("/etc/vllm-router/secrets/inference-token"),
         },
         inventory: Inventory {
             host_ram_capacity_bytes: 128 * GIB,
@@ -231,6 +233,38 @@ fn validates_allowlisted_environment_at_global_and_service_scope() {
     let errors = messages(&config);
     assert!(errors.contains("environment.CUDA_VISIBLE_DEVICES is not allowlisted"));
     assert!(errors.contains("environment.PATH contains a forbidden control character"));
+}
+
+#[test]
+fn accepts_model_specific_gpu_environment_and_runner_arguments() {
+    let mut config = valid_config();
+    config.services[0].environment.extend([
+        ("FLASHINFER_CUDA_ARCH_LIST".into(), "12.0f".into()),
+        ("NCCL_P2P_DISABLE".into(), "1".into()),
+        (
+            "PYTORCH_CUDA_ALLOC_CONF".into(),
+            "expandable_segments:True".into(),
+        ),
+        ("VLLM_USE_FASTOKENS".into(), "1".into()),
+        ("VLLM_WORKER_MULTIPROC_METHOD".into(), "spawn".into()),
+    ]);
+    config.services[0].runner_args.extend([
+        (
+            "attention-backend".into(),
+            RunnerArgValue::String("flashinfer".into()),
+        ),
+        (
+            "mm-encoder-tp-mode".into(),
+            RunnerArgValue::String("data".into()),
+        ),
+        (
+            "disable-custom-all-reduce".into(),
+            RunnerArgValue::Bool(true),
+        ),
+        ("language-model-only".into(), RunnerArgValue::Bool(false)),
+    ]);
+
+    config.validate().unwrap();
 }
 
 #[test]
@@ -1136,7 +1170,7 @@ fn additive_registration_validates_the_merged_config_before_publication() {
 #[test]
 fn omitted_inference_token_file_fails_to_parse_rather_than_serving_unauthenticated() {
     let yaml = include_str!("example.yaml").replace(
-        "  inference_bearer_token_file: /run/secrets/vllm-router-inference-token\n",
+        "  inference_bearer_token_file: /etc/vllm-router/secrets/inference-token\n",
         "",
     );
     let error = serde_yaml::from_str::<RouterConfig>(&yaml)
