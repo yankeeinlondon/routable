@@ -2,8 +2,8 @@
 
 The **LLM Router** exposes three separate API's (across three separate ports). This separation was done to address the following:
 
-- provide full separation between "adminstrative" needs from normal "usage" needs
-- allow for each API to be network bound separately in a way that is more restrictive to adminstrative needs than for general usage
+- provide full separation between "administrative" needs from normal "usage" needs
+- allow for each API to be network bound separately in a way that is more restrictive to administrative needs than for general usage
 - also allows for separate NIC's to be used for the different APIs so even if front facing data channel is saturated, admins can gain access to the administrative functions on a different network route.
 
 The rest of this document will introduce the three API surfaces, what they are for, how to use them, and how they are impacted by CLI switches and ENV variables used when starting the service.
@@ -48,7 +48,7 @@ These are the endpoints that a typical client wouldn't know of "out of the box":
 
 | Endpoint            | Protocol family                                                                              | 
 |---------------------|----------------------------------------------------------------------------------------------|
-| `POST /
+| `POST /`
 
 
 
@@ -68,3 +68,7 @@ These are the endpoints that a typical client wouldn't know of "out of the box":
 | `POST /v1/services/{name}/sleep` | drain then sleep; body: `{"level": "l1"\|"l2"}` |
 | `POST /v1/services/{name}/stop`  | drain then stop the unit; `{"force": true}` stops after the drain deadline even with work in flight and holds the service drained until an explicit start/wake |
 | `GET /v1/services`               | desired config + observed state for every service (lifecycle, systemd, probes, GPU, active/parked counts, last error) |
+
+### Web Interface
+
+Calling `GET /` on the inference port will bring up web based interface for viewing the current state as well as some limited configuration.
