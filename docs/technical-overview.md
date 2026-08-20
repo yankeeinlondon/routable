@@ -89,7 +89,7 @@ that look arbitrary are the only remaining option once you account for them.
 
 - **No general body replay.** A `ProxyHttp` implementation cannot read-then-replay a
   request body before `upstream_peer`; the only replay facility is a retry buffer capped
-  at 64 KiB, far too small for multimodal OpenAI payloads. Established by spike, recorded
+  at 64 KiB, far too small for multi-modal OpenAI payloads. Established by spike, recorded
   in [`phase0-findings.md`](../features/2026-07-28-pooling/phase0-findings.md).
 - **`run_forever()` calls `block_on`** and panics inside any tokio context, which
   constrains how the process may be started.
