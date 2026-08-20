@@ -220,13 +220,14 @@ metrics: _need-router
 unit-logs service:
     journalctl -u vllm@{{service}}.service -f
 
-# start claude code CLI
+
+# start claude code
 cc *args="":
-  claude --dangerously-skip-permissions
+  claude --permission-mode auto {{args}}
 
 # start codex CLI
 codex *args="":
-  codex --dangerously-bypass-approvals-and-sandbox
+  codex --dangerously-bypass-approvals-and-sandbox {{args}}
 
 
 # Run `just _colors` if you want to exercise this (it does nothing).
