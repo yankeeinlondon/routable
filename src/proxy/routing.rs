@@ -272,6 +272,10 @@ mod tests {
             ErrorDialect::OpenAi
         );
         assert_eq!(ErrorDialect::for_path("/v1/rerank"), ErrorDialect::OpenAi);
+        assert_eq!(
+            ErrorDialect::for_path("/v1/systemone"),
+            ErrorDialect::OpenAi
+        );
     }
 
     #[test]

@@ -43,6 +43,7 @@ const MODEL_ENDPOINTS: &[&str] = &[
     "/v1/rerank",
     "/v2/rerank",
     "/v2/embed",
+    "/v1/systemone",
     "/score",
     "/rerank",
     "/classify",
@@ -1533,6 +1534,16 @@ mod tests {
             );
         }
 
+        // Not a vLLM route: the System One decision API of d3-style backends (d3q-serve), which carries
+        // the model name in its JSON body like every other model-bearing endpoint.
+        assert!(MODEL_ENDPOINTS.contains(&"/v1/systemone"));
+        for path in ["/v1/systemone/", "/systemone", "/health"] {
+            assert!(
+                !MODEL_ENDPOINTS.contains(&path),
+                "{path} should not be proxied"
+            );
+        }
+
         for path in [
             "/v1/tokenize",
             "/v1/detokenize",
@@ -2008,6 +2019,59 @@ mod tests {
         let forwarded = String::from_utf8_lossy(&upstream_request).to_ascii_lowercase();
         assert!(!forwarded.contains("authorization"), "{forwarded}");
         assert!(!forwarded.contains(TEST_TOKEN), "{forwarded}");
+    }
+
+    #[tokio::test]
+    async fn systemone_requests_reach_the_backend_with_the_body_unchanged() {
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend = upstream.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let (mut stream, _) = upstream.accept().await.unwrap();
+            let request = read_upstream_request(&mut stream).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\n\
+                      Content-Type: application/json\r\n\
+                      Content-Length: 2\r\n\
+                      Connection: close\r\n\r\n\
+                      {}",
+                )
+                .await
+                .unwrap();
+            request
+        });
+
+        let mut router_config = test_router_config_named(&[backend], "replica");
+        router_config.services[0].aliases = vec!["d3-turbo".into()];
+        let config =
+            Arc::new(ConfigStore::new(router_config).expect("test config should validate"));
+        let pool = Arc::new(FakePool::new(
+            config.snapshot().as_ref(),
+            Lifecycle::Running,
+            EnsureBehavior::Ready,
+        ));
+        let plane = Arc::new(DataPlane::new(config, pool.clone(), test_auth()).unwrap());
+        let body = br#"{"model":"d3-turbo","state":"Ticket: refund","questions":{"route":{"type":"choice","criteria":{"a":"A","b":"B"}}}}"#;
+
+        let (mut client, ingress_task) = ingress_connection(plane).await;
+        write_inference_request_to(&mut client, "/v1/systemone", body).await;
+        let response = read_response(client).await;
+        ingress_task.await.unwrap();
+        let upstream_request = upstream_task.await.unwrap();
+
+        assert!(
+            response.starts_with(b"HTTP/1.1 200"),
+            "unexpected response: {}",
+            String::from_utf8_lossy(&response)
+        );
+        assert_eq!(*pool.active_attempts.lock().unwrap(), vec!["replica-0"]);
+        let header_end = upstream_request
+            .windows(4)
+            .position(|bytes| bytes == b"\r\n\r\n")
+            .unwrap()
+            + 4;
+        assert!(upstream_request.starts_with(b"POST /v1/systemone HTTP/1.1\r\n"));
+        assert_eq!(&upstream_request[header_end..], body);
     }
 
     #[tokio::test]

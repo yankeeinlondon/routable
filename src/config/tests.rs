@@ -1195,3 +1195,16 @@ fn omitted_runner_executable_uses_the_backward_compatible_default() {
     );
     config.validate().unwrap();
 }
+
+#[test]
+fn accepts_a_systemone_warmup_request() {
+    let mut config = valid_config();
+    let warmup = config.services[0].warmup.as_mut().unwrap();
+    warmup.path = "/v1/systemone".into();
+    warmup.body = serde_json::json!({
+        "model": "vllm-sr/d3-turbo-NVFP4",
+        "state": "warmup",
+        "questions": {"w": {"type": "noul", "instructions": "Is this a warmup?"}}
+    });
+    config.validate().unwrap();
+}
